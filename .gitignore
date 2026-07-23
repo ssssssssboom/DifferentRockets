@@ -1,21 +1,21 @@
-# ---- 大型工具链（本地环境，不入库） ----
-android-sdk/
-gradle/
-
 # ---- 临时与调试 ----
 tmp/
 tmp-tools/
 1
-*.png
-bug.jpg
+/1.png
+/2.png
+/3.png
+/4.png
+/bug.jpg
+/bug_1.png
+/bug_2.png
 
 # ---- 构建产物 ----
-*.apk
 game/*/build/
 game/build/
 game/local.properties
 
-# ---- Gradle ----
+# ---- Gradle 缓存（发行版本体 gradle/ 已入库） ----
 .gradle/
 **/build/
 

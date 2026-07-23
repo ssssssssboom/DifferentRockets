@@ -1,0 +1,1209 @@
+package com.differentrockets.ui;
+
+import com.badlogic.gdx.Gdx;
+import com.badlogic.gdx.Input;
+import com.badlogic.gdx.InputAdapter;
+import com.badlogic.gdx.InputMultiplexer;
+import com.badlogic.gdx.ScreenAdapter;
+import com.badlogic.gdx.graphics.Color;
+import com.badlogic.gdx.graphics.GL20;
+import com.badlogic.gdx.graphics.OrthographicCamera;
+import com.badlogic.gdx.graphics.g2d.TextureRegion;
+import com.badlogic.gdx.math.Vector2;
+import com.badlogic.gdx.math.Vector3;
+import com.badlogic.gdx.scenes.scene2d.InputEvent;
+import com.badlogic.gdx.scenes.scene2d.Actor;
+import com.badlogic.gdx.scenes.scene2d.InputListener;
+import com.badlogic.gdx.scenes.scene2d.Stage;
+import com.badlogic.gdx.scenes.scene2d.Touchable;
+import com.badlogic.gdx.scenes.scene2d.ui.Label;
+import com.badlogic.gdx.scenes.scene2d.ui.ScrollPane;
+import com.badlogic.gdx.scenes.scene2d.ui.Table;
+import com.badlogic.gdx.scenes.scene2d.ui.TextButton;
+import com.badlogic.gdx.scenes.scene2d.ui.TextField;
+import com.badlogic.gdx.scenes.scene2d.utils.ClickListener;
+import com.badlogic.gdx.utils.Align;
+import com.badlogic.gdx.utils.viewport.ScreenViewport;
+import com.differentrockets.game.Attach;
+import com.differentrockets.game.DRGame;
+import com.differentrockets.game.PartList;
+import com.differentrockets.game.PartType;
+import com.differentrockets.game.Planet;
+import com.differentrockets.game.ShipDesign;
+
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+
+/**
+ * Rocket build editor: part palette, drag-and-drop assembly with attach-point
+ * snapping, 90-degree rotation, deletion, stage list, ship save/load, Launch.
+ */
+public class EditorScreen extends ScreenAdapter {
+
+    private final DRGame game;
+    private ShipDesign design = new ShipDesign();
+    private String shipName = "Untitled";
+
+    private Stage stage;
+    private OrthographicCamera cam;
+    private final InputAdapter editorInput = new EditorInput();
+    private Table canvasArea;         // the only stage region treated as canvas by EditorInput
+    private final List<PaletteItem> paletteItems = new ArrayList<>();
+    private ScrollPane paletteScroll; // palette list; scrolling is suspended mid drag-out
+    private PartType dragOutType;     // non-null while a palette drag-out gesture is live
+    private int dragOutPointer = -1;
+    private float dragScrX, dragScrY; // last known screen pos of the drag-out finger
+    private final TextButton[] groupButtons = new TextButton[9];
+
+    // dragging state
+    private PartType placing;         // palette part being placed
+    private int dragIndex = -1;       // existing part being dragged
+    private float dragX, dragY;       // current ghost position (world)
+    private int dragRot;              // rotation of ghost
+    private boolean panning;
+    private float panLastX, panLastY;
+    // two-finger gesture state (item 2): A = first finger, B = second finger
+    private int touchPtrA = -1, touchPtrB = -1;
+    private float gpaX, gpaY, gpbX, gpbY;
+    private Table stageTable;
+    private Label statusLabel;
+    private Table overlay;            // modal overlays (launch picker / load dialog)
+
+    // activation groups (item 6a): multi-select + group assignment
+    private final Set<Integer> selected = new HashSet<>();
+    private int downIndex = -1;       // part under touch-down (tap=select, drag=move)
+    private float downScrX, downScrY;
+    private boolean dragMoved;
+    private Table groupBar;
+
+    public EditorScreen(DRGame game, ShipDesign existing) {
+        this.game = game;
+        if (existing != null) this.design = existing;
+        // every new rocket starts with a command pod
+        if (this.design.parts.isEmpty()) {
+            this.design.parts.add(new ShipDesign.DesignPart("pod-1", 0, 0, 0));
+            this.design.autoStage();
+        }
+    }
+
+    public ShipDesign getDesign() { return design; }
+
+    // ---- smoke-test hooks (item 5 tap verification) ----
+    public PartType getPlacing() { return placing; }
+    public boolean isSelected(int index) { return selected.contains(index); }
+    public void cancelPlacing() { placing = null; }
+
+    private int[] actorScreenPos(Actor a) {
+        if (a == null || a.getStage() == null) return null;
+        com.badlogic.gdx.math.Vector2 v = a.localToStageCoordinates(
+                new com.badlogic.gdx.math.Vector2(a.getWidth() / 2f, a.getHeight() / 2f));
+        v = stage.stageToScreenCoordinates(v);
+        return new int[]{Math.round(v.x), Math.round(v.y)};
+    }
+    public int[] paletteItemScreenPos(int i) {
+        return i < paletteItems.size() ? actorScreenPos(paletteItems.get(i)) : null;
+    }
+    public int[] groupButtonScreenPos(int g) {
+        return g >= 1 && g <= 8 ? actorScreenPos(groupButtons[g]) : null;
+    }
+    public int[] partScreenPos(int designIndex) {
+        if (designIndex >= design.parts.size()) return null;
+        ShipDesign.DesignPart dp = design.parts.get(designIndex);
+        Vector3 v3 = new Vector3(dp.x, dp.y, 0);
+        cam.project(v3); // libGDX project() yields y-UP; input handlers want y-DOWN
+        return new int[]{Math.round(v3.x), Math.round(Gdx.graphics.getHeight() - v3.y)};
+    }
+    /** Diagnostic for tap routing: which stage actor and which part a screen point maps to. */
+    public String hitInfo(int sx, int sy) {
+        Actor a = stage.hit(sx, Gdx.graphics.getHeight() - sy, true);
+        Vector2 w = screenToWorld(sx, sy);
+        int idx = partAt(w);
+        return "stageHit=" + (a == null ? "null" : a.getClass().getSimpleName()
+                + (a == canvasArea ? "(canvas)" : ""))
+                + " world=(" + String.format("%.2f", w.x) + "," + String.format("%.2f", w.y) + ")"
+                + " partAt=" + idx;
+    }
+
+    @Override
+    public void show() {
+        cam = new OrthographicCamera();
+        cam.viewportHeight = 40;
+        cam.viewportWidth = 40f * Gdx.graphics.getWidth() / Gdx.graphics.getHeight();
+        // portrait with left palette: frame the rocket in the visible canvas
+        // band right of the palette column (canvas center != screen center)
+        cam.position.set(-4.5f, -3, 0);
+        cam.update();
+
+        stage = new Stage(new ScreenViewport());
+        buildChrome();
+        rebuildStageList();
+
+        InputMultiplexer mux = new InputMultiplexer();
+        // Palette drag-out (item 4) is intercepted RAW, before the stage: the
+        // ScrollPane steals/cancels Scene2D touch focus mid-drag (and capture
+        // listeners don't fire for focus-routed events in this gdx version),
+        // so neither the row's nor stage-level listeners can complete the
+        // gesture reliably. This processor only consumes events once a
+        // horizontal drag-out has actually started; taps and vertical scroll
+        // gestures flow to the stage untouched.
+        mux.addProcessor(dragOutInterceptor);
+        mux.addProcessor(stage);
+        mux.addProcessor(editorInput);
+        Gdx.input.setInputProcessor(mux);
+    }
+
+    private final DragOutInterceptor dragOutInterceptor = new DragOutInterceptor();
+
+    /**
+     * Palette drag-out interceptor: sits in FRONT of the stage and only consumes
+     * events once a horizontal drag-out has actually started. POINTER-LIFECYCLE
+     * CRITICAL (item 8): the palette row took Scene2D touch focus at touch-down;
+     * once this interceptor owns the gesture it swallows the release touchUp, so
+     * beginDragOut() must stage.cancelTouchFocus() — otherwise the stale focus
+     * fires a phantom row touchUp on the NEXT gesture (arming a ghost
+     * placement) AND the stage swallows that touchUp, so EditorInput never
+     * finishes its own gesture (leaked touchPtrA turns every later gesture into
+     * a ghost two-finger op). That cascade was the round-8
+     * "input dead after drag-out" bug.
+     */
+    private class DragOutInterceptor extends InputAdapter {
+        private PartType candidate;
+        private int downX, downY;
+
+        void reset() { candidate = null; }
+
+        @Override public boolean touchDown(int screenX, int screenY, int pointer, int button) {
+            if (pointer != 0 || dragOutType != null) return false;
+            candidate = paletteRowAt(screenX, screenY);
+            downX = screenX; downY = screenY;
+            return false; // never consume the press: tap/scroll need it
+        }
+
+        @Override public boolean touchDragged(int screenX, int screenY, int pointer) {
+            if (pointer != 0) return false;
+            if (dragOutType != null) {
+                dragScrX = screenX; dragScrY = screenY;
+                return true; // ours now: the pane/stage must not see this drag
+            }
+            if (candidate != null) {
+                float dx = screenX - downX, dy = screenY - downY;
+                if (Math.abs(dx) > 14 && Math.abs(dx) > Math.abs(dy)) {
+                    PartType t = candidate;
+                    candidate = null;
+                    beginDragOut(t, pointer, screenX, screenY);
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        @Override public boolean touchUp(int screenX, int screenY, int pointer, int button) {
+            candidate = null;
+            if (pointer != 0 || dragOutType == null) return false;
+            finishDragOut(screenX, screenY);
+            return true; // release consumed: stage never sees it
+        }
+
+        @Override public boolean touchCancelled(int screenX, int screenY, int pointer, int button) {
+            candidate = null;
+            if (dragOutType != null) {
+                dragOutType = null;
+                placing = null;
+                return true;
+            }
+            return false;
+        }
+    }
+
+    /** The palette row (if any) under a screen point, for drag-out interception. */
+    private PartType paletteRowAt(float screenX, float screenY) {
+        float stageY = Gdx.graphics.getHeight() - screenY; // stage coords are y-up
+        com.badlogic.gdx.math.Vector2 tmpA = new com.badlogic.gdx.math.Vector2();
+        com.badlogic.gdx.math.Vector2 tmpB = new com.badlogic.gdx.math.Vector2();
+        for (PaletteItem item : paletteItems) {
+            item.localToStageCoordinates(tmpA.set(0, 0));
+            item.localToStageCoordinates(tmpB.set(item.getWidth(), item.getHeight()));
+            if (screenX >= tmpA.x && screenX <= tmpB.x && stageY >= tmpA.y && stageY <= tmpB.y) {
+                return item.partType;
+            }
+        }
+        return null;
+    }
+
+    // ------------------------------------------------------------ UI chrome
+
+    private void buildChrome() {
+        Table root = new Table();
+        root.setFillParent(true);
+        root.top();
+        stage.addActor(root);
+
+        // --- top bar row 1: Menu / ship name / LAUNCH ---
+        final TextField nameField = new TextField(shipName, game.ui.skin);
+        nameField.setTextFieldListener((tf, c) -> shipName = tf.getText());
+
+        TextButton launch = new TextButton("LAUNCH >>", game.ui.skin);
+        launch.addListener(new ClickListener() {
+            @Override public void clicked(InputEvent e, float x, float y) { showLaunchPicker(); }
+        });
+        TextButton back = new TextButton("Menu", game.ui.skin);
+        back.addListener(new ClickListener() {
+            @Override public void clicked(InputEvent e, float x, float y) {
+                game.setScreen(new MenuScreen(game));
+            }
+        });
+
+        Table top1 = new Table();
+        top1.add(back).height(64).pad(4);
+        top1.add(nameField).expandX().fillX().height(64).pad(4);
+        top1.add(launch).width(150).height(64).pad(4);
+
+        // --- top bar row 2: Rotate / Save / Load / Stages ---
+        TextButton rotate = new TextButton("Rotate (R)", game.ui.skin);
+        rotate.addListener(new ClickListener() {
+            @Override public void clicked(InputEvent e, float x, float y) { rotateGhost(); }
+        });
+        TextButton save = new TextButton("Save", game.ui.skin);
+        save.addListener(new ClickListener() {
+            @Override public void clicked(InputEvent e, float x, float y) { saveShip(); }
+        });
+        TextButton load = new TextButton("Load", game.ui.skin);
+        load.addListener(new ClickListener() {
+            @Override public void clicked(InputEvent e, float x, float y) { showLoadDialog(); }
+        });
+        TextButton stages = new TextButton("Stages", game.ui.skin);
+        stages.addListener(new ClickListener() {
+            @Override public void clicked(InputEvent e, float x, float y) { showStagesDialog(); }
+        });
+
+        Table top2 = new Table();
+        top2.add(rotate).expandX().fillX().height(64).pad(4);
+        top2.add(save).expandX().fillX().height(64).pad(4);
+        top2.add(load).expandX().fillX().height(64).pad(4);
+        top2.add(stages).expandX().fillX().height(64).pad(4);
+
+        Table top = new Table();
+        top.setBackground(game.ui.tinted(new Color(0.09f, 0.1f, 0.15f, 0.95f)));
+        top.add(top1).fillX().row();
+        top.add(top2).fillX().row();
+
+        // --- middle: LEFT palette column (~40% width) + canvas ---
+        stageTable = new Table(); // content shown inside the Stages dialog
+
+        Table paletteCol = new Table();
+        paletteCol.top();
+        paletteItems.clear();
+        for (PartType t : PartList.palette()) {
+            PaletteItem item = new PaletteItem(t);
+            paletteItems.add(item);
+            // no fixed height: rows size to their (possibly wrapped) text and the
+            // row actor fills the whole cell -> the ENTIRE row is touchable
+            paletteCol.add(item).expandX().fillX().pad(3).row();
+        }
+        ScrollPane scroll = new ScrollPane(paletteCol, game.ui.skin);
+        scroll.setFadeScrollBars(false);
+        scroll.setScrollingDisabled(true, false); // vertical drag only
+        paletteScroll = scroll;
+        Table paletteWrap = new Table();
+        paletteWrap.setBackground(game.ui.tinted(new Color(0.09f, 0.1f, 0.15f, 0.95f)));
+        paletteWrap.add(scroll).expand().fill();
+
+        groupBar = new Table();
+        canvasArea = new Table();
+        canvasArea.add().expand().fill().row();
+        canvasArea.add(groupBar).padBottom(6).row();
+
+        Table middle = new Table();
+        middle.add(paletteWrap).width(Gdx.graphics.getWidth() * 0.4f).expandY().fillY();
+        middle.add(canvasArea).expand().fill();
+
+        // --- bottom: status line only ---
+        statusLabel = new Label("Drag a part row onto the canvas, or tap it then click to place. Tap part = select; DEL deletes.",
+                game.ui.skin);
+        statusLabel.setColor(new Color(0.7f, 0.75f, 0.85f, 1f));
+        statusLabel.setWrap(true);
+        Table bottom = new Table();
+        bottom.setBackground(game.ui.tinted(new Color(0.09f, 0.1f, 0.15f, 0.95f)));
+        bottom.add(statusLabel).width(Gdx.graphics.getWidth() - 24).left().padLeft(12);
+
+        root.add(top).fillX().row();
+        root.add(middle).expand().fill().row();
+        root.add(bottom).fillX();
+        rebuildGroupBar();
+    }
+
+    /** Bottom bar with the 8 activation-group toggles; visible when parts are selected. */
+    private void rebuildGroupBar() {
+        groupBar.clear();
+        java.util.Arrays.fill(groupButtons, null);
+        if (selected.isEmpty()) return;
+        groupBar.setBackground(game.ui.tinted(new Color(0.09f, 0.1f, 0.15f, 0.9f)));
+        // three compact rows (the canvas column beside the palette is narrow):
+        // Grp 1-4 / 5-8 / Clear+DEL
+        Table r1 = new Table();
+        r1.add(new Label("Grp:", game.ui.skin)).padRight(6);
+        Table r2 = new Table();
+        for (int g = 1; g <= 8; g++) {
+            final int grp = g;
+            TextButton b = new TextButton(String.valueOf(g), game.ui.skin);
+            b.addListener(new ClickListener() {
+                @Override public void clicked(InputEvent e, float x, float y) { toggleGroup(grp); }
+            });
+            groupButtons[g] = b;
+            (g <= 4 ? r1 : r2).add(b).width(48).height(56).pad(2);
+        }
+        groupBar.add(r1).row();
+        groupBar.add(r2).row();
+        Table r3 = new Table();
+        TextButton clr = new TextButton("Clear grp", game.ui.skin);
+        clr.addListener(new ClickListener() {
+            @Override public void clicked(InputEvent e, float x, float y) {
+                for (int i : selected) design.parts.get(i).group = 0;
+                status("Cleared groups on " + selected.size() + " parts");
+                rebuildGroupBar();
+            }
+        });
+        TextButton del = new TextButton("DEL parts", game.ui.skin);
+        del.addListener(new ClickListener() {
+            @Override public void clicked(InputEvent e, float x, float y) {
+                // touch-friendly delete (right-click does not exist on phones)
+                List<Integer> idx = new ArrayList<>(selected);
+                idx.sort(java.util.Collections.reverseOrder());
+                for (int i : idx) design.parts.remove(i);
+                selected.clear();
+                design.autoStage();
+                rebuildStageList();
+                rebuildGroupBar();
+                status("Deleted " + idx.size() + " parts");
+            }
+        });
+        r3.add(clr).width(130).height(52).pad(3);
+        r3.add(del).width(130).height(52).pad(3);
+        groupBar.add(r3);
+    }
+
+    /** Assign/toggle one activation group on every selected part (one group per part). */
+    private void toggleGroup(int grp) {
+        if (selected.isEmpty()) return;
+        boolean allIn = true;
+        for (int i : selected) {
+            if (design.parts.get(i).group != grp) { allIn = false; break; }
+        }
+        for (int i : selected) design.parts.get(i).group = allIn ? 0 : grp;
+        status(allIn ? "Removed group " + grp : "Assigned group " + grp + " to " + selected.size() + " parts");
+        rebuildGroupBar();
+    }
+
+    private void rebuildStageList() {
+        stageTable.clear();
+        stageTable.add(new Label("STAGES", game.ui.skin)).pad(6).row();
+        for (int i = 0; i < design.stages.size(); i++) {
+            List<Integer> st = design.stages.get(i);
+            StringBuilder sb = new StringBuilder();
+            for (int idx : st) {
+                if (idx < design.parts.size()) {
+                    PartType t = PartList.get(design.parts.get(idx).typeId);
+                    if (t != null) sb.append(t.name).append(", ");
+                }
+            }
+            String txt = sb.length() > 2 ? sb.substring(0, sb.length() - 2) : "(empty)";
+            stageTable.add(new Label((i + 1) + ": " + txt, game.ui.skin))
+                    .pad(4).align(Align.left).row();
+        }
+    }
+
+    /** Portrait: the stage list lives in a modal dialog (screen estate). */
+    private void showStagesDialog() {
+        closeOverlay();
+        rebuildStageList();
+        overlay = newOverlay();
+        Table box = new Table();
+        box.setBackground(game.ui.tinted(new Color(0.12f, 0.14f, 0.2f, 1f)));
+        box.pad(20);
+        box.add(stageTable).row();
+        TextButton close = new TextButton("Close", game.ui.skin);
+        close.addListener(new ClickListener() {
+            @Override public void clicked(InputEvent e, float x, float y) { closeOverlay(); }
+        });
+        box.add(close).width(300).height(56).pad(8).row();
+        overlay.add(box);
+        stage.addActor(overlay);
+    }
+
+    /** Modal overlay that swallows taps so they never leak to the canvas below. */
+    private Table newOverlay() {
+        Table o = new Table();
+        o.setFillParent(true);
+        o.setBackground(game.ui.tinted(new Color(0f, 0f, 0f, 0.6f)));
+        o.addListener(new InputListener() {
+            @Override public boolean touchDown(InputEvent e, float x, float y, int pointer, int button) {
+                return true; // modal: consume everything outside the dialog box too
+            }
+        });
+        return o;
+    }
+
+    // ------------------------------------------------------------ modal overlays
+
+    private void closeOverlay() {
+        if (overlay != null) {
+            overlay.remove();
+            overlay = null;
+        }
+    }
+
+    private void showLaunchPicker() {
+        closeOverlay();
+        overlay = newOverlay();
+        Table box = new Table();
+        box.setBackground(game.ui.tinted(new Color(0.12f, 0.14f, 0.2f, 1f)));
+        box.pad(20);
+        box.add(new Label("Select launch planet", game.ui.skin)).pad(10).row();
+        List<Planet> flat = new ArrayList<>();
+        game.world.sun.flatten(flat);
+        for (Planet p : flat) {
+            if (!p.launchEnabled) continue;
+            TextButton b = new TextButton(p.name + "  (g=" + String.format("%.1f", p.gravity) + ")", game.ui.skin);
+            b.addListener(new ClickListener() {
+                @Override public void clicked(InputEvent e, float x, float y) {
+                    launch(p);
+                }
+            });
+            box.add(b).width(300).height(44).pad(4).row();
+        }
+        TextButton cancel = new TextButton("Cancel", game.ui.skin);
+        cancel.addListener(new ClickListener() {
+            @Override public void clicked(InputEvent e, float x, float y) { closeOverlay(); }
+        });
+        box.add(cancel).width(300).height(40).pad(8).row();
+        overlay.add(box);
+        stage.addActor(overlay);
+    }
+
+    private void showLoadDialog() {
+        closeOverlay();
+        overlay = newOverlay();
+        Table box = new Table();
+        box.setBackground(game.ui.tinted(new Color(0.12f, 0.14f, 0.2f, 1f)));
+        box.pad(20);
+        box.add(new Label("Load ship", game.ui.skin)).pad(10).row();
+        com.badlogic.gdx.files.FileHandle dir = Gdx.files.local("save/ships");
+        boolean any = false;
+        if (dir.exists()) {
+            for (com.badlogic.gdx.files.FileHandle f : dir.list(".json")) {
+                any = true;
+                TextButton b = new TextButton(f.nameWithoutExtension(), game.ui.skin);
+                b.addListener(new ClickListener() {
+                    @Override public void clicked(InputEvent e, float x, float y) {
+                        try {
+                            design = ShipDesign.fromJson(f.readString());
+                            shipName = f.nameWithoutExtension();
+                            selected.clear();
+                            rebuildGroupBar();
+                            rebuildStageList();
+                        } catch (Exception ex) {
+                            status("Load failed: " + ex.getMessage());
+                        }
+                        closeOverlay();
+                    }
+                });
+                box.add(b).width(300).height(44).pad(4).row();
+            }
+        }
+        if (!any) box.add(new Label("(no saved ships)", game.ui.skin)).pad(8).row();
+        TextButton cancel = new TextButton("Cancel", game.ui.skin);
+        cancel.addListener(new ClickListener() {
+            @Override public void clicked(InputEvent e, float x, float y) { closeOverlay(); }
+        });
+        box.add(cancel).width(300).height(40).pad(8).row();
+        overlay.add(box);
+        stage.addActor(overlay);
+    }
+
+    private void saveShip() {
+        try {
+            com.badlogic.gdx.files.FileHandle dir = Gdx.files.local("save/ships");
+            dir.mkdirs();
+            dir.child(shipName.replaceAll("[^a-zA-Z0-9_ -]", "_") + ".json").writeString(design.toJson(), false);
+            status("Saved " + shipName);
+        } catch (Exception e) {
+            status("Save failed: " + e.getMessage());
+        }
+    }
+
+    private void status(String s) {
+        statusLabel.setText(s);
+    }
+
+    // ------------------------------------------------------------ launch
+
+    private void launch(Planet planet) {
+        design.autoStage();
+        game.world.launchShip(design, planet);
+        game.setScreen(new SandboxScreen(game));
+    }
+
+    // ------------------------------------------------------------ editing logic
+
+    private Vector3 tmp3 = new Vector3();
+
+    private Vector2 screenToWorld(float sx, float sy) {
+        tmp3.set(sx, sy, 0);
+        cam.unproject(tmp3);
+        return new Vector2(tmp3.x, tmp3.y);
+    }
+
+    private int partAt(Vector2 w) {
+        // generous pick radius (item 6): max(2 m, 48 px in world units);
+        // nearest center among all hit parts wins (stable under overlap)
+        float tol = Math.max(2f, 48f / Gdx.graphics.getHeight() * cam.viewportHeight);
+        int best = -1;
+        float bestD = Float.MAX_VALUE;
+        for (int i = design.parts.size() - 1; i >= 0; i--) {
+            ShipDesign.DesignPart dp = design.parts.get(i);
+            PartType t = PartList.get(dp.typeId);
+            if (t == null) continue;
+            // box test in part frame
+            float dx = w.x - dp.x, dy = w.y - dp.y;
+            float c = (float) Math.cos(-dp.rot * Math.PI / 2), s = (float) Math.sin(-dp.rot * Math.PI / 2);
+            float lx = dx * c - dy * s, ly = dx * s + dy * c;
+            if (Math.abs(lx) <= t.width / 2f + tol && Math.abs(ly) <= t.height / 2f + tol) {
+                float d = (float) Math.hypot(dx, dy);
+                if (d < bestD) { bestD = d; best = i; }
+            }
+        }
+        return best;
+    }
+
+    /** Try to snap ghost position to attach points of other parts. Returns snapped position. */
+    private Vector2 snap(float px, float py, int rot, PartType type, int ignoreIndex) {
+        Vector2 best = new Vector2(px, py);
+        float bestD = 2.2f; // snap radius (m)
+        // edge-aware snapping (round 11 item 5): an edge attach point accepts
+        // contact anywhere along its side segment, so the ghost slides along
+        // the mating edge and aligns at the closest contact pair.
+        Vector2 ma = new Vector2(), mb = new Vector2();
+        Vector2 oa = new Vector2(), ob = new Vector2();
+        Vector2 cm = new Vector2(), co = new Vector2();
+        Vector2 qn = new Vector2();
+        for (int i = 0; i < design.parts.size(); i++) {
+            if (i == ignoreIndex) continue;
+            ShipDesign.DesignPart dp = design.parts.get(i);
+            PartType t = PartList.get(dp.typeId);
+            if (t == null) continue;
+            for (PartType.AttachPoint apM : type.attach) {
+                attachWorldSeg(type, px, py, rot, apM, ma, mb);
+                for (PartType.AttachPoint apO : t.attach) {
+                    attachWorldSeg(t, dp.x, dp.y, dp.rot, apO, oa, ob);
+                    float d = Attach.closestBetweenSegments(ma, mb, oa, ob, cm, co);
+                    if (d < bestD) {
+                        bestD = d;
+                        float nx = px + (co.x - cm.x), ny = py + (co.y - cm.y);
+                        // edge snap quantization: when the winning contact
+                        // involves an edge-type attach point, the ghost's free
+                        // slide along the edge locks to the 0.25 m grid;
+                        // center-type pairs keep the exact contact position.
+                        if (apO.edge != PartType.AttachPoint.EDGE_NONE) {
+                            best.set(Attach.quantizeAlongSegment(nx, ny, oa, ob, qn));
+                        } else if (apM.edge != PartType.AttachPoint.EDGE_NONE) {
+                            best.set(Attach.quantizeAlongSegment(nx, ny, ma, mb, qn));
+                        } else {
+                            best.set(nx, ny);
+                        }
+                    }
+                }
+            }
+        }
+        return best;
+    }
+
+    /** Design-space world segment of one attach point of a part at (px,py,rot). */
+    private static void attachWorldSeg(PartType t, float px, float py, int rot,
+                                       PartType.AttachPoint ap, Vector2 outA, Vector2 outB) {
+        Attach.localSegment(t, ap, outA, outB);
+        float c = (float) Math.cos(rot * Math.PI / 2), s = (float) Math.sin(rot * Math.PI / 2);
+        float ax = outA.x * c - outA.y * s, ay = outA.x * s + outA.y * c;
+        float bx = outB.x * c - outB.y * s, by = outB.x * s + outB.y * c;
+        outA.set(px + ax, py + ay);
+        outB.set(px + bx, py + by);
+    }
+
+    /** Smoke-test hook (round 11 item 5): snap as if dragging typeId to (px,py). */
+    public Vector2 snapForTest(float px, float py, int rot, String typeId, int ignoreIndex) {
+        PartType t = PartList.get(typeId);
+        return t == null ? new Vector2(px, py) : snap(px, py, rot, t, ignoreIndex);
+    }
+
+    private List<Vector2> attachWorld(PartType t, float px, float py, int rot) {
+        List<Vector2> out = new ArrayList<>();
+        float c = (float) Math.cos(rot * Math.PI / 2), s = (float) Math.sin(rot * Math.PI / 2);
+        for (PartType.AttachPoint ap : t.attach) {
+            float lx = ap.x * c - ap.y * s;
+            float ly = ap.x * s + ap.y * c;
+            out.add(new Vector2(px + lx, py + ly));
+        }
+        return out;
+    }
+
+    private void rotateGhost() {
+        if (placing != null && !placing.disableEditorRotation) {
+            dragRot = (dragRot + 1) % 4;
+            status("Rotation: " + (dragRot * 90) + " deg");
+            return;
+        }
+        if (dragIndex >= 0) {
+            ShipDesign.DesignPart dp = design.parts.get(dragIndex);
+            PartType t = PartList.get(dp.typeId);
+            if (t != null && !t.disableEditorRotation) {
+                dragRot = (dragRot + 1) % 4;
+                status("Rotation: " + (dragRot * 90) + " deg");
+            }
+            return;
+        }
+        // item 9 (round-9 bug): Rotate did nothing for TAP-SELECTED placed
+        // parts — the old code only knew the placing ghost and the mid-drag
+        // part, so a tap-selection was a dead target. Rotate all selected.
+        if (!selected.isEmpty()) {
+            int n = 0;
+            for (int idx : selected) {
+                if (idx < 0 || idx >= design.parts.size()) continue;
+                ShipDesign.DesignPart dp = design.parts.get(idx);
+                PartType t = PartList.get(dp.typeId);
+                if (t != null && !t.disableEditorRotation) {
+                    dp.rot = (dp.rot + 1) % 4;
+                    n++;
+                }
+            }
+            status(n > 0 ? "Rotated " + n + " selected part(s)"
+                    : "Selected part(s) cannot be rotated");
+        }
+    }
+
+    /** Diagnostic: ghost/drag rotation steps (smoke tests). */
+    public int dragRotForTest() { return dragRot; }
+
+    private class EditorInput extends InputAdapter {
+        @Override
+        public boolean touchDown(int screenX, int screenY, int pointer, int button) {
+            // a palette drag-out owns pointer 0 — a second finger must not
+            // place a ghost or start a pan underneath it (item 8)
+            if (dragOutType != null) return false;
+            if (touchPtrA != -1) {
+                // second finger -> two-finger camera gesture (item 2): cancel
+                // any single-finger op (part drag / pan) without finishing it.
+                // Finger A's position comes from OUR event log (gpaX/gpaY,
+                // maintained at every A event) — never Gdx.input.getX(pointer),
+                // which is unreliable for synthetic events and for pointers the
+                // back-end has already forgotten (item 8, same class as the
+                // dead-pointer pinch crash).
+                if (touchPtrB != -1) return false; // ignore 3rd finger
+                touchPtrB = pointer;
+                gpbX = screenX; gpbY = screenY;
+                panning = false;
+                downIndex = -1; dragIndex = -1; dragMoved = false;
+                return true;
+            }
+            // Canvas-or-chrome decision via the stage itself (no coordinate
+            // guessing): any stage actor other than the transparent canvas area
+            // (top bar, palette sheet, group bar, overlays) owns the tap.
+            Actor hit = stage.hit(screenX, Gdx.graphics.getHeight() - screenY, true);
+            if (hit != null && hit != canvasArea) return false;
+            boolean handled = firstFingerDown(screenX, screenY, button);
+            if (handled) { touchPtrA = pointer; gpaX = screenX; gpaY = screenY; }
+            return handled;
+        }
+
+        /** Single-finger canvas touch (part drag/tap-select/pan/place/delete). */
+        private boolean firstFingerDown(int screenX, int screenY, int button) {
+            Vector2 w = screenToWorld(screenX, screenY);
+            if (button == Input.Buttons.RIGHT) {
+                if (placing != null) { placing = null; return true; }
+                int idx = partAt(w);
+                if (idx >= 0) {
+                    design.parts.remove(idx);
+                    selected.clear();
+                    rebuildGroupBar();
+                    design.autoStage();
+                    rebuildStageList();
+                    return true;
+                }
+                return false;
+            }
+            if (placing != null) {
+                Vector2 snapped = snap(w.x, w.y, dragRot, placing, -1);
+                design.parts.add(new ShipDesign.DesignPart(placing.id, snapped.x, snapped.y, dragRot));
+                selected.clear();
+                rebuildGroupBar();
+                design.autoStage();
+                rebuildStageList();
+                if (!Gdx.input.isKeyPressed(Input.Keys.SHIFT_LEFT)) placing = null;
+                return true;
+            }
+            int idx = partAt(w);
+            if (idx >= 0) {
+                // could become a drag (move) or stay a tap (toggle selection)
+                downIndex = idx;
+                downScrX = screenX;
+                downScrY = screenY;
+                dragMoved = false;
+                return true;
+            }
+            panning = true;
+            panLastX = screenX;
+            panLastY = screenY;
+            downScrX = screenX;
+            downScrY = screenY;
+            return true;
+        }
+
+        /** Two-finger camera gesture: midpoint pans, pinch ratio zooms (item 2). */
+        private void pinchDrag(float x, float y, boolean movedIsA) {
+            float nAX = movedIsA ? x : gpaX, nAY = movedIsA ? y : gpaY;
+            float nBX = movedIsA ? gpbX : x, nBY = movedIsA ? gpbY : y;
+            float midX = (nAX + nBX) / 2f, midY = (nAY + nBY) / 2f;
+            float pmX = (gpaX + gpbX) / 2f, pmY = (gpaY + gpbY) / 2f;
+            double prevDist = Math.hypot(gpaX - gpbX, gpaY - gpbY);
+            double dist = Math.hypot(nAX - nBX, nAY - nBY);
+            // pan by midpoint delta (unprojected, exact)
+            tmp3.set(pmX, pmY, 0); cam.unproject(tmp3);
+            float w1x = tmp3.x, w1y = tmp3.y;
+            tmp3.set(midX, midY, 0); cam.unproject(tmp3);
+            cam.position.sub(tmp3.x - w1x, tmp3.y - w1y, 0);
+            // pinch zoom anchored at the midpoint
+            if (prevDist > 10 && dist > 10) {
+                float factor = (float) (prevDist / dist);
+                float newH = Math.max(5, Math.min(200, cam.viewportHeight * factor));
+                if (Float.isFinite(newH) && newH > 0 && newH != cam.viewportHeight) {
+                    tmp3.set(midX, midY, 0); cam.unproject(tmp3);
+                    float ax = tmp3.x, ay = tmp3.y;
+                    cam.viewportHeight = newH;
+                    cam.viewportWidth = newH * Gdx.graphics.getWidth() / Gdx.graphics.getHeight();
+                    cam.update();
+                    tmp3.set(midX, midY, 0); cam.unproject(tmp3);
+                    cam.position.x += ax - tmp3.x;
+                    cam.position.y += ay - tmp3.y;
+                }
+            }
+            cam.update();
+            gpaX = nAX; gpaY = nAY; gpbX = nBX; gpbY = nBY;
+        }
+
+        @Override
+        public boolean touchDragged(int screenX, int screenY, int pointer) {
+            if (touchPtrB != -1) {
+                if (pointer == touchPtrA || pointer == touchPtrB) {
+                    pinchDrag(screenX, screenY, pointer == touchPtrA);
+                    return true;
+                }
+                return false;
+            }
+            // single-finger op: keep our own per-finger position log current
+            // (used instead of Gdx.input.getX(pointer) everywhere — item 8)
+            if (pointer == touchPtrA) { gpaX = screenX; gpaY = screenY; }
+            if (pointer != touchPtrA) return false;
+            if (downIndex >= 0 && !dragMoved
+                    && Math.hypot(screenX - downScrX, screenY - downScrY) > 12) {
+                // promote to a drag-move
+                dragMoved = true;
+                dragIndex = downIndex;
+                dragRot = design.parts.get(dragIndex).rot;
+            }
+            if (dragMoved && dragIndex >= 0) {
+                Vector2 w = screenToWorld(screenX, screenY);
+                PartType t = PartList.get(design.parts.get(dragIndex).typeId);
+                Vector2 snapped = snap(w.x, w.y, dragRot, t, dragIndex);
+                dragX = snapped.x;
+                dragY = snapped.y;
+                design.parts.get(dragIndex).x = dragX;
+                design.parts.get(dragIndex).y = dragY;
+                design.parts.get(dragIndex).rot = dragRot;
+                return true;
+            }
+            if (panning) {
+                float scale = cam.viewportHeight / Gdx.graphics.getHeight();
+                cam.position.sub((screenX - panLastX) * scale, -(screenY - panLastY) * scale, 0);
+                cam.update();
+                panLastX = screenX;
+                panLastY = screenY;
+                return true;
+            }
+            return false;
+        }
+
+        @Override
+        public boolean touchUp(int screenX, int screenY, int pointer, int button) {
+            if (pointer == touchPtrB) {
+                touchPtrB = -1;
+                // re-anchor the remaining finger from OUR position log (the
+                // back-end's per-pointer query is not trustworthy — item 8)
+                if (touchPtrA >= 0) {
+                    panLastX = gpaX; panLastY = gpaY;
+                }
+                return true;
+            }
+            if (pointer != touchPtrA) return false;
+            if (touchPtrB != -1) {
+                // primary lifted while second finger still down: promote it
+                touchPtrA = touchPtrB;
+                touchPtrB = -1;
+                gpaX = gpbX;
+                gpaY = gpbY;
+                panLastX = gpaX; panLastY = gpaY;
+                panning = false; downIndex = -1; dragIndex = -1; dragMoved = false;
+                return true;
+            }
+            touchPtrA = -1;
+            if (downIndex >= 0) {
+                if (!dragMoved) {
+                    // tap: toggle selection for group assignment
+                    if (!selected.remove(downIndex)) selected.add(downIndex);
+                    status(selected.isEmpty() ? "Drag a part row onto the canvas, or tap it then click to place. Tap part = select; DEL deletes."
+                            : selected.size() + " selected — tap a group number below");
+                    rebuildGroupBar();
+                } else {
+                    design.autoStage();
+                    rebuildStageList();
+                }
+                downIndex = -1;
+                dragIndex = -1;
+                dragMoved = false;
+                return true;
+            }
+            if (panning) {
+                panning = false;
+                if (Math.hypot(screenX - downScrX, screenY - downScrY) < 12 && !selected.isEmpty()) {
+                    // tapped empty space: clear selection
+                    selected.clear();
+                    rebuildGroupBar();
+                }
+                return false;
+            }
+            return false;
+        }
+
+        @Override
+        public boolean scrolled(float amountX, float amountY) {
+            cam.viewportHeight = Math.max(5, Math.min(200, cam.viewportHeight * (amountY > 0 ? 1.1f : 0.9f)));
+            cam.viewportWidth = cam.viewportHeight * Gdx.graphics.getWidth() / Gdx.graphics.getHeight();
+            cam.update();
+            return true;
+        }
+
+        /** Gesture interrupted by the OS/back-end: drop ALL transient state. */
+        @Override
+        public boolean touchCancelled(int screenX, int screenY, int pointer, int button) {
+            touchPtrA = -1;
+            touchPtrB = -1;
+            panning = false;
+            downIndex = -1;
+            dragIndex = -1;
+            dragMoved = false;
+            return false;
+        }
+
+        @Override
+        public boolean keyDown(int keycode) {
+            if (keycode == Input.Keys.R) { rotateGhost(); return true; }
+            if (keycode == Input.Keys.ESCAPE) {
+                if (overlay != null) closeOverlay();
+                else if (placing != null) placing = null;
+                else game.setScreen(new MenuScreen(game));
+                return true;
+            }
+            if (keycode == Input.Keys.DEL || keycode == Input.Keys.BACKSPACE) {
+                return true;
+            }
+            return false;
+        }
+    }
+
+    public void selectPart(PartType t) {
+        placing = t;
+        dragRot = 0;
+        status("Placing: " + t.name + " (R = rotate, right-click = cancel, shift = keep placing)");
+    }
+
+    /** Diagnostic: palette row bounds in screen coords (smoke tests). */
+    public String actorBoundsInfo(int i) {
+        if (i >= paletteItems.size()) return "?";
+        Actor a = paletteItems.get(i);
+        com.badlogic.gdx.math.Vector2 bl = a.localToStageCoordinates(new com.badlogic.gdx.math.Vector2(0, 0));
+        com.badlogic.gdx.math.Vector2 tr = a.localToStageCoordinates(
+                new com.badlogic.gdx.math.Vector2(a.getWidth(), a.getHeight()));
+        bl = stage.stageToScreenCoordinates(bl);
+        tr = stage.stageToScreenCoordinates(tr);
+        return "(" + Math.round(bl.x) + "," + Math.round(tr.y) + ")-(" + Math.round(tr.x) + "," + Math.round(bl.y) + ")";
+    }
+
+    /** Palette drag-out (item 4): a palette row was pulled sideways — arm the ghost. */    void beginDragOut(PartType t, int pointer, float screenX, float screenY) {
+        // The raw interceptor owns the gesture from here on and will swallow the
+        // release touchUp — cancel the stage's touch focus (palette row /
+        // ScrollPane) NOW or the stale focus fires a phantom row touchUp on the
+        // next gesture and the stage swallows that touchUp, leaking
+        // EditorInput's touchPtrA (item 8).
+        stage.cancelTouchFocus();
+        placing = t;
+        dragRot = 0;
+        dragOutType = t;
+        dragScrX = screenX;
+        dragScrY = screenY;
+        status("Drag onto the canvas and release to place " + t.name);
+    }
+
+    /** Diagnostic: current status line text (smoke tests). */
+    public String lastStatus() { return statusLabel.getText().toString(); }
+
+    /** Diagnostics for input-lifecycle smoke tests. */
+    public float camXForTest() { return cam.position.x; }
+    public float camYForTest() { return cam.position.y; }
+    public float zoomForTest() { return cam.viewportHeight; }
+
+    /**
+     * Diagnostic: first screen point that is guaranteed canvas — no chrome and
+     * no part under it (smoke tests, robust to any camera state).
+     */
+    public int[] emptyCanvasPointForTest() {
+        for (int y = 180; y <= 700; y += 40) {
+            for (int x = 240; x <= 520; x += 40) {
+                Actor a = stage.hit(x, Gdx.graphics.getHeight() - y, true);
+                if (a != null && a != canvasArea) continue;
+                if (partAt(screenToWorld(x, y)) < 0) return new int[]{x, y};
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Palette drag-out release (screen coords of the finger): over the canvas
+     * (right of the palette column) -> place at the snapped position; back over
+     * the palette -> cancel.
+     */
+    void finishDragOut(float screenX, float screenY) {
+        dragOutType = null;
+        // defensive: nothing should hold stage focus after a drag-out (a second
+        // finger on the palette mid-drag could have re-armed one)
+        stage.cancelTouchFocus();
+        if (placing == null) return;
+        float paletteW = Gdx.graphics.getWidth() * 0.4f;
+        if (screenX > paletteW) {
+            Vector2 w = screenToWorld(screenX, screenY);
+            Vector2 snapped = snap(w.x, w.y, dragRot, placing, -1);
+            design.parts.add(new ShipDesign.DesignPart(placing.id, snapped.x, snapped.y, dragRot));
+            selected.clear();
+            rebuildGroupBar();
+            design.autoStage();
+            rebuildStageList();
+            status("Placed " + placing.name + " — drag another from the list, or tap a row");
+        } else {
+            status("Cancelled");
+        }
+        placing = null;
+    }
+
+    // ------------------------------------------------------------ palette item widget
+
+    private class PaletteItem extends Table {
+        final PartType partType;
+
+        PaletteItem(PartType t) {
+            partType = t;
+            setBackground(game.ui.tinted(new Color(0.14f, 0.16f, 0.22f, 1f)));
+            float textW = Gdx.graphics.getWidth() * 0.4f - 20; // palette width minus pads
+            Label name = new Label(t.name, game.ui.skin);
+            name.setFontScale(2.0f); // item 3: 2x, wrapped to stay inside the panel
+            name.setWrap(true);
+            Label info = new Label(t.type + "  " + String.format("%.2f t", t.massTons), game.ui.skin);
+            info.setFontScale(1.5f);
+            info.setWrap(true);
+            info.setColor(new Color(0.6f, 0.65f, 0.75f, 1f));
+            add(name).width(textW).left().padLeft(8).padTop(8).row();
+            add(info).width(textW).left().padLeft(8).padBottom(8);
+            // The whole row is the touch target (item 3). Tap = arm click-to-place.
+            // Horizontal drag-out is intercepted RAW upstream (see show(): the
+            // InputMultiplexer processor in front of the stage) because the
+            // ScrollPane steals/cancels Scene2D touch focus mid-drag; vertical
+            // drags are left to the pane and never arm anything (movement guard).
+            addListener(new InputListener() {
+                private float downX, downY;
+                private float downScrollY;
+                private boolean moved;
+                @Override public boolean touchDown(InputEvent e, float x, float y, int pointer, int button) {
+                    downX = x; downY = y;
+                    downScrollY = paletteScroll != null ? paletteScroll.getScrollY() : 0f;
+                    moved = false;
+                    return true;
+                }
+                @Override public void touchDragged(InputEvent e, float x, float y, int pointer) {
+                    if (Math.hypot(x - downX, y - downY) > 14) moved = true;
+                }
+                @Override public void touchUp(InputEvent e, float x, float y, int pointer, int button) {
+                    // The ScrollPane steals vertical drags without ever routing
+                    // touchDragged/cancel to this row (observed: moved=false,
+                    // cancelled=false after a 180 px scroll), so also treat any
+                    // pane scroll since touch-down as "this was a scroll, not a tap".
+                    boolean paneScrolled = paletteScroll != null
+                            && Math.abs(paletteScroll.getScrollY() - downScrollY) > 2f;
+                    if (!moved && !paneScrolled && !e.isCancelled()) {
+                        selectPart(t); // simple tap: arm click-to-place (fallback)
+                    }
+                }
+            });
+        }
+    }
+
+    // ------------------------------------------------------------ render
+
+    @Override
+    public void render(float delta) {
+        Gdx.gl.glClearColor(0.07f, 0.08f, 0.12f, 1f);
+        Gdx.gl.glClear(GL20.GL_COLOR_BUFFER_BIT);
+
+        // grid
+        game.shapes.setProjectionMatrix(cam.combined);
+        game.shapes.begin(com.badlogic.gdx.graphics.glutils.ShapeRenderer.ShapeType.Line);
+        game.shapes.setColor(0.16f, 0.18f, 0.24f, 1f);
+        float gx = (float) Math.floor(cam.position.x - cam.viewportWidth / 2 - 1);
+        float gy = (float) Math.floor(cam.position.y - cam.viewportHeight / 2 - 1);
+        for (float x = gx; x < cam.position.x + cam.viewportWidth / 2 + 2; x += 2) {
+            game.shapes.line(x, cam.position.y - cam.viewportHeight / 2 - 2, x, cam.position.y + cam.viewportHeight / 2 + 2);
+        }
+        for (float y = gy; y < cam.position.y + cam.viewportHeight / 2 + 2; y += 2) {
+            game.shapes.line(cam.position.x - cam.viewportWidth / 2 - 2, y, cam.position.x + cam.viewportWidth / 2 + 2, y);
+        }
+        game.shapes.end();
+
+        // parts
+        game.batch.setProjectionMatrix(cam.combined);
+        game.batch.begin();
+        for (ShipDesign.DesignPart dp : design.parts) {
+            drawPart(dp.typeId, dp.x, dp.y, dp.rot, 1f);
+        }
+        // ghost
+        if (placing != null) {
+            Vector2 w = screenToWorld(Gdx.input.getX(), Gdx.input.getY());
+            Vector2 snapped = snap(w.x, w.y, dragRot, placing, -1);
+            drawPart(placing.id, snapped.x, snapped.y, dragRot, 0.6f);
+            // attach markers
+            game.batch.end();
+            game.shapes.begin(com.badlogic.gdx.graphics.glutils.ShapeRenderer.ShapeType.Filled);
+            game.shapes.setColor(0.3f, 0.9f, 0.4f, 0.9f);
+            for (Vector2 p : attachWorld(placing, snapped.x, snapped.y, dragRot)) {
+                game.shapes.circle(p.x, p.y, 0.25f, 8);
+            }
+            for (ShipDesign.DesignPart dp : design.parts) {
+                PartType t = PartList.get(dp.typeId);
+                if (t == null) continue;
+                for (Vector2 p : attachWorld(t, dp.x, dp.y, dp.rot)) {
+                    game.shapes.circle(p.x, p.y, 0.18f, 8);
+                }
+            }
+            game.shapes.end();
+            game.batch.begin();
+        }
+        game.batch.end();
+
+        // selection outlines + activation-group badges (item 6a)
+        if (!selected.isEmpty() || hasAnyGroup()) {
+            game.shapes.setProjectionMatrix(cam.combined);
+            game.shapes.begin(com.badlogic.gdx.graphics.glutils.ShapeRenderer.ShapeType.Line);
+            game.shapes.setColor(0.3f, 0.9f, 1f, 0.95f);
+            for (int i : selected) {
+                if (i >= design.parts.size()) continue;
+                ShipDesign.DesignPart dp = design.parts.get(i);
+                PartType t = PartList.get(dp.typeId);
+                if (t == null) continue;
+                float hw = t.width / 2f + 0.3f, hh = t.height / 2f + 0.3f;
+                game.shapes.rect(dp.x - hw, dp.y - hh, hw * 2, hh * 2);
+            }
+            game.shapes.end();
+            game.shapes.begin(com.badlogic.gdx.graphics.glutils.ShapeRenderer.ShapeType.Filled);
+            for (int i = 0; i < design.parts.size(); i++) {
+                ShipDesign.DesignPart dp = design.parts.get(i);
+                if (dp.group <= 0) continue;
+                PartType t = PartList.get(dp.typeId);
+                if (t == null) continue;
+                game.shapes.setColor(0.2f, 0.55f, 1f, 0.95f);
+                game.shapes.circle(dp.x + t.width / 2f, dp.y + t.height / 2f, 0.55f, 12);
+            }
+            game.shapes.end();
+            // badge digits (constant on-screen size: scale follows zoom)
+            game.batch.setProjectionMatrix(cam.combined);
+            game.batch.begin();
+            game.font.getData().setScale(cam.viewportHeight / 40f * 0.07f);
+            for (int i = 0; i < design.parts.size(); i++) {
+                ShipDesign.DesignPart dp = design.parts.get(i);
+                if (dp.group <= 0) continue;
+                PartType t = PartList.get(dp.typeId);
+                if (t == null) continue;
+                game.font.draw(game.batch, String.valueOf(dp.group),
+                        dp.x + t.width / 2f - 0.28f * cam.viewportHeight / 40f,
+                        dp.y + t.height / 2f + 0.34f * cam.viewportHeight / 40f);
+            }
+            game.font.getData().setScale(com.differentrockets.game.DRGame.FONT_SCALE);
+            game.batch.end();
+        }
+
+        stage.act(delta);
+        stage.draw();
+    }
+
+    private boolean hasAnyGroup() {
+        for (ShipDesign.DesignPart dp : design.parts) if (dp.group > 0) return true;
+        return false;
+    }
+
+    private void drawPart(String typeId, float x, float y, int rot, float alpha) {
+        PartType t = PartList.get(typeId);
+        if (t == null) return;
+        TextureRegion r = game.shipSprites.find(t.sprite);
+        game.batch.setColor(1, 1, 1, alpha);
+        if (r != null) {
+            game.batch.draw(r, x - t.width / 2f, y - t.height / 2f,
+                    t.width / 2f, t.height / 2f, t.width, t.height,
+                    1f, 1f, rot * 90f);
+        } else {
+            game.batch.end();
+            game.shapes.begin(com.badlogic.gdx.graphics.glutils.ShapeRenderer.ShapeType.Line);
+            game.shapes.setColor(0.8f, 0.5f, 0.3f, alpha);
+            game.shapes.rect(x - t.width / 2f, y - t.height / 2f, t.width, t.height);
+            game.shapes.end();
+            game.batch.begin();
+        }
+        game.batch.setColor(1, 1, 1, 1);
+    }
+
+    @Override
+    public void resize(int w, int h) {
+        if (stage != null) stage.getViewport().update(w, h, true);
+        if (cam != null) {
+            cam.viewportWidth = cam.viewportHeight * w / h;
+            cam.update();
+        }
+    }
+
+    @Override
+    public void dispose() {
+        if (stage != null) stage.dispose();
+    }
+
+    /**
+     * Leaving the screen mid-gesture must not leak any pointer state into the
+     * next show() (item 8): armed drag-out, candidate row, tracked fingers,
+     * pan/drag indices — everything transient dies here.
+     */
+    @Override
+    public void hide() {
+        dragOutInterceptor.reset();
+        dragOutType = null;
+        placing = null;
+        touchPtrA = -1;
+        touchPtrB = -1;
+        panning = false;
+        downIndex = -1;
+        dragIndex = -1;
+        dragMoved = false;
+        if (stage != null) stage.cancelTouchFocus();
+    }
+}

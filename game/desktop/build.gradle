@@ -1,0 +1,24 @@
+plugins { id 'application' }
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_17
+    targetCompatibility = JavaVersion.VERSION_17
+}
+
+sourceSets.main.java.srcDirs = ['src']
+
+application {
+    mainClass = 'com.differentrockets.desktop.DesktopLauncher'
+}
+
+dependencies {
+    implementation project(':core')
+    implementation 'com.badlogicgames.gdx:gdx-backend-lwjgl3:1.12.1'
+    implementation 'com.badlogicgames.gdx:gdx-platform:1.12.1:natives-desktop'
+    implementation 'com.badlogicgames.gdx:gdx-box2d-platform:1.12.1:natives-desktop'
+}
+
+run {
+    workingDir = rootProject.file('core/assets').absolutePath
+    standardInput = System.in
+}

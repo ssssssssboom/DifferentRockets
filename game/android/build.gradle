@@ -1,0 +1,82 @@
+plugins { id 'com.android.application' }
+
+android {
+    namespace 'com.differentrockets'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId 'com.differentrockets'
+        minSdk 24
+        // targetSdk 29: scoped-storage enforcement stays OFF on Android 11
+        // (requestLegacyExternalStorage honored), and plain WRITE_EXTERNAL_STORAGE
+        // suffices on Android <= 10. MANAGE_EXTERNAL_STORAGE covers Android 12+.
+        targetSdk 29
+        versionCode 1
+        versionName '1.0'
+    }
+
+    buildTypes {
+        debug {
+            minifyEnabled false
+            debuggable true
+        }
+        release {
+            minifyEnabled false
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    sourceSets {
+        main {
+            java.srcDirs = ['src']
+            assets.srcDirs = ['../core/assets']
+            res.srcDirs = ['res']
+            manifest.srcFile 'AndroidManifest.xml'
+            jniLibs.srcDir 'libs'
+        }
+    }
+
+    packagingOptions {
+        resources.excludes.addAll(['META-INF/DEPENDENCIES', 'META-INF/LICENSE', 'META-INF/NOTICE'])
+        // the desktop player-resource copy dir must never ship inside the APK
+        resources.excludes.addAll(['DifferentRocket/**', 'assets/DifferentRocket/**'])
+    }
+}
+
+configurations { natives }
+
+// Extract .so files from the gdx natives JARs into libs/<abi>/ so AGP
+// packages them as JNI libs (plain JAR deps are not scanned for .so).
+tasks.register('copyAndroidNatives') {
+    doLast {
+        configurations.natives.files.each { jar ->
+            def abi = null
+            ['armeabi-v7a', 'arm64-v8a', 'x86', 'x86_64'].each { a ->
+                if (jar.name.endsWith("natives-${a}.jar")) abi = a
+            }
+            if (abi != null) {
+                def outDir = file("libs/${abi}")
+                outDir.mkdirs()
+                copy {
+                    from zipTree(jar)
+                    into outDir
+                    include '*.so'
+                }
+            }
+        }
+    }
+}
+preBuild.dependsOn 'copyAndroidNatives'
+
+dependencies {
+    implementation project(':core')
+    implementation 'com.badlogicgames.gdx:gdx-backend-android:1.12.1'
+    ['armeabi-v7a', 'arm64-v8a', 'x86', 'x86_64'].each { abi ->
+        natives "com.badlogicgames.gdx:gdx-platform:1.12.1:natives-${abi}"
+        natives "com.badlogicgames.gdx:gdx-box2d-platform:1.12.1:natives-${abi}"
+    }
+}

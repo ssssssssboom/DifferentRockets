@@ -1,0 +1,2 @@
+rootProject.name = 'DifferentRockets'
+include 'core', 'desktop', 'android'

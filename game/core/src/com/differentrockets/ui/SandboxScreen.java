@@ -1,0 +1,1821 @@
+package com.differentrockets.ui;
+
+import com.badlogic.gdx.Gdx;
+import com.badlogic.gdx.Input;
+import com.badlogic.gdx.InputAdapter;
+import com.badlogic.gdx.InputMultiplexer;
+import com.badlogic.gdx.ScreenAdapter;
+import com.badlogic.gdx.graphics.Color;
+import com.badlogic.gdx.graphics.GL20;
+import com.badlogic.gdx.graphics.OrthographicCamera;
+import com.badlogic.gdx.graphics.Pixmap;
+import com.badlogic.gdx.graphics.Texture;
+import com.badlogic.gdx.graphics.g2d.TextureRegion;
+import com.badlogic.gdx.graphics.glutils.ShapeRenderer;
+import com.badlogic.gdx.math.Vector2;
+import com.badlogic.gdx.math.Vector3;
+import com.badlogic.gdx.scenes.scene2d.InputEvent;
+import com.badlogic.gdx.scenes.scene2d.InputListener;
+import com.badlogic.gdx.scenes.scene2d.Stage;
+import com.badlogic.gdx.scenes.scene2d.ui.Label;
+import com.badlogic.gdx.scenes.scene2d.ui.Table;
+import com.badlogic.gdx.scenes.scene2d.ui.TextButton;
+import com.badlogic.gdx.scenes.scene2d.utils.ClickListener;
+import com.badlogic.gdx.scenes.scene2d.Actor;
+import com.badlogic.gdx.utils.viewport.ScreenViewport;
+import com.differentrockets.game.Attach;
+import com.differentrockets.game.DRGame;
+import com.differentrockets.game.FlameFx;
+import com.differentrockets.game.FlameScript;
+import com.differentrockets.game.OrbitPredictor;
+import com.differentrockets.game.Part;
+import com.differentrockets.game.Planet;
+import com.differentrockets.game.Ship;
+import com.differentrockets.game.SteeringIO;
+import com.differentrockets.util.Vec2d;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Random;
+
+/**
+ * Flight view: renders the sandbox (planets, terrain, ships, flames), handles
+ * flight input (keyboard + on-screen controls), map view, time warp.
+ */
+public class SandboxScreen extends ScreenAdapter {
+
+    private final DRGame game;
+    private Stage stage;
+    private final OrthographicCamera cam;
+    private final OrthographicCamera mapCam;
+    private boolean mapMode;
+    /**
+     * Map orbit-frame anchor (round 17): index into game.world.planets of the
+     * body the predicted path AND the map camera are anchored to; -1 = Auto
+     * (the ship's dominant body, round-15 default). Selected from a gravity-
+     * sorted list popped up by the FRAME button.
+     */
+    private int anchorIndex = -1;
+    private TextButton frameBtn;
+    private Table frameList;
+    /** Camera-follow state: the map center rides the selected anchor body. */
+    private Planet lastAnchorBody;
+    private double lastAnchorX, lastAnchorY;
+    private boolean mapInit;
+    private int mapPanPointer = -1;
+    private float mapPanLastX, mapPanLastY;
+    private float mapPanDist;
+    private boolean mapPanned;
+    // map camera center in DOUBLE precision (round 13): mapCam.position is a
+    // float copy derived from these every frame — at universe coords ~1e10 m
+    // float32 has ~1 km resolution, which jittered/segmented the prediction
+    // polyline; pan/zoom/tap update the doubles, the float cam follows
+    private double mapCX, mapCY;
+
+    // multitouch camera control (item 2): two-finger pan + pinch zoom
+    private final Vector2 camPan = new Vector2(); // flight camera pan offset (world meters)
+    private int touchA = -1, touchB = -1;         // active pointer ids (-1 = free)
+    private float paX, paY, pbX, pbY;             // last screen positions
+
+    // steering ring (item 4)
+    private boolean ringDrag;
+    private float ringX, ringY, ringR;
+    private final com.badlogic.gdx.math.Matrix4 ringMat = new com.badlogic.gdx.math.Matrix4();
+    private int slewDir;                          // -1/0/+1 while turn buttons/keys held
+
+    // tap-to-activate (item 6b)
+    private Part selectedPart;
+    private boolean tapCandidate;
+    private boolean tapMoved;
+    private float tapDist;
+    private double ringDelta; // grab offset between touch angle and target heading (item 11)
+
+    // drag resultant overlay (item 6): DRAG HUD toggle; on by default so the
+    // smoke flight screenshots show the CoP arrow
+    private boolean dragOverlay = true;
+
+    // orbit prediction in map view (item 10): cached, re-propagated at ~2 Hz
+    private final OrbitPredictor predictor = new OrbitPredictor();
+    /** Map orbit re-propagation interval (round 18: 15 Hz, was 4 Hz). */
+    private static final float ORBIT_INTERVAL = 1f / 15f;
+    private float orbitTimer = Float.MAX_VALUE;
+
+    private Label telemetry;
+    private Label stageLabel;
+    private SegmentedThrottle throttle;
+    private Texture starTex;
+    private final List<float[]> stars = new ArrayList<>();
+    private Texture atmoTex;
+
+    private final Vector3 tmp3 = new Vector3();
+    private final Vector2 tmp2 = new Vector2();
+    private float lastSimDt; // simulated seconds in the current frame (0 when paused)
+
+    public SandboxScreen(DRGame game) {
+        this.game = game;
+        cam = new OrthographicCamera();
+        cam.viewportHeight = 45;
+        mapCam = new OrthographicCamera();
+        // starfield
+        Random rnd = new Random(42);
+        Pixmap sp = new Pixmap(2, 2, Pixmap.Format.RGBA8888);
+        sp.setColor(Color.WHITE);
+        sp.fill();
+        starTex = new Texture(sp);
+        sp.dispose();
+        for (int i = 0; i < 300; i++) {
+            stars.add(new float[]{rnd.nextFloat(), rnd.nextFloat(), 0.4f + rnd.nextFloat() * 0.6f});
+        }
+        // soft circle texture for atmosphere
+        int sz = 256;
+        Pixmap ap = new Pixmap(sz, sz, Pixmap.Format.RGBA8888);
+        for (int y = 0; y < sz; y++) {
+            for (int x = 0; x < sz; x++) {
+                float dx = (x - sz / 2f) / (sz / 2f);
+                float dy = (y - sz / 2f) / (sz / 2f);
+                float d = (float) Math.sqrt(dx * dx + dy * dy);
+                float a = 0;
+                if (d < 1f) {
+                    // ring: strongest near r=0.85 fading in and out
+                    float ring = 1f - Math.abs(d - 0.82f) / 0.18f;
+                    a = Math.max(0, ring);
+                    if (d < 0.82f) a = Math.max(0.05f, a);
+                }
+                ap.setColor(1f, 1f, 1f, a);
+                ap.drawPixel(x, y);
+            }
+        }
+        atmoTex = new Texture(ap);
+        ap.dispose();
+    }
+
+    @Override
+    public void show() {
+        stage = new Stage(new ScreenViewport());
+        buildHud();
+        InputMultiplexer mux = new InputMultiplexer();
+        mux.addProcessor(stage);
+        mux.addProcessor(new GameInput());
+        Gdx.input.setInputProcessor(mux);
+        resize(Gdx.graphics.getWidth(), Gdx.graphics.getHeight());
+    }
+
+    // ---------------------------------------------------------------- HUD
+
+    private void buildHud() {
+        Table root = new Table();
+        root.setFillParent(true);
+        stage.addActor(root);
+
+        telemetry = new Label("", game.ui.skin);
+        // global font is scaled up; keep telemetry near its old effective size (~1.05x)
+        telemetry.setFontScale(1.0f); // global 1.75x already applied; keep telemetry at full UI scale
+
+        stageLabel = new Label("", game.ui.skin);
+        stageLabel.setColor(new Color(1f, 0.85f, 0.3f, 1f));
+
+        TextButton mapBtn = new TextButton("MAP", game.ui.skin);
+        mapBtn.addListener(new ClickListener() {
+            @Override public void clicked(InputEvent e, float x, float y) { toggleMap(); }
+        });
+        // round 17: map orbit-frame anchor — opens a gravity-sorted body
+        // list (see toggleFrameList). State is shown in the TEXT (like
+        // DRAG:on/off); a plain ClickListener keeps the return-to-gray
+        // behavior (no checked state).
+        frameBtn = new TextButton("FRAME:Auto", game.ui.skin);
+        frameBtn.addListener(new ClickListener() {
+            @Override public void clicked(InputEvent e, float x, float y) { toggleFrameList(); }
+        });
+        // item 6: toggle for the aerodynamic drag resultant overlay.
+        // Round 14: buttons must return to gray on touch-up — the on/off
+        // state is shown in the TEXT, not a stuck green tint.
+        final TextButton dragBtn = new TextButton("DRAG:on", game.ui.skin);
+        dragBtn.addListener(new ClickListener() {
+            @Override public void clicked(InputEvent e, float x, float y) {
+                dragOverlay = !dragOverlay;
+                dragBtn.setText(dragOverlay ? "DRAG:on" : "DRAG:off");
+            }
+        });
+        TextButton pauseBtn = new TextButton("II", game.ui.skin);
+        pauseBtn.addListener(new ClickListener() {
+            @Override public void clicked(InputEvent e, float x, float y) {
+                game.world.paused = !game.world.paused;
+            }
+        });
+        TextButton editorBtn = new TextButton("Menu", game.ui.skin);
+        editorBtn.addListener(new ClickListener() {
+            @Override public void clicked(InputEvent e, float x, float y) {
+                game.world.save();
+                game.setScreen(new MenuScreen(game));
+            }
+        });
+        // round 14 item 7: warp ladder — "-" / "+" step through WARP_LEVELS
+        // (1x 2x 4x physical, then 25x..250000x on rails), label shows current.
+        TextButton warpDown = new TextButton("-", game.ui.skin);
+        warpDown.addListener(new ClickListener() {
+            @Override public void clicked(InputEvent e, float x, float y) { warpStep(-1); }
+        });
+        warpLabel = new Label("1x", game.ui.skin);
+        warpLabel.setAlignment(com.badlogic.gdx.utils.Align.center);
+        TextButton warpUp = new TextButton("+", game.ui.skin);
+        warpUp.addListener(new ClickListener() {
+            @Override public void clicked(InputEvent e, float x, float y) { warpStep(1); }
+        });
+
+        Table topRight = new Table();
+        topRight.add(warpDown).width(60).height(64).pad(2);
+        topRight.add(warpLabel).width(110).height(64).pad(2);
+        topRight.add(warpUp).width(60).height(64).pad(2);
+        topRight.add(pauseBtn).width(60).height(64).pad(2);
+        topRight.add(dragBtn).width(110).height(64).pad(2);
+        topRight.add(mapBtn).width(96).height(64).pad(2);
+        topRight.add(frameBtn).width(170).height(64).pad(2);
+        topRight.add(editorBtn).width(104).height(64).pad(2);
+
+        // throttle: 10-segment bar from the Runtime atlas, right edge
+        // (round 11 item 10 — ThrottleControl track + ThrottleLevel sprites)
+        throttle = new SegmentedThrottle();
+
+        TextButton stageBtn = new TextButton("STAGE\n(Space)", game.ui.skin);
+        stageBtn.addListener(new ClickListener() {
+            @Override public void clicked(InputEvent e, float x, float y) { doStage(); }
+        });
+
+        TextButton activateBtn = new TextButton("ACTIVATE", game.ui.skin);
+        activateBtn.addListener(new ClickListener() {
+            @Override public void clicked(InputEvent e, float x, float y) { activateSelected(); }
+        });
+
+        // heading slew: "<" rotates the nose left (target heading increases)
+        TextButton leftBtn = holdBtn("<", 1);
+        TextButton rightBtn = holdBtn(">", -1);
+
+        TextButton zoomIn = new TextButton("+", game.ui.skin);
+        zoomIn.addListener(new ClickListener() {
+            @Override public void clicked(InputEvent e, float x, float y) { zoom(0.8f); }
+        });
+        TextButton zoomOut = new TextButton("-", game.ui.skin);
+        zoomOut.addListener(new ClickListener() {
+            @Override public void clicked(InputEvent e, float x, float y) { zoom(1.25f); }
+        });
+        // round 17: one-tap recenter — clears the drag offset so the flight
+        // camera snaps back onto the ship (lost-the-ship rescue)
+        TextButton centerBtn = new TextButton("CENTER", game.ui.skin);
+        centerBtn.addListener(new ClickListener() {
+            @Override public void clicked(InputEvent e, float x, float y) { camPan.setZero(); }
+        });
+
+        // portrait HUD: telemetry row / button row / right-edge throttle /
+        // two bottom button rows
+        root.top().left();
+        root.add(telemetry).pad(10).left().expandX().row();
+
+        Table topBar = new Table();
+        topBar.add().expandX();
+        topBar.add(topRight).right();
+        root.add(topBar).fillX().padRight(6).row();
+
+        Table mid = new Table();
+        mid.add().expandX();
+        mid.add(throttle).height(320).width(90).right().padRight(10);
+        root.add(mid).expandY().fillX().row();
+
+        Table bottomA = new Table();
+        bottomA.add(leftBtn).width(120).height(96).pad(4);
+        bottomA.add(rightBtn).width(120).height(96).pad(4);
+        bottomA.add(stageLabel).expandX().center().padLeft(8);
+        bottomA.add(zoomIn).width(96).height(96).pad(4);
+        bottomA.add(zoomOut).width(96).height(96).pad(4);
+        bottomA.add(centerBtn).width(130).height(96).pad(4);
+        root.add(bottomA).fillX().row();
+
+        Table bottomB = new Table();
+        bottomB.add().expandX();
+        bottomB.add(activateBtn).width(170).height(110).pad(6);
+        bottomB.add(stageBtn).width(200).height(110).pad(6);
+        bottomB.add().expandX();
+        root.add(bottomB).fillX().padBottom(8);
+    }
+
+    private Label warpLabel;
+
+    /** Step the time-warp ladder (round 14 item 7). */
+    private void warpStep(int dir) {
+        int[] levels = game.world.WARP_LEVELS;
+        int idx = 0;
+        for (int i = 0; i < levels.length; i++) {
+            if (levels[i] <= game.world.warp) idx = i;
+        }
+        idx = Math.max(0, Math.min(levels.length - 1, idx + dir));
+        game.world.warp = levels[idx];
+        refreshWarpLabel();
+    }
+
+    private void refreshWarpLabel() {
+        if (warpLabel != null) warpLabel.setText(game.world.warp + "x");
+    }
+
+    private TextButton warpBtn(String label, int w) {
+        TextButton b = new TextButton(label, game.ui.skin);
+        b.addListener(new ClickListener() {
+            @Override public void clicked(InputEvent e, float x, float y) {
+                game.world.warp = w;
+            }
+        });
+        return b;
+    }
+
+    private TextButton holdBtn(String label, final int dir) {
+        // turn buttons: fine slew of the steering target heading (item 4);
+        // while HELD they also drive SteeringIO.buttonTurn (item 2-UI), which
+        // the steering consumer treats as an override of the ring
+        TextButton b = new TextButton(label, game.ui.skin);
+        b.addListener(new ClickListener() {
+            @Override public boolean touchDown(InputEvent e, float x, float y, int pointer, int button) {
+                slewDir = dir;
+                syncButtonTurn();
+                return true;
+            }
+            @Override public void touchUp(InputEvent e, float x, float y, int pointer, int button) {
+                if (slewDir == dir) slewDir = 0;
+                syncButtonTurn();
+            }
+        });
+        return b;
+    }
+
+    /**
+     * SteeringIO contract (item 2-UI): the turn buttons write buttonTurn while
+     * held. slewDir = +1 slews the nose LEFT (heading is CCW from "up"), so
+     * the contract sign is flipped: buttonTurn = -1 left, +1 right.
+     */
+    private void syncButtonTurn() {
+        SteeringIO.buttonTurn = slewDir > 0 ? -1 : (slewDir < 0 ? 1 : 0);
+    }
+
+    /** Single write path for the steering target: world controller + SteeringIO. */
+    private void setSteerTarget(double rad) {
+        game.world.setTargetHeading(rad);
+        SteeringIO.targetHeadingRad = rad;
+    }
+
+    private void doStage() {
+        if (game.world.active != null) {
+            int s = game.world.active.activateStage();
+            stageLabel.setText(s >= 0 ? "Stage " + (s + 1) + " fired!" : "No stages left");
+        }
+    }
+
+    public void zoom(float f) {
+        if (!Float.isFinite(f) || f <= 0) return;
+        if (mapMode) {
+            // item 8: zoom out far enough to frame the whole solar system
+            // (Smeptune a ~= 4.5e11 m; Smalley's Comet apoapsis ~5.2e11 m)
+            mapCam.viewportHeight = clamp(mapCam.viewportHeight * f, 1000, 1.2e12f);
+            if (!Float.isFinite(mapCam.viewportHeight)) mapCam.viewportHeight = 200000;
+        } else {
+            cam.viewportHeight = clamp(cam.viewportHeight * f, 8, 200000);
+            if (!Float.isFinite(cam.viewportHeight)) cam.viewportHeight = 45;
+        }
+        updateCamViewport();
+    }
+
+    private static float clamp(float v, double lo, double hi) {
+        return (float) Math.max(lo, Math.min(hi, v));
+    }
+
+    // ---------------------------------------------------------------- input
+
+    private class GameInput extends InputAdapter {
+        @Override
+        public boolean keyDown(int keycode) {
+            switch (keycode) {
+                case Input.Keys.SPACE: doStage(); return true;
+                case Input.Keys.TAB: toggleMap(); return true;
+                case Input.Keys.P: game.world.paused = !game.world.paused; return true;
+                case Input.Keys.Z: setThrottleLevel(throttleLevel() + 1); return true;
+                case Input.Keys.X: setThrottleLevel(throttleLevel() - 1); return true;
+                case Input.Keys.SHIFT_LEFT: setThrottle(game.world.inputThrottle + 0.05); return true;
+                case Input.Keys.CONTROL_LEFT: setThrottle(game.world.inputThrottle - 0.05); return true;
+                case Input.Keys.LEFT: case Input.Keys.A: slewDir = 1; syncButtonTurn(); return true;
+                case Input.Keys.RIGHT: case Input.Keys.D: slewDir = -1; syncButtonTurn(); return true;
+                case Input.Keys.COMMA: zoom(0.8f); return true;
+                case Input.Keys.PERIOD: zoom(1.25f); return true;
+                case Input.Keys.NUM_1: game.world.warp = 1; return true;
+                case Input.Keys.NUM_2: game.world.warp = 2; return true;
+                case Input.Keys.NUM_3: game.world.warp = 4; return true;
+                case Input.Keys.NUM_4: game.world.warp = 25; return true;
+                case Input.Keys.NUM_5: game.world.warp = 100; return true;
+                case Input.Keys.NUM_6: game.world.warp = 1000; return true;
+                case Input.Keys.NUM_7: game.world.warp = 7500; return true;
+                case Input.Keys.NUM_8: game.world.warp = 50000; return true;
+                case Input.Keys.NUM_9: game.world.warp = 250000; return true;
+            }
+            return false;
+        }
+
+        @Override
+        public boolean keyUp(int keycode) {
+            switch (keycode) {
+                case Input.Keys.LEFT: case Input.Keys.A:
+                    if (slewDir > 0) slewDir = 0;
+                    syncButtonTurn();
+                    return true;
+                case Input.Keys.RIGHT: case Input.Keys.D:
+                    if (slewDir < 0) slewDir = 0;
+                    syncButtonTurn();
+                    return true;
+            }
+            return false;
+        }
+
+        @Override
+        public boolean scrolled(float amountX, float amountY) {
+            zoom(amountY > 0 ? 1.15f : 0.87f);
+            return true;
+        }
+
+        @Override
+        public boolean touchDown(int screenX, int screenY, int pointer, int button) {
+            if (touchA != -1 && touchB != -1) return false; // ignore 3rd finger
+            if (touchA == -1) {
+                touchA = pointer; paX = screenX; paY = screenY;
+                if (mapMode) {
+                    // round 13 item 2: the nav ring stays INTERACTIVE in map
+                    // view — touches inside its annulus steer, others pan/tap
+                    ringDrag = nearRing(screenX, screenY);
+                    if (ringDrag) {
+                        SteeringIO.ringActive = true;
+                        setSteerTarget(game.world.currentHeading());
+                        ringDelta = ringAngle(screenX, screenY) - game.world.getTargetHeading();
+                    } else {
+                        mapPanPointer = pointer;
+                        mapPanDist = 0;
+                        mapPanned = false;
+                    }
+                } else {
+                    // steering ring takes priority over tap-select near screen center
+                    ringDrag = nearRing(screenX, screenY);
+                    if (ringDrag) {
+                        // item 2-UI: tapping the ring ACTIVATES steering; the
+                        // target restarts from the ship's CURRENT heading.
+                        // Item 11 (kept): grab the ring where the finger lands
+                        // — the offset between touch angle and target heading
+                        // is preserved so the ring doesn't jump to the finger.
+                        SteeringIO.ringActive = true;
+                        setSteerTarget(game.world.currentHeading());
+                        ringDelta = ringAngle(screenX, screenY) - game.world.getTargetHeading();
+                    }
+                    tapCandidate = !ringDrag;
+                    tapMoved = false;
+                    tapDist = 0;
+                }
+                return true;
+            }
+            // second finger: two-finger camera gesture begins; one-finger ops cancel
+            touchB = pointer; pbX = screenX; pbY = screenY;
+            ringDrag = false;
+            tapCandidate = false;
+            mapPanned = true; // suppress the map tap when the gesture ends
+            return true;
+        }
+
+        @Override
+        public boolean touchDragged(int screenX, int screenY, int pointer) {
+            if (pointer == touchA && touchB != -1) {
+                twoFinger(screenX, screenY, true);
+                return true;
+            }
+            if (pointer == touchB) {
+                twoFinger(screenX, screenY, false);
+                return true;
+            }
+            if (pointer != touchA) return false;
+            // one-finger drag
+            if (mapMode) {
+                if (ringDrag) {
+                    // ring steering in map view (round 13 item 2)
+                    steerRingTo(screenX, screenY);
+                    paX = screenX; paY = screenY;
+                    return true;
+                }
+                // pan the double-precision map center directly (float unproject
+                // of a ~1e10 camera position was a jitter source, round 13)
+                double w = Gdx.graphics.getWidth(), h = Gdx.graphics.getHeight();
+                mapCX += (paX - screenX) / w * mapCam.viewportWidth;
+                mapCY += (screenY - paY) / h * mapCam.viewportHeight;
+                mapPanDist += Math.hypot(screenX - paX, screenY - paY);
+                if (mapPanDist > 12) mapPanned = true;
+                paX = screenX; paY = screenY;
+                return true;
+            }
+            if (ringDrag) {
+                steerRingTo(screenX, screenY);
+                paX = screenX; paY = screenY;
+                return true;
+            }
+            if (tapCandidate) {
+                tapDist += Math.hypot(screenX - paX, screenY - paY);
+                if (tapDist > 12) tapMoved = true;
+                paX = screenX; paY = screenY;
+                return true;
+            }
+            return false;
+        }
+
+        @Override
+        public boolean touchUp(int screenX, int screenY, int pointer, int button) {
+            if (pointer == touchB) {
+                touchB = -1;
+                // re-anchor the remaining finger at its live position (no camera jump);
+                // touchA may already be gone (lifted first) — never query a dead pointer
+                if (touchA >= 0) {
+                    paX = Gdx.input.getX(touchA);
+                    paY = Gdx.input.getY(touchA);
+                }
+                return true;
+            }
+            if (pointer != touchA) return false;
+            // A lifted while B is still down: promote B to the primary finger
+            // instead of leaving a stale pointer id (Android getX(deadId) crashes)
+            if (touchB != -1) {
+                touchA = touchB;
+                touchB = -1;
+                paX = Gdx.input.getX(touchA);
+                paY = Gdx.input.getY(touchA);
+                ringDrag = false;
+                tapCandidate = false;
+                return true;
+            }
+            touchA = -1;
+            boolean wasTap = tapCandidate && !tapMoved;
+            boolean wasRingDrag = ringDrag;
+            ringDrag = false;
+            tapCandidate = false;
+            if (mapMode) {
+                if (mapPanPointer == pointer) mapPanPointer = -1;
+                // a ring drag in map view is steering, not a map tap (item 2)
+                if (!mapPanned && !wasRingDrag) mapTap(screenX, screenY);
+                mapPanned = false;
+                return true;
+            }
+            if (wasTap) flightTap(screenX, screenY);
+            return true;
+        }
+
+        /** Two-finger gesture: midpoint drag pans, pinch ratio zooms (anchored at midpoint). */
+        private void twoFinger(float x, float y, boolean movedIsA) {
+            float nAX = movedIsA ? x : paX, nAY = movedIsA ? y : paY;
+            float nBX = movedIsA ? pbX : x, nBY = movedIsA ? pbY : y;
+            float midX = (nAX + nBX) / 2f, midY = (nAY + nBY) / 2f;
+            float prevMidX = (paX + pbX) / 2f, prevMidY = (paY + pbY) / 2f;
+            double prevDist = Math.hypot(paX - pbX, paY - pbY);
+            double dist = Math.hypot(nAX - nBX, nAY - nBY);
+            double sw = Gdx.graphics.getWidth(), sh = Gdx.graphics.getHeight();
+            if (mapMode) {
+                // pan + zoom on the double-precision map center (round 13)
+                mapCX += (prevMidX - midX) / sw * mapCam.viewportWidth;
+                mapCY += (midY - prevMidY) / sh * mapCam.viewportHeight;
+                if (prevDist > 10 && dist > 10) {
+                    float factor = (float) (prevDist / dist);
+                    double oldH = mapCam.viewportHeight, oldW = mapCam.viewportWidth;
+                    float newH = clamp((float) (oldH * factor), 1000, 1.2e12f);
+                    if (Float.isFinite(newH) && newH > 0 && newH != oldH) {
+                        // world point under the midpoint, kept anchored (doubles)
+                        double wx = mapCX + (midX - sw / 2) / sw * oldW;
+                        double wy = mapCY + (sh / 2 - midY) / sh * oldH;
+                        mapCam.viewportHeight = newH;
+                        updateCamViewport();
+                        mapCX = wx - (midX - sw / 2) / sw * mapCam.viewportWidth;
+                        mapCY = wy - (sh / 2 - midY) / sh * newH;
+                    }
+                }
+            } else {
+                // pan by midpoint delta
+                panCamera(cam, camPan, prevMidX, prevMidY, midX, midY);
+                // pinch zoom anchored at the midpoint
+                if (prevDist > 10 && dist > 10) {
+                    float factor = (float) (prevDist / dist);
+                    float oldH = cam.viewportHeight;
+                    float newH = clamp(oldH * factor, 8, 200000);
+                    // reject NaN/Inf results (degenerate gesture data once crashed us)
+                    if (Float.isFinite(newH) && newH > 0 && newH != oldH) {
+                        // world point under the midpoint before the zoom
+                        tmp3.set(midX, midY, 0);
+                        cam.unproject(tmp3);
+                        float wx = tmp3.x, wy = tmp3.y;
+                        cam.viewportHeight = newH;
+                        updateCamViewport();
+                        tmp3.set(midX, midY, 0);
+                        cam.unproject(tmp3);
+                        // keep that world point anchored under the midpoint
+                        camPan.x += wx - tmp3.x;
+                        camPan.y += wy - tmp3.y;
+                    }
+                }
+            }
+            paX = nAX; paY = nAY; pbX = nBX; pbY = nBY;
+        }
+
+        /** Pan a camera by a screen-space drag delta (unprojected). */
+        private void panCamera(OrthographicCamera c, Vector2 offset,
+                               float fromX, float fromY, float toX, float toY) {
+            tmp3.set(fromX, fromY, 0);
+            c.unproject(tmp3);
+            float fx = tmp3.x, fy = tmp3.y;
+            tmp3.set(toX, toY, 0);
+            c.unproject(tmp3);
+            float ddx = fx - tmp3.x, ddy = fy - tmp3.y;
+            if (offset != null) {
+                offset.x += ddx;
+                offset.y += ddy;
+            } else {
+                c.position.x += ddx;
+                c.position.y += ddy;
+            }
+        }
+    }
+
+    // ------------------------------------------------------------ gestures
+
+    private boolean nearRing(float sx, float sy) {
+        float my = Gdx.graphics.getHeight() - sy; // ring math is y-up
+        float d = (float) Math.hypot(sx - ringX, my - ringY);
+        return d > ringR * 0.55f && d < ringR * 1.6f;
+    }
+
+    /** Angle on the steering ring of a screen position (heading convention). */
+    private double ringAngle(float sx, float sy) {
+        float vx = sx - ringX;
+        float vy = (Gdx.graphics.getHeight() - sy) - ringY;
+        // nose direction for heading θ is (-sinθ, cosθ): solve for θ
+        return Math.atan2(-vx, vy);
+    }
+
+    /** Set the steering target heading from a ring drag position. */
+    private void steerRingTo(float sx, float sy) {
+        float vx = sx - ringX;
+        float vy = (Gdx.graphics.getHeight() - sy) - ringY;
+        if (vx * vx + vy * vy < 4) return;
+        // item 11: heading follows the finger by the grab offset (ringDelta),
+        // not absolutely — dragging starts from the current marker position
+        setSteerTarget(ringAngle(sx, sy) - ringDelta);
+    }
+
+    /** Tap on the map: switch ship or center a planet. */
+    private void mapTap(int screenX, int screenY) {
+        // an open anchor list eats the next tap anywhere (collapse-only)
+        if (frameList != null) {
+            toggleFrameList();
+            return;
+        }
+        // tap point in world coords from the double-precision center (round 13)
+        double sw = Gdx.graphics.getWidth(), sh = Gdx.graphics.getHeight();
+        double wx = mapCX + (screenX - sw / 2) / sw * mapCam.viewportWidth;
+        double wy = mapCY + (sh / 2 - screenY) / sh * mapCam.viewportHeight;
+        Ship best = null;
+        double bestD = mapCam.viewportHeight * 0.05;
+        for (Ship s : game.world.ships) {
+            Vec2d p = s.getUniversePos();
+            double d = Math.hypot(p.x - wx, p.y - wy);
+            if (d < bestD) { bestD = d; best = s; }
+        }
+        if (best != null && best != game.world.active) {
+            game.world.setActive(best);
+            mapMode = false;
+            return;
+        }
+        for (Planet p : game.world.planets) {
+            double d = Math.hypot(p.pos.x - wx, p.pos.y - wy);
+            if (d < Math.max(p.radius * 1.5, mapCam.viewportHeight * 0.03)) {
+                mapCX = p.pos.x;
+                mapCY = p.pos.y;
+                return;
+            }
+        }
+    }
+
+    /** Tap in flight view: select a part of the active ship (item 6b).
+     *  Round 11 item 8: nearest-EDGE distance wins — the tap point is measured
+     *  against every polygon edge of every fixture (no QueryAABB/testPoint),
+     *  so thin parts (struts, panels) are as easy to tap as fat tanks.
+     *  Threshold: max(3 m, 64 px in world units). */
+    private void flightTap(int screenX, int screenY) {
+        if (game.world.active == null) return;
+        tmp3.set(screenX, screenY, 0);
+        cam.unproject(tmp3);
+        final float wx = tmp3.x, wy = tmp3.y;
+        final float threshold = Math.max(3f, 64f / Gdx.graphics.getHeight() * cam.viewportHeight);
+        Part best = null;
+        float bestD = threshold;
+        Vector2 va = new Vector2(), vb = new Vector2();
+        for (Part p : game.world.active.parts) {
+            if (p.body == null) continue;
+            for (com.badlogic.gdx.physics.box2d.Fixture f : p.body.getFixtureList()) {
+                if (!(f.getShape() instanceof com.badlogic.gdx.physics.box2d.PolygonShape)) continue;
+                com.badlogic.gdx.physics.box2d.PolygonShape poly =
+                        (com.badlogic.gdx.physics.box2d.PolygonShape) f.getShape();
+                int n = poly.getVertexCount();
+                for (int i = 0; i < n; i++) {
+                    poly.getVertex(i, va);
+                    p.body.getWorldPoint(va);
+                    poly.getVertex((i + 1) % n, vb);
+                    p.body.getWorldPoint(vb);
+                    float d = Attach.closestOnSegment(tmp2.set(wx, wy), va, vb, va).dst(tmp2);
+                    if (d < bestD) { bestD = d; best = p; }
+                }
+            }
+        }
+        selectedPart = best;
+        if (best == null) {
+            // item 2-UI: a tap that hits NO button (we're past the stage) and
+            // NO part DEACTIVATES the steering ring — engines center
+            SteeringIO.ringActive = false;
+        }
+        stageLabel.setText(best != null
+                ? "Selected " + best.type.name + (best.group > 0 ? " [group " + best.group + "]" : "")
+                : "");
+    }
+
+    /** ACTIVATE button: fire onStage on the selected part and its activation group. */
+    public void activateSelected() {
+        if (selectedPart == null || game.world.active == null
+                || !game.world.active.parts.contains(selectedPart)) {
+            stageLabel.setText("Tap a part first, then ACTIVATE");
+            return;
+        }
+        int fired = 0;
+        int grp = selectedPart.group;
+        // snapshot group members FIRST: a detacher's onStage defers a ship
+        // split that mutates the live parts list — iterating it here while it
+        // changes was the group-activate crash.
+        List<Part> targets = new ArrayList<>();
+        for (Part p : game.world.active.parts) {
+            if (p == selectedPart || (grp > 0 && p.group == grp)) targets.add(p);
+        }
+        for (Part p : targets) {
+            // skip parts already destroyed/moved by an earlier member's activation
+            if (p.body == null || p.ship == null || !p.ship.parts.contains(p)) continue;
+            p.callOnStage();
+            fired++;
+        }
+        game.world.processDeferredStructure(); // apply detach/split immediately
+        stageLabel.setText(fired > 1
+                ? "Activated group " + grp + " (" + fired + " parts)"
+                : "Activated " + selectedPart.type.name);
+    }
+
+    /** test hook: select a part without a synthetic tap (smoke-detacher). */
+    public void debugSelectPart(Part p) {
+        selectedPart = p;
+        if (p == null) stageLabel.setText(""); // mirror the tap-path deselect
+    }
+
+    private void setThrottle(double v) {
+        game.world.inputThrottle = Math.max(0, Math.min(1, v));
+    }
+
+    // ------------------------------ segmented throttle (round 11 item 10)
+
+    /** Current throttle segment 0..10 (k = round(throttle * 10)). */
+    private int throttleLevel() {
+        return (int) Math.round(game.world.inputThrottle * SegmentedThrottle.SEGMENTS);
+    }
+
+    private void setThrottleLevel(int k) {
+        k = Math.max(0, Math.min(SegmentedThrottle.SEGMENTS, k));
+        game.world.inputThrottle = k / (double) SegmentedThrottle.SEGMENTS;
+    }
+
+    /** Smoke-test hooks: read/set the throttle in whole segments. */
+    public int throttleLevelForTest() { return throttleLevel(); }
+    public void setThrottleLevelForTest(int k) { setThrottleLevel(k); }
+
+    /**
+     * 10-segment throttle bar drawn from the Runtime atlas (round 11 item 10,
+     * follow-up): ThrottleControl.png is the track/frame and each
+     * ThrottleLevel{1..10}.png is one segment — a white alpha-mask bar that
+     * grows wider with its level, stacked bottom-to-top. Lit segments are
+     * tinted green, unlit ones dark red (the sprites themselves are white).
+     * Tap or drag to scrub; the touched segment count is round(yNorm * 10),
+     * giving 11 states (0..100% in 10% steps). Falls back to flat rectangles
+     * when the atlas is unavailable.
+     */
+    private final class SegmentedThrottle extends Actor {
+        static final int SEGMENTS = 10;
+        private TextureRegion track;
+        private final Texture[] seg = new Texture[SEGMENTS];
+        private com.differentrockets.util.AtlasPack loadedFrom;
+
+        SegmentedThrottle() {
+            addListener(new InputListener() {
+                @Override
+                public boolean touchDown(InputEvent e, float x, float y, int pointer, int button) {
+                    scrub(y);
+                    return true;
+                }
+                @Override
+                public void touchDragged(InputEvent e, float x, float y, int pointer) {
+                    scrub(y);
+                }
+            });
+        }
+        private void scrub(float y) {
+            float n = getHeight() <= 0 ? 0 : y / getHeight();
+            int k = Math.round(Math.max(0, Math.min(1, n)) * SEGMENTS);
+            game.world.inputThrottle = k / (double) SEGMENTS;
+        }
+        private void ensureSprites() {
+            if (loadedFrom == game.runtimeSprites) return;
+            for (int i = 0; i < SEGMENTS; i++) {
+                if (seg[i] != null) { seg[i].dispose(); seg[i] = null; }
+            }
+            track = null;
+            loadedFrom = game.runtimeSprites;
+            if (loadedFrom == null) return;
+            track = loadedFrom.find("ThrottleControl.png");
+            for (int i = 0; i < SEGMENTS; i++) {
+                // r="y" sprites are un-rotated here so no segment is sideways
+                seg[i] = loadedFrom.extractUnrotated("ThrottleLevel" + (i + 1) + ".png");
+            }
+        }
+        @Override
+        public void draw(com.badlogic.gdx.graphics.g2d.Batch batch, float parentAlpha) {
+            ensureSprites();
+            int lit = throttleLevel();
+            if (track != null && seg[0] != null) {
+                // textured bar: track frame + 10 stacked segment sprites
+                batch.setColor(Color.WHITE);
+                batch.draw(track, getX(), getY(), getWidth(), getHeight());
+                float slotH = getHeight() / SEGMENTS;
+                for (int i = 0; i < SEGMENTS; i++) {
+                    Texture t = seg[i];
+                    if (t == null) continue;
+                    // fit the sprite inside its slot, keep its aspect ratio,
+                    // bottom-aligned within the slot and centered horizontally
+                    float dw = getWidth() * 0.86f;
+                    float dh = dw * t.getHeight() / t.getWidth();
+                    float maxH = slotH * 0.86f;
+                    if (dh > maxH) { dh = maxH; dw = dh * t.getWidth() / t.getHeight(); }
+                    float sx = getX() + (getWidth() - dw) / 2f;
+                    float sy = getY() + i * slotH + (slotH - dh) / 2f;
+                    if (i < lit) batch.setColor(0.30f, 1.00f, 0.35f, 1f); // lit: green
+                    else batch.setColor(0.42f, 0.10f, 0.10f, 1f);         // empty: dark red
+                    batch.draw(t, sx, sy, dw, dh);
+                }
+                batch.setColor(Color.WHITE);
+                return;
+            }
+            // fallback: flat procedural segments (atlas unavailable)
+            float gap = 4f;
+            float h = (getHeight() - gap * (SEGMENTS - 1)) / SEGMENTS;
+            for (int i = 0; i < SEGMENTS; i++) {
+                if (i < lit) batch.setColor(0.25f, 0.95f, 0.35f, 1f);
+                else batch.setColor(0.42f, 0.10f, 0.10f, 1f);
+                batch.draw(starTex, getX(), getY() + i * (h + gap), getWidth(), h);
+            }
+            batch.setColor(Color.WHITE);
+        }
+    }
+
+    /** Entering map view re-centers on the active ship (mapInit=false triggers auto-fit in renderMap). */
+    public void toggleMap() {
+        mapMode = !mapMode;
+        if (mapMode) {
+            mapInit = false;
+            lastAnchorBody = null; // re-anchor the camera follow, no jump
+            orbitTimer = Float.MAX_VALUE; // force an immediate re-propagation
+        } else if (frameList != null) {
+            toggleFrameList(); // never leave the anchor list open over the flight view
+        }
+    }
+
+    /** g = mu/r² of body b on the ship at p (sort key for the anchor list). */
+    private static double gOn(Vec2d p, Planet b) {
+        double dx = b.pos.x - p.x, dy = b.pos.y - p.y;
+        return b.mu() / (dx * dx + dy * dy);
+    }
+
+    /**
+     * Open/close the map anchor list (round 17): every massive body, sorted
+     * by the CURRENT gravity it exerts on the active ship (strongest first),
+     * plus an "Auto" entry (the round-15 dominant-body behavior, index -1).
+     * Selecting an entry collapses the list and forces an immediate
+     * re-propagation so the orbit line switches frame instantly; tapping the
+     * FRAME button again or tapping the map collapses without changes.
+     */
+    private void toggleFrameList() {
+        if (frameList != null) {
+            frameList.remove();
+            frameList = null;
+            return;
+        }
+        final java.util.List<Planet> bodies = new java.util.ArrayList<>();
+        for (Planet p : game.world.planets) {
+            if (p.mu() > 0) bodies.add(p);
+        }
+        final Vec2d sp = game.world.active != null ? game.world.active.getUniversePos() : null;
+        if (sp != null) {
+            bodies.sort((a, b) -> Double.compare(gOn(sp, b), gOn(sp, a)));
+        }
+        frameList = new Table();
+        TextButton auto = new TextButton("Auto (dominant)", game.ui.skin);
+        auto.addListener(new ClickListener() {
+            @Override public void clicked(InputEvent e, float x, float y) { selectAnchor(-1, "Auto"); }
+        });
+        frameList.add(auto).width(240).height(56).pad(2).row();
+        for (final Planet p : bodies) {
+            final int idx = game.world.planets.indexOf(p);
+            TextButton b = new TextButton(p.name, game.ui.skin);
+            b.addListener(new ClickListener() {
+                @Override public void clicked(InputEvent e, float x, float y) { selectAnchor(idx, p.name); }
+            });
+            frameList.add(b).width(240).height(56).pad(2).row();
+        }
+        frameList.pack();
+        float sw = Gdx.graphics.getWidth(), sh = Gdx.graphics.getHeight();
+        frameList.setPosition(sw - frameList.getWidth() - 6,
+                Math.max(6, sh - 76 - frameList.getHeight())); // under the top-right bar
+        stage.addActor(frameList);
+    }
+
+    private void selectAnchor(int idx, String label) {
+        anchorIndex = idx;
+        frameBtn.setText("FRAME:" + label);
+        orbitTimer = Float.MAX_VALUE; // re-propagate NOW with the new frame
+        if (frameList != null) toggleFrameList(); // collapse
+    }
+
+    /**
+     * Map auto-fit (round 13): frame the predicted trajectory's bounding box
+     * (in draw-anchored coords), so even a short ballistic hop is visible on
+     * first open; falls back to framing the current planet when there is no
+     * prediction. Clamped to [2e4, 1.2e12] m.
+     */
+    private void autoFitMap() {
+        double need = 0;
+        // predictor.anchor already reflects the selected frame (round 17):
+        // compute() is called with anchorIndex, which it resolves to the
+        // explicit body or the automatic dominant one
+        if (predictor.count > 1 && predictor.anchor >= 0) {
+            Planet a0 = game.world.planets.get(predictor.anchor);
+            double bx = a0.pos.x;
+            double by = a0.pos.y;
+            double minX = Double.MAX_VALUE, maxX = -Double.MAX_VALUE;
+            double minY = Double.MAX_VALUE, maxY = -Double.MAX_VALUE;
+            for (int i = 0; i < predictor.count; i++) {
+                double dx = predictor.xs[i] - predictor.fx[i] + bx;
+                double dy = predictor.ys[i] - predictor.fy[i] + by;
+                if (dx < minX) minX = dx;
+                if (dx > maxX) maxX = dx;
+                if (dy < minY) minY = dy;
+                if (dy > maxY) maxY = dy;
+            }
+            double aspect = (double) Gdx.graphics.getWidth() / Gdx.graphics.getHeight();
+            need = Math.max(maxY - minY, (maxX - minX) / aspect) * 1.3;
+        }
+        if (need <= 0) {
+            Planet cp = game.world.currentPlanet();
+            need = Math.max(cp != null ? cp.radius * 4 : 0, 200000);
+        }
+        mapCam.viewportHeight = (float) Math.max(20000, Math.min(1.2e12, need));
+    }
+
+    // ---------------------------------------------------------------- render
+
+    @Override
+    public void render(float delta) {
+        // turn buttons/keys slew the steering target heading (~45 deg/s; a tap ≈ 2°)
+        if (slewDir != 0) {
+            setSteerTarget(
+                    game.world.getTargetHeading() + slewDir * Math.toRadians(45) * delta);
+        }
+        float fd = Math.min(delta, 1f / 20f);
+        game.world.update(fd);
+        // SteeringIO backstop: the world's PI controller may itself re-prime
+        // the target heading (spawn, ship switch) — mirror it every frame
+        SteeringIO.targetHeadingRad = game.world.getTargetHeading();
+        // particle FX advance in simulated time (freeze while paused, warp-aware)
+        lastSimDt = game.world.paused ? 0f : fd * game.world.warp;
+        FlameFx.update(lastSimDt);
+
+        Gdx.gl.glClearColor(0.02f, 0.03f, 0.07f, 1f);
+        Gdx.gl.glClear(GL20.GL_COLOR_BUFFER_BIT);
+
+        if (mapMode) {
+            renderMap();
+            // item 7: the navigation ring stays visible in map view
+            drawSteeringRing();
+        } else {
+            renderFlight();
+            drawSteeringRing();
+        }
+
+        updateTelemetry();
+        stage.act(delta);
+        stage.draw();
+    }
+
+    /** test hook: set the flight camera zoom (meters of viewport height). */
+    public void setFlightZoom(float viewportHeight) {
+        cam.viewportHeight = viewportHeight;
+        updateCamViewport();
+    }
+
+    /** test hook: current flight viewport height (NaN check in the zoom hammer). */
+    public float flightZoomForTest() { return cam.viewportHeight; }
+
+    /** test hooks: pooled flame particle counts (Item 2 cap assertion). */
+    public int flameParticlesForTest() { return FlameFx.activeCount(); }
+    public int flameParticlesMaxForTest() { return FlameFx.maxActiveEver(); }
+
+    private void updateCamViewport() {
+        float aspect = (float) Gdx.graphics.getWidth() / Gdx.graphics.getHeight();
+        cam.viewportWidth = cam.viewportHeight * aspect;
+        cam.update();
+        mapCam.viewportWidth = mapCam.viewportHeight * aspect;
+        mapCam.update();
+    }
+
+    private void renderFlight() {
+        // camera follows active ship COM (which is near origin) + two-finger pan offset
+        cam.position.set(camPan.x, camPan.y, 0);
+        cam.update();
+
+        drawStars();
+
+        Vec2d shipPos = game.world.active != null ? game.world.active.getUniversePos() : game.world.origin;
+
+        // planets: atmosphere glow + body circle
+        game.batch.setProjectionMatrix(cam.combined);
+        game.batch.begin();
+        for (Planet p : game.world.planets) {
+            double dx = p.pos.x - game.world.origin.x;
+            double dy = p.pos.y - game.world.origin.y;
+            double dist = Math.sqrt(dx * dx + dy * dy);
+            // skip if far off-screen
+            float halfView = Math.max(cam.viewportWidth, cam.viewportHeight) / 2f;
+            double outer = p.radius + Math.max(0, p.maxHeight) + Math.max(0, p.atmoHeight);
+            if (dist - outer > halfView * 3) continue;
+            if (p.hasAtmosphere()) {
+                float r = (float) (p.radius + p.atmoHeight);
+                Color c = p.mapColor;
+                game.batch.setColor(0.55f + c.r * 0.4f, 0.65f + c.g * 0.3f, 1f, 0.5f);
+                game.batch.draw(atmoTex, (float) dx - r, (float) dy - r, r * 2, r * 2);
+                game.batch.setColor(1, 1, 1, 1);
+            }
+        }
+        game.batch.end();
+
+        game.shapes.setProjectionMatrix(cam.combined);
+        game.shapes.begin(ShapeRenderer.ShapeType.Filled);
+        for (Planet p : game.world.planets) {
+            double dx = p.pos.x - game.world.origin.x;
+            double dy = p.pos.y - game.world.origin.y;
+            double dist = Math.sqrt(dx * dx + dy * dy);
+            float halfView = Math.max(cam.viewportWidth, cam.viewportHeight) / 2f;
+            double outer = p.radius + Math.max(0, p.maxHeight) + Math.max(0, p.atmoHeight);
+            if (dist - outer > halfView * 3) continue;
+            if (p == game.world.sun) {
+                game.shapes.setColor(1f, 0.9f, 0.4f, 1f);
+            } else {
+                Color cc = p.crustColor;
+                game.shapes.setColor(cc.r, cc.g, cc.b, 1f);
+            }
+            game.shapes.circle((float) dx, (float) dy, (float) p.radius, 96);
+        }
+        game.shapes.end();
+
+        game.world.terrain.render(cam);
+
+        // ships (the active one is drawn even while parked on super-warp rails)
+        game.batch.begin();
+        for (Ship s : game.world.ships) {
+            if (s.onRails && s != game.world.active) continue;
+            drawShip(s);
+        }
+        game.batch.end();
+
+        drawFlames();
+
+        // selected-part highlight (tap-to-activate, item 6b)
+        if (selectedPart != null && selectedPart.body != null
+                && game.world.active != null && game.world.active.parts.contains(selectedPart)) {
+            Vector2 sp = selectedPart.body.getPosition();
+            float sr = Math.max(selectedPart.type.width, selectedPart.type.height) * 0.75f;
+            game.shapes.setProjectionMatrix(cam.combined);
+            game.shapes.begin(ShapeRenderer.ShapeType.Line);
+            game.shapes.setColor(0.3f, 0.9f, 1f, 0.9f);
+            game.shapes.circle(sp.x, sp.y, sr, 32);
+            game.shapes.end();
+        }
+
+        drawTankLevels();
+
+        // item 6: aerodynamic drag resultant (CoP + total vector) behind DRAG toggle
+        drawDragOverlay();
+
+        game.shapes.begin(ShapeRenderer.ShapeType.Filled);
+        for (Ship s : game.world.ships) {
+            if (s == game.world.active) continue;
+            Vec2d p = s.getUniversePos();
+            double dx = p.x - game.world.origin.x;
+            double dy = p.y - game.world.origin.y;
+            double dist = Math.sqrt(dx * dx + dy * dy);
+            if (dist < 30000) {
+                game.shapes.setColor(1f, 0.6f, 0.2f, 1f);
+                game.shapes.circle((float) dx, (float) dy, cam.viewportHeight * 0.012f, 12);
+            }
+        }
+        game.shapes.end();
+    }
+
+    /**
+     * Item 5 (round 9): per-tank live level overlay — a bright fill rising
+     * from the tank bottom plus a subtle dark empty area, rotated with the
+     * part body. Liquid fuel = cyan, electric (battery) = green-yellow, solid
+     * (SRB) = orange. Cheap guards: tanks only, and only when a tank spans at
+     * least ~24 px on screen (zoomed-in enough to read).
+     */
+    private void drawTankLevels() {
+        Gdx.gl.glEnable(GL20.GL_BLEND);
+        Gdx.gl.glBlendFunc(GL20.GL_SRC_ALPHA, GL20.GL_ONE_MINUS_SRC_ALPHA);
+        float screenH = Gdx.graphics.getHeight();
+        game.shapes.setProjectionMatrix(cam.combined);
+        game.shapes.begin(ShapeRenderer.ShapeType.Filled);
+        for (Ship s : game.world.ships) {
+            if (s.onRails) continue;
+            for (Part p : s.parts) {
+                if (p.body == null || p.getFuelCapacity() <= 0) continue;
+                float spanPx = p.type.height / cam.viewportHeight * screenH;
+                if (spanPx < 24) continue;
+                double frac = p.getFuel() / p.getFuelCapacity();
+                if (frac < 0) frac = 0;
+                if (frac > 1) frac = 1;
+                float w2 = p.type.width / 2f * 0.16f; // thin gauge strip (round 11 item 9)
+                float h2 = p.type.height / 2f;
+                Vector2 c = p.body.getPosition();
+                float a = p.body.getAngle();
+                float cos = (float) Math.cos(a), sin = (float) Math.sin(a);
+                float fillY = -h2 + p.type.height * (float) frac;
+                // empty area above the fill line: subtle dark
+                levelQuad(c, cos, sin, -w2, fillY, w2, h2, 0f, 0f, 0f, 0.30f);
+                // fill below the line: bright, color by fuel type
+                int ft = p.getFuelType();
+                if (ft == 2) levelQuad(c, cos, sin, -w2, -h2, w2, fillY, 0.75f, 1f, 0.30f, 0.55f);
+                else if (ft == 3) levelQuad(c, cos, sin, -w2, -h2, w2, fillY, 1f, 0.60f, 0.20f, 0.55f);
+                else levelQuad(c, cos, sin, -w2, -h2, w2, fillY, 0.15f, 0.85f, 1f, 0.55f);
+            }
+        }
+        game.shapes.end();
+    }
+
+    /**
+     * Item 6: aggregate the per-part aerodynamic drag (½ρv²·CdA·dragExposure —
+     * the same law GameWorld.applyEnvironmentForces integrates) of the active
+     * ship into a center-of-pressure point plus a total force vector, and draw
+     * an arrow at the CoP scaled to the magnitude with a numeric label.
+     */
+    private void drawDragOverlay() {
+        if (!dragOverlay) return;
+        Ship s = game.world.active;
+        if (s == null || s.onRails) return;
+        double fx = 0, fy = 0;   // total drag force (physics frame direction)
+        double mx = 0, my = 0;   // force-weighted position moment (CoP)
+        double fSum = 0;
+        for (Part p : s.parts) {
+            if (p.body == null || !p.body.isActive()) continue;
+            Vector2 bp = p.body.getPosition();
+            double ux = game.world.origin.x + bp.x;
+            double uy = game.world.origin.y + bp.y;
+            // nearest body by surface distance (same rule as the physics pass)
+            Planet np = null;
+            double bestAlt = Double.MAX_VALUE;
+            for (Planet q : game.world.planets) {
+                double dx = ux - q.pos.x, dy = uy - q.pos.y;
+                double d = Math.sqrt(dx * dx + dy * dy) - q.radius;
+                if (d < bestAlt) { bestAlt = d; np = q; }
+            }
+            if (np == null || !np.hasAtmosphere()) continue;
+            // round 14: honor the player-editable density law (mod/physics.lua)
+            double rho = game.world.densityAt(ux, uy);
+            if (rho <= 1e-9) continue;
+            Vector2 v = p.body.getLinearVelocity();
+            // wind-relative velocity in the universe frame (planet rotation ignored)
+            double rvx = game.world.frameVel.x + s.originVel.x + v.x - np.vel.x;
+            double rvy = game.world.frameVel.y + s.originVel.y + v.y - np.vel.y;
+            double speed2 = rvx * rvx + rvy * rvy;
+            if (speed2 <= 0.01) continue;
+            double speed = Math.sqrt(speed2);
+            double cd = !Double.isNaN(p.dragCd) ? p.dragCd : Math.max(0.0, 0.75 + p.type.drag);
+            double area = !Double.isNaN(p.dragArea) ? p.dragArea : p.type.width;
+            double fmag = 0.5 * rho * speed2 * cd * area * p.dragExposure;
+            fx += -fmag * rvx / speed;
+            fy += -fmag * rvy / speed;
+            mx += bp.x * fmag;
+            my += bp.y * fmag;
+            fSum += fmag;
+        }
+        double fTot = Math.hypot(fx, fy);
+        if (fSum <= 0 || fTot <= 1e-6) return;
+        float copX = (float) (mx / fSum), copY = (float) (my / fSum);
+        float dirX = (float) (fx / fTot), dirY = (float) (fy / fTot);
+
+        // log-scaled arrow length so 0.1 kN and 500 kN both read on screen
+        float len = cam.viewportHeight * 0.18f
+                * (float) Math.max(0.12, Math.min(1, Math.log10(1 + fTot / 2000.0) / 1.5));
+        float tipX = copX + dirX * len, tipY = copY + dirY * len;
+        float barb = len * 0.22f;
+        double ba = Math.atan2(dirY, dirX);
+        float b1x = (float) (tipX - Math.cos(ba - 0.45) * barb), b1y = (float) (tipY - Math.sin(ba - 0.45) * barb);
+        float b2x = (float) (tipX - Math.cos(ba + 0.45) * barb), b2y = (float) (tipY - Math.sin(ba + 0.45) * barb);
+
+        Gdx.gl.glEnable(GL20.GL_BLEND);
+        Gdx.gl.glBlendFunc(GL20.GL_SRC_ALPHA, GL20.GL_ONE_MINUS_SRC_ALPHA);
+        game.shapes.setProjectionMatrix(cam.combined);
+        game.shapes.begin(ShapeRenderer.ShapeType.Line);
+        game.shapes.setColor(1f, 0.62f, 0.15f, 0.95f);
+        game.shapes.line(copX, copY, tipX, tipY);
+        game.shapes.line(tipX, tipY, b1x, b1y);
+        game.shapes.line(tipX, tipY, b2x, b2y);
+        // center-of-pressure marker
+        game.shapes.circle(copX, copY, cam.viewportHeight * 0.012f, 16);
+        game.shapes.end();
+
+        // numeric label at the arrow tip — drawn in screen space (the same
+        // ortho as the ring readouts): readable at every zoom level
+        tmp3.set(tipX, tipY, 0);
+        cam.project(tmp3);
+        float sw = Gdx.graphics.getWidth(), sh = Gdx.graphics.getHeight();
+        game.batch.setProjectionMatrix(ringMat.setToOrtho2D(0, 0, sw, sh));
+        game.batch.begin();
+        game.font.getData().setScale(1.0f);
+        game.font.setColor(1f, 0.72f, 0.3f, 1f);
+        String label = fTot >= 1e6 ? String.format("%.2f MN", fTot / 1e6)
+                : fTot >= 1e3 ? String.format("%.1f kN", fTot / 1e3)
+                : String.format("%.0f N", fTot);
+        game.font.draw(game.batch, label, tmp3.x + 12, tmp3.y - 6);
+        game.font.getData().setScale(DRGame.FONT_SCALE);
+        game.font.setColor(Color.WHITE);
+        game.batch.end();
+    }
+
+    /** Rotated quad in a part's local frame ((x1,y1)=bottom-left, (x2,y2)=top-right), 2 triangles. */
+    private void levelQuad(Vector2 c, float cos, float sin,
+                           float x1, float y1, float x2, float y2,
+                           float r, float g, float b, float a) {
+        game.shapes.setColor(r, g, b, a);
+        float ax = c.x + x1 * cos - y1 * sin, ay = c.y + x1 * sin + y1 * cos;
+        float bx = c.x + x2 * cos - y1 * sin, by = c.y + x2 * sin + y1 * cos;
+        float cx = c.x + x2 * cos - y2 * sin, cy = c.y + x2 * sin + y2 * cos;
+        float dx = c.x + x1 * cos - y2 * sin, dy = c.y + x1 * sin + y2 * cos;
+        game.shapes.triangle(ax, ay, bx, by, cx, cy);
+        game.shapes.triangle(ax, ay, cx, cy, dx, dy);
+    }
+
+    private void drawShip(Ship s) {
+        for (Part p : s.parts) {
+            if (p.body == null) continue;
+            TextureRegion r = game.shipSprites.find(p.type.sprite);
+            Vector2 pos = p.body.getPosition();
+            float angleDeg = (float) Math.toDegrees(p.body.getAngle());
+            if (r != null) {
+                game.batch.draw(r, pos.x - p.type.width / 2f, pos.y - p.type.height / 2f,
+                        p.type.width / 2f, p.type.height / 2f, p.type.width, p.type.height,
+                        1f, 1f, angleDeg);
+            }
+            // engine flames are drawn procedurally in drawFlames() after batch.end()
+            // parachute canopy when deployed
+            if ("parachute".equals(p.type.type) && p.deployed) {
+                TextureRegion cr = game.shipSprites.find("Parachute.png");
+                if (cr != null) {
+                    Vector2 top = p.body.getWorldPoint(tmp2.set(0, p.type.height / 2f));
+                    float w = 22f, h = 22f;
+                    game.batch.draw(cr, top.x - w / 2f, top.y, w / 2f, 0, w, h, 1f, 1f, angleDeg);
+                }
+            }
+        }
+    }
+
+    /** Engine flames: drawn by mod/flame.lua when present; built-in default otherwise. */
+    private void drawFlames() {
+        Gdx.gl.glEnable(GL20.GL_BLEND);
+        Gdx.gl.glBlendFunc(GL20.GL_SRC_ALPHA, GL20.GL_ONE_MINUS_SRC_ALPHA);
+        game.shapes.setProjectionMatrix(cam.combined);
+        boolean lua = FlameScript.begin(lastSimDt);
+        if (!lua) {
+            drawFlamesBuiltin();
+            FlameFx.render(game.batch);
+            return;
+        }
+        for (Ship s : game.world.ships) {
+            if (s.onRails) continue;
+            for (Part p : s.parts) {
+                if (p.body == null || p.type.engine == null || p.flameLevel <= 0.01f) continue;
+                float lvl = Math.min(1f, p.flameLevel);
+                Vector2 nozzle = p.body.getWorldPoint(tmp2.set(0, -p.type.height / 2f));
+                float ang = p.body.getAngle() + (float) Math.toRadians(p.flameGimbalDeg);
+                // thrust pushes along (-sin, cos); the plume exits the nozzle the opposite way
+                float dx = (float) Math.sin(ang), dy = -(float) Math.cos(ang);
+                float nozzleW = p.type.width * 0.3f * p.type.engine.size;
+                // ambient atmosphere at the nozzle (universe coords) drives
+                // Mach diamonds / plume expansion in mod/flame.lua
+                double ux = game.world.origin.x + nozzle.x;
+                double uy = game.world.origin.y + nozzle.y;
+                FlameScript.drawPart(nozzle.x, nozzle.y, dx, dy, ang, nozzleW, lvl,
+                        p.type.engine.size, p.type.height, game.world.time, p.type.engine.fuelType,
+                        game.world.pressureAt(ux, uy), game.world.densityAt(ux, uy),
+                        System.identityHashCode(p));
+            }
+        }
+        game.shapes.begin(ShapeRenderer.ShapeType.Filled);
+        FlameScript.flush(game.shapes);
+        game.shapes.end();
+        // textured pass: script sprites (core glow / Mach diamonds) + pooled
+        // exhaust particles; both render additively with their own batch scope
+        FlameScript.flushSprites(game.batch);
+        FlameFx.render(game.batch);
+    }
+
+    /** Built-in 3-layer plume (fallback when mod/flame.lua is missing or broken). */
+    private void drawFlamesBuiltin() {
+        game.shapes.begin(ShapeRenderer.ShapeType.Filled);
+        for (Ship s : game.world.ships) {
+            if (s.onRails) continue;
+            for (Part p : s.parts) {
+                if (p.body == null || p.type.engine == null || p.flameLevel <= 0.01f) continue;
+                boolean ion = p.type.engine.fuelType == 2;
+                float lvl = Math.min(1f, p.flameLevel);
+                Vector2 nozzle = p.body.getWorldPoint(tmp2.set(0, -p.type.height / 2f));
+                float ang = p.body.getAngle() + (float) Math.toRadians(p.flameGimbalDeg);
+                // thrust pushes along (-sin, cos); the plume exits the nozzle the opposite way
+                float dx = (float) Math.sin(ang), dy = -(float) Math.cos(ang);
+                // nozzle width scales with the engine's size stat (Blasto 170 = 0.96 m)
+                float nozzleW = p.type.width * 0.3f * p.type.engine.size;
+                // full-throttle plume = 3.2x the visible engine height (~19 m on a
+                // Blasto 170, ~6 m on a Tiny 21); throttle and jitter keep it alive
+                float len = p.type.height * (1.0f + 2.2f * lvl) * (ion ? 0.8f : 1f)
+                        * (0.85f + 0.3f * (float) Math.random());
+                float half = nozzleW * 0.5f * (0.85f + 0.3f * (float) Math.random());
+                if (ion) {
+                    flameCone(nozzle, dx, dy, len, half, 1.0f, 2.5f, 0.45f, 0.70f, 1f, 0.20f);
+                    flameCone(nozzle, dx, dy, len, half, 0.8f, 1.7f, 0.55f, 0.80f, 1f, 0.55f);
+                    flameCone(nozzle, dx, dy, len, half, 0.5f, 1.0f, 0.90f, 0.97f, 1f, 0.85f);
+                } else {
+                    flameCone(nozzle, dx, dy, len, half, 1.0f, 2.5f, 0.40f, 0.60f, 1f, 0.18f);
+                    flameCone(nozzle, dx, dy, len, half, 0.8f, 1.7f, 1f, 0.55f, 0.15f, 0.85f);
+                    flameCone(nozzle, dx, dy, len, half, 0.5f, 1.0f, 1f, 0.95f, 0.80f, 0.95f);
+                }
+            }
+        }
+        game.shapes.end();
+    }
+
+    /** One flame layer: triangle with its apex at the nozzle, widening toward the plume end. */
+    private void flameCone(Vector2 nozzle, float dx, float dy, float len, float half,
+                           float lenF, float widF, float r, float g, float b, float a) {
+        float cx = nozzle.x + dx * len * lenF, cy = nozzle.y + dy * len * lenF;
+        float px = -dy * half * widF, py = dx * half * widF;
+        game.shapes.setColor(r, g, b, a);
+        game.shapes.triangle(nozzle.x, nozzle.y, cx + px, cy + py, cx - px, cy - py);
+    }
+
+    /**
+     * SimpleRockets-style steering ring at screen center (item 4): ring,
+     * current heading marker (white tick), target heading marker (green tick),
+     * and an error arc between them (yellow). Dragging on/near the ring sets
+     * the target heading; the PI controller steers the ship toward it.
+     */
+    private void drawSteeringRing() {
+        if (game.world.active == null) return;
+        // round 19: parked on the ground there is nothing to steer — don't
+        // hang the giant ring (0.26·min(w,h)) over the zoomed-out scenery.
+        if (game.world.active.landed) return;
+        float w = Gdx.graphics.getWidth(), h = Gdx.graphics.getHeight();
+        ringX = w / 2f;
+        ringY = h / 2f;
+        ringR = Math.min(w, h) * 0.26f;
+
+        game.shapes.setProjectionMatrix(ringMat.setToOrtho2D(0, 0, w, h));
+        Gdx.gl.glEnable(GL20.GL_BLEND);
+        Gdx.gl.glBlendFunc(GL20.GL_SRC_ALPHA, GL20.GL_ONE_MINUS_SRC_ALPHA);
+
+        double cur = game.world.currentHeading();
+        double tgt = game.world.getTargetHeading();
+
+        // item 3: ship velocity vector on the ring — planet-relative wind
+        // frame (same as the telemetry SPD), marker at the velocity heading
+        Ship actShip = game.world.active;
+        Vec2d sv = actShip.getUniverseVel();
+        Planet vcp = game.world.currentPlanet();
+        double rvx = sv.x - (vcp != null ? vcp.vel.x : 0);
+        double rvy = sv.y - (vcp != null ? vcp.vel.y : 0);
+        double spd = Math.hypot(rvx, rvy);
+        double vHead = Math.atan2(-rvx, rvy); // ring heading convention
+
+        game.shapes.begin(ShapeRenderer.ShapeType.Line);
+        game.shapes.setColor(1f, 1f, 1f, 0.30f);
+        game.shapes.circle(ringX, ringY, ringR, 72);
+        // error arc from current to target (shortest way around)
+        double err = tgt - cur;
+        err = (err + Math.PI * 3) % (Math.PI * 2) - Math.PI;
+        int segs = 28;
+        double prevA = cur;
+        float prevX = ringPtX(prevA), prevY = ringPtY(prevA);
+        game.shapes.setColor(1f, 0.85f, 0.2f, 0.75f);
+        for (int i = 1; i <= segs; i++) {
+            double a = cur + err * i / segs;
+            float x = ringPtX(a), y = ringPtY(a);
+            game.shapes.line(prevX, prevY, x, y);
+            prevX = x; prevY = y;
+        }
+        // current heading marker (white radial tick)
+        game.shapes.setColor(1f, 1f, 1f, 0.9f);
+        game.shapes.line(ringX + (ringPtX(cur) - ringX) * 0.82f, ringY + (ringPtY(cur) - ringY) * 0.82f,
+                ringPtX(cur), ringPtY(cur));
+        // target heading marker (green tick, slightly outside)
+        game.shapes.setColor(0.3f, 1f, 0.45f, 0.95f);
+        game.shapes.line(ringPtX(tgt), ringPtY(tgt),
+                ringX + (ringPtX(tgt) - ringX) * 1.14f, ringY + (ringPtY(tgt) - ringY) * 1.14f);
+        // velocity marker (cyan radial tick, slightly inside) — item 3
+        if (spd > 0.5) {
+            game.shapes.setColor(0.35f, 0.85f, 1f, 0.95f);
+            game.shapes.line(ringX + (ringPtX(vHead) - ringX) * 0.90f, ringY + (ringPtY(vHead) - ringY) * 0.90f,
+                    ringX + (ringPtX(vHead) - ringX) * 1.05f, ringY + (ringPtY(vHead) - ringY) * 1.05f);
+        }
+        game.shapes.end();
+
+        // center cross
+        game.shapes.begin(ShapeRenderer.ShapeType.Filled);
+        game.shapes.setColor(1f, 1f, 1f, 0.5f);
+        game.shapes.circle(ringX, ringY, 2.5f, 12);
+        game.shapes.setColor(0.3f, 1f, 0.45f, 0.95f);
+        game.shapes.circle(ringX + (ringPtX(tgt) - ringX) * 1.14f, ringY + (ringPtY(tgt) - ringY) * 1.14f, 5f, 12);
+        game.shapes.setColor(1f, 1f, 1f, 0.95f);
+        game.shapes.circle(ringPtX(cur), ringPtY(cur), 4f, 12);
+        // velocity arrowhead on the ring at the velocity heading — item 3
+        if (spd > 0.5) {
+            float bx = ringPtX(vHead), by = ringPtY(vHead);
+            float ox = (bx - ringX) / ringR, oy = (by - ringY) / ringR; // unit outward
+            float pxu = -oy, pyu = ox;                                  // unit tangent
+            game.shapes.setColor(0.35f, 0.85f, 1f, 0.95f);
+            game.shapes.triangle(bx + ox * 14, by + oy * 14,
+                    bx - pxu * 7, by - pyu * 7,
+                    bx + pxu * 7, by + pyu * 7);
+        }
+        game.shapes.end();
+
+        // numeric speed readout just outside the ring at the velocity heading
+        if (spd > 0.5) {
+            game.batch.setProjectionMatrix(ringMat);
+            game.batch.begin();
+            game.font.getData().setScale(1.0f);
+            game.font.setColor(0.35f, 0.85f, 1f, 0.95f);
+            float tx = ringX + (float) -Math.sin(vHead) * ringR * 1.22f;
+            float ty = ringY + (float) Math.cos(vHead) * ringR * 1.22f;
+            game.font.draw(game.batch, fmt(spd) + " m/s", tx, ty);
+            game.font.getData().setScale(DRGame.FONT_SCALE);
+            game.font.setColor(Color.WHITE);
+            game.batch.end();
+        }
+    }
+
+    /** Ring point for a heading angle: nose dir is (-sinθ, cosθ), screen is y-up here. */
+    private float ringPtX(double heading) { return ringX + (float) -Math.sin(heading) * ringR; }
+    private float ringPtY(double heading) { return ringY + (float) Math.cos(heading) * ringR; }
+
+    private void drawStars() {
+        game.batch.getProjectionMatrix().setToOrtho2D(0, 0, Gdx.graphics.getWidth(), Gdx.graphics.getHeight());
+        game.batch.begin();
+        float px = -cam.position.x * 0.02f, py = -cam.position.y * 0.02f;
+        for (float[] s : stars) {
+            float x = (s[0] * Gdx.graphics.getWidth() + px) % Gdx.graphics.getWidth();
+            float y = (s[1] * Gdx.graphics.getHeight() + py) % Gdx.graphics.getHeight();
+            if (x < 0) x += Gdx.graphics.getWidth();
+            if (y < 0) y += Gdx.graphics.getHeight();
+            game.batch.setColor(1, 1, 1, s[2]);
+            game.batch.draw(starTex, x, y, 2, 2);
+        }
+        game.batch.setColor(1, 1, 1, 1);
+        game.batch.end();
+    }
+
+    // ---------------------------------------------------------------- map view
+
+    private void renderMap() {
+        Vec2d shipPos = game.world.active != null ? game.world.active.getUniversePos() : game.world.origin;
+        // re-propagate at 15 Hz (round 18: was 4 Hz — users found the line
+        // too stale; the re-anchor to live planet positions still happens
+        // EVERY frame in drawOrbitPrediction, so the line is 60 Hz smooth)
+        if (game.world.active != null) {
+            orbitTimer += Gdx.graphics.getDeltaTime();
+            if (orbitTimer > ORBIT_INTERVAL || predictor.count == 0) {
+                orbitTimer = 0;
+                predictor.compute(game.world, game.world.active, anchorIndex);
+            }
+        }
+        // auto-fit on first open: center on the active ship, framed on the prediction
+        if (!mapInit) {
+            mapInit = true;
+            mapCX = shipPos.x;
+            mapCY = shipPos.y;
+            autoFitMap();
+            updateCamViewport();
+        }
+        // camera follows the selected anchor body (round 17): the user's
+        // pan/pinch gestures keep editing mapCX/mapCY directly, we just add
+        // the anchor body's frame-to-frame movement, so the net effect is
+        // camera = body position + user offset. A body SWITCH records the
+        // new reference without moving the camera (no jump).
+        Planet fb = predictor.anchor >= 0 ? game.world.planets.get(predictor.anchor) : null;
+        if (fb != null) {
+            if (fb == lastAnchorBody) {
+                mapCX += fb.pos.x - lastAnchorX;
+                mapCY += fb.pos.y - lastAnchorY;
+            }
+            lastAnchorBody = fb;
+            lastAnchorX = fb.pos.x;
+            lastAnchorY = fb.pos.y;
+        }
+        // Round 18 jitter fix: the map camera sits at the ORIGIN and every
+        // world-space draw subtracts the double-precision center (mapCX,
+        // mapCY) BEFORE the float conversion. Universe coords (~1e10 m) in
+        // float32 quantize to ~1 km — a float camera position plus float
+        // vertices made every drawn thing (line, planets, labels) hop in
+        // ~km steps. All deltas below are viewport-scale doubles -> floats.
+        mapCam.position.set(0, 0, 0);
+        mapCam.update();
+
+        drawStars();
+
+        game.shapes.setProjectionMatrix(mapCam.combined);
+        float lw = mapCam.viewportHeight / 400f;
+
+        // planet orbit rings + bodies
+        for (Planet p : game.world.planets) {
+            if (p.parent != null) {
+                game.shapes.begin(ShapeRenderer.ShapeType.Line);
+                game.shapes.setColor(0.3f, 0.35f, 0.5f, 0.8f);
+                // sample ellipse in parent frame via the same Kepler solution over one period
+                drawOrbitPath(p);
+                game.shapes.end();
+            }
+        }
+        // planet bodies: TRUE-radius circles — translucent fill + outline ring,
+        // no sprite icons (they occluded ships and orbit lines). Positions are
+        // relative to the double map center (camera at origin, round 18).
+        game.shapes.begin(ShapeRenderer.ShapeType.Filled);
+        for (Planet p : game.world.planets) {
+            Color c = p.mapColor;
+            game.shapes.setColor(c.r, c.g, c.b, 0.35f);
+            game.shapes.circle((float) (p.pos.x - mapCX), (float) (p.pos.y - mapCY),
+                    (float) p.radius, 48);
+        }
+        game.shapes.end();
+        game.shapes.begin(ShapeRenderer.ShapeType.Line);
+        for (Planet p : game.world.planets) {
+            Color c = p.mapColor;
+            game.shapes.setColor(c.r, c.g, c.b, 0.9f);
+            game.shapes.circle((float) (p.pos.x - mapCX), (float) (p.pos.y - mapCY),
+                    (float) p.radius, 64);
+        }
+        game.shapes.end();
+
+        // ship orbit prediction + markers
+        if (game.world.active != null) {
+            drawOrbitPrediction();
+            // round 14 fix: drawOrbitPrediction switches ShapeRenderer to the
+            // SCREEN-space ortho — restore the map camera or the ship arrows
+            // below are drawn at universe coords in pixel space (invisible).
+            game.shapes.setProjectionMatrix(mapCam.combined);
+        }
+        game.shapes.begin(ShapeRenderer.ShapeType.Filled);
+        for (Ship s : game.world.ships) {
+            Vec2d sp = s.getUniversePos();
+            float r = mapCam.viewportHeight * 0.01f;
+            if (s == game.world.active) game.shapes.setColor(0.4f, 1f, 0.5f, 1f);
+            else game.shapes.setColor(1f, 0.7f, 0.2f, 1f);
+            // round 17: the arrow points along the ship's ATTITUDE (nose
+            // direction, the control part's body angle — an inertial-frame
+            // angle, so the map can use it directly). Nose dir convention
+            // matches the steering ring: (-sinθ, cosθ). Ships on rails have
+            // no bodies — fall back to the old velocity-relative direction.
+            Part ref = s.controlPart();
+            float dirx, diry;
+            if (ref != null && ref.body != null) {
+                double hd = ref.body.getAngle();
+                dirx = (float) -Math.sin(hd);
+                diry = (float) Math.cos(hd);
+            } else {
+                Planet cp = game.world.currentPlanet();
+                Vec2d svl = s.getUniverseVel();
+                double rvx = svl.x - (cp != null ? cp.vel.x : 0);
+                double rvy = svl.y - (cp != null ? cp.vel.y : 0);
+                dirx = 0; diry = 1;
+                double sp2 = rvx * rvx + rvy * rvy;
+                if (sp2 > 0.25) {
+                    double inv = 1 / Math.sqrt(sp2);
+                    dirx = (float) (rvx * inv);
+                    diry = (float) (rvy * inv);
+                }
+            }
+            float perx = -diry, pery = dirx;
+            // relative to the double map center (camera at origin, round 18)
+            float rx = (float) (sp.x - mapCX), ry = (float) (sp.y - mapCY);
+            game.shapes.triangle(rx + dirx * r * 1.5f, ry + diry * r * 1.5f,
+                    rx - dirx * r * 0.9f + perx * r, ry - diry * r * 0.9f + pery * r,
+                    rx - dirx * r * 0.9f - perx * r, ry - diry * r * 0.9f - pery * r);
+        }
+        game.shapes.end();
+
+        // planet + ship labels in SCREEN space (round 15): world-space font
+        // scaling made them enormous/pixelated when zoomed out to the system
+        // (250000x warp screenshots). Fixed pixel size at every zoom.
+        double msw = Gdx.graphics.getWidth(), msh = Gdx.graphics.getHeight();
+        game.batch.setProjectionMatrix(ringMat.setToOrtho2D(0, 0, (float) msw, (float) msh));
+        game.batch.begin();
+        game.font.getData().setScale(1.0f);
+        game.font.setColor(1f, 1f, 1f, 0.85f);
+        for (Planet p : game.world.planets) {
+            // skip labels for bodies too small to see at this zoom
+            if (p.radius / mapCam.viewportHeight < 0.0025) continue;
+            float sx = (float) ((p.pos.x + p.radius - mapCX) / mapCam.viewportWidth * msw + msw / 2);
+            float sy = (float) ((p.pos.y - mapCY) / mapCam.viewportHeight * msh + msh / 2);
+            if (sx < -200 || sx > msw + 200 || sy < -50 || sy > msh + 50) continue;
+            game.font.draw(game.batch, p.name, sx + 6, sy + 4);
+        }
+        game.font.setColor(0.6f, 1f, 0.7f, 0.9f);
+        for (Ship s : game.world.ships) {
+            Vec2d sp = s.getUniversePos();
+            float sx = (float) ((sp.x - mapCX) / mapCam.viewportWidth * msw + msw / 2);
+            float sy = (float) ((sp.y - mapCY) / mapCam.viewportHeight * msh + msh / 2);
+            if (sx < -200 || sx > msw + 200 || sy < -50 || sy > msh + 50) continue;
+            game.font.draw(game.batch, s.name, sx + 10, sy - 6);
+        }
+        game.font.getData().setScale(DRGame.FONT_SCALE);
+        game.font.setColor(Color.WHITE);
+        game.batch.end();
+    }
+
+    private void drawOrbitPath(Planet p) {
+        // sample one full period using Kepler's equation at N time steps;
+        // positions relative to the double map center (camera at origin, round 18)
+        double muP = p.parent.mu();
+        double n = Math.sqrt(muP / (p.a * p.a * p.a));
+        double period = 2 * Math.PI / n;
+        int N = 96;
+        float prevX = 0, prevY = 0;
+        for (int i = 0; i <= N; i++) {
+            double t = game.world.time + period * i / N;
+            // compute planet position relative to parent at time t (reuse rails math via a fresh solve)
+            double[] rel = orbitRelAt(p, t);
+            float x = (float) (p.parent.pos.x + rel[0] - mapCX);
+            float y = (float) (p.parent.pos.y + rel[1] - mapCY);
+            if (i > 0) game.shapes.line(prevX, prevY, x, y);
+            prevX = x;
+            prevY = y;
+        }
+    }
+
+    /** position relative to parent at absolute time t (mirrors Planet.localPosVel). */
+    private double[] orbitRelAt(Planet p, double t) {
+        double muP = p.parent.mu();
+        double n = Math.sqrt(muP / (p.a * p.a * p.a));
+        double M = n * t + p.v0;
+        if (!p.prograde) M = -M;
+        // round 14: wrap M to [-pi, pi] — Newton from E=M diverges for large
+        // M (big world.time after long warps) and high eccentricity, folding
+        // the drawn orbit/trajectory back on itself.
+        M = (M + Math.PI) % (2 * Math.PI);
+        if (M < 0) M += 2 * Math.PI;
+        M -= Math.PI;
+        double E = M + p.e * Math.sin(M);
+        for (int i = 0; i < 12; i++) E = E - (E - p.e * Math.sin(E) - M) / (1 - p.e * Math.cos(E));
+        double xp = p.a * (Math.cos(E) - p.e);
+        double yp = p.a * Math.sqrt(1 - p.e * p.e) * Math.sin(E);
+        double cw = Math.cos(p.w), sw = Math.sin(p.w);
+        return new double[]{xp * cw - yp * sw, xp * sw + yp * cw};
+    }
+
+    /**
+     * Item 10 / round 13 item 1: render the numerically propagated trajectory
+     * in TWO segments — a solid near-term line (first ~30% of the points)
+     * followed by a long-term line whose alpha fades per segment from 0.95 to
+     * zero at the tail. Decimated to <= 2000 GL points.
+     *
+     * Round 13 fixes:
+     *  - re-anchored EVERY rendered frame: the offset-chained polyline
+     *    (xs-fx+off, continuous by construction) is shifted by how far run 0's
+     *    body moved since the propagation started, so the line tracks the
+     *    planet at 60 Hz with no 2 Hz jump;
+     *  - world->screen projection is computed in DOUBLE precision against the
+     *    double map center and emitted as floats only in screen space — no
+     *    float32 jitter/gaps at universe coords ~1e10 m;
+     *  - frame-boundary holes are gone: the run offsets chain across dominant-
+     *    body transitions, so the polyline is continuous end to end.
+     */
+    private void drawOrbitPrediction() {
+        int n = predictor.count;
+        if (n < 2 || predictor.anchor < 0) return;
+        // ONE frame for the whole polyline (round 15), the body picked via
+        // the anchor list (round 17) — predictor.anchor resolves the
+        // explicit selection or the automatic dominant body. The raw
+        // inertial path is translated into that body's CURRENT frame;
+        // continuous by construction within a frame, a whole-line
+        // translation on switches (expected).
+        Planet a0 = game.world.planets.get(predictor.anchor);
+        double baseX = a0.pos.x, baseY = a0.pos.y;
+        int stride = Math.max(1, (n + 1999) / 2000);
+        int drawn = (n + stride - 1) / stride;
+        if (drawn < 2) return;
+        int solid = Math.max(1, (int) (drawn * 0.3));
+        double sw = Gdx.graphics.getWidth(), sh = Gdx.graphics.getHeight();
+        game.shapes.setProjectionMatrix(ringMat.setToOrtho2D(0, 0, (float) sw, (float) sh));
+        Gdx.gl.glEnable(GL20.GL_BLEND);
+        Gdx.gl.glBlendFunc(GL20.GL_SRC_ALPHA, GL20.GL_ONE_MINUS_SRC_ALPHA);
+        game.shapes.begin(ShapeRenderer.ShapeType.Line);
+        game.shapes.setColor(0.4f, 0.9f, 0.5f, 0.95f);
+        float prevX = 0, prevY = 0;
+        for (int i = 0; i < drawn; i++) {
+            int idx = Math.min(i * stride, n - 1);
+            // anchor-relative world position (doubles end to end)
+            double wx = predictor.xs[idx] - predictor.fx[idx] + baseX;
+            double wy = predictor.ys[idx] - predictor.fy[idx] + baseY;
+            float sx = (float) ((wx - mapCX) / mapCam.viewportWidth * sw + sw / 2);
+            float sy = (float) ((wy - mapCY) / mapCam.viewportHeight * sh + sh / 2);
+            if (i > 0) {
+                if (i > solid) {
+                    // long-term: per-segment linear alpha fade to zero at the tail
+                    float f2 = (i - solid) / (float) (drawn - solid);
+                    game.shapes.setColor(0.4f, 0.9f, 0.5f, 0.95f * (1f - f2));
+                }
+                game.shapes.line(prevX, prevY, sx, sy);
+            }
+            prevX = sx; prevY = sy;
+        }
+        game.shapes.end();
+    }
+
+    // ---------------------------------------------------------------- telemetry
+
+    private void updateTelemetry() {
+        refreshWarpLabel();
+        Ship s = game.world.active;
+        if (s == null) {
+            telemetry.setText("No active ship");
+            return;
+        }
+        Vec2d sp = s.getUniversePos();
+        Vec2d sv = s.getUniverseVel();
+        double alt = game.world.altitudeAt(sp.x, sp.y);
+        Planet cp = game.world.currentPlanet();
+        double speed = cp != null
+                ? Math.hypot(sv.x - cp.vel.x, sv.y - cp.vel.y) // surface-relative
+                : sv.len();
+        double fuel = s.fuelTotal(0);
+        double mono = s.fuelTotal(1);
+        double elec = s.fuelTotal(2);
+        telemetry.setText(
+                "ALT " + fmt(alt) + " m   SPD " + fmt(speed) + " m/s\n" +
+                "BODY " + (cp != null ? cp.name : "-") + (s.landed ? "  [landed]" : "") + "\n" +
+                "FUEL " + fmt(fuel) + "  MONO " + fmt(mono) + "  BATT " + fmt(elec) + "\n" +
+                "THR " + (int) (game.world.inputThrottle * 100) + "%   WARP " + game.world.warp + "x" +
+                (game.world.paused ? "   [PAUSED]" : "") +
+                (mapMode ? "   [MAP]" : ""));
+
+        // item 5 (round 9): a tap-selected tank/SRB/battery shows its live
+        // numeric level in the selection readout
+        if (selectedPart != null && selectedPart.body != null
+                && selectedPart.getFuelCapacity() > 0
+                && s.parts.contains(selectedPart)) {
+            int ft = selectedPart.getFuelType();
+            String unit = ft == 2 ? "CHARGE" : ft == 3 ? "SOLID" : "FUEL";
+            stageLabel.setText("Selected " + selectedPart.type.name
+                    + (selectedPart.group > 0 ? " [group " + selectedPart.group + "]" : "")
+                    + "  —  " + unit + " " + String.format("%.0f / %.0f",
+                    selectedPart.getFuel(), selectedPart.getFuelCapacity()));
+        }
+    }
+
+    /** Diagnostic: current selection/status line (smoke tests). */
+    public String stageLabelForTest() { return stageLabel.getText().toString(); }
+
+    private static String fmt(double v) {
+        if (Math.abs(v) >= 1e6) return String.format("%.2fM", v / 1e6);
+        if (Math.abs(v) >= 1e3) return String.format("%.1fk", v / 1e3);
+        return String.format("%.0f", v);
+    }
+
+    @Override
+    public void resize(int w, int h) {
+        if (stage != null) stage.getViewport().update(w, h, true);
+        updateCamViewport();
+    }
+
+    @Override
+    public void dispose() {
+        if (stage != null) stage.dispose();
+        starTex.dispose();
+        atmoTex.dispose();
+    }
+}

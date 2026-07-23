@@ -1,0 +1,270 @@
+package com.differentrockets.game;
+
+import com.badlogic.gdx.math.Vector2;
+
+import java.util.List;
+
+/**
+ * The Java object exposed to Lua scripts as the `part` argument.
+ * All positions/velocities are in the physics frame (meters, y-up, relative
+ * to the active origin). Planet positions are exposed in the same frame.
+ */
+public class ModApi {
+    public final Part part;
+
+    public ModApi(Part part) { this.part = part; }
+
+    private GameWorld world() { return part.ship.world; }
+
+    // ---------- identity ----------
+    public String getTypeId() { return part.type.id; }
+    public String getName() { return part.type.name; }
+    public String getType() { return part.type.type; }
+    /** Activation group of this part: 0 = none, 1..8. */
+    public int getGroup() { return part.group; }
+    public void setGroup(int g) { part.group = Math.max(0, Math.min(8, g)); }
+
+    // ---------- own physics ----------
+    public double getX() { return part.body != null ? part.body.getPosition().x : 0; }
+    public double getY() { return part.body != null ? part.body.getPosition().y : 0; }
+    public double getVelocityX() { return part.body != null ? part.body.getLinearVelocity().x : 0; }
+    public double getVelocityY() { return part.body != null ? part.body.getLinearVelocity().y : 0; }
+    public double getAngle() { return part.body != null ? part.body.getAngle() : 0; } // radians
+    public double getAngularVelocity() { return part.body != null ? part.body.getAngularVelocity() : 0; }
+    public double getMass() { return part.body != null ? part.body.getMass() : 0; }
+
+    public void applyForce(double fx, double fy) {
+        if (part.body != null) part.body.applyForceToCenter((float) fx, (float) fy, true);
+    }
+
+    /** Apply force at a local offset (meters, part frame). */
+    public void applyForceAt(double fx, double fy, double localX, double localY) {
+        if (part.body == null) return;
+        Vector2 wp = part.body.getWorldPoint(new Vector2((float) localX, (float) localY));
+        part.body.applyForce((float) fx, (float) fy, wp.x, wp.y, true);
+    }
+
+    public void applyTorque(double t) {
+        if (part.body != null) part.body.applyTorque((float) t, true);
+    }
+
+    // ---------- ship / world ----------
+    public double getShipX() { return world().origin.x + (part.body != null ? part.body.getPosition().x : 0); }
+    public double getShipY() { return world().origin.y + (part.body != null ? part.body.getPosition().y : 0); }
+    public double getShipVelocityX() { return part.ship.getUniverseVel().x; }
+    public double getShipVelocityY() { return part.ship.getUniverseVel().y; }
+
+    public int getPlanetCount() { return world().planets.size(); }
+    public String getPlanetName(int i) { return world().planets.get(i).name; }
+    public double getPlanetRadius(int i) { return world().planets.get(i).radius; }
+    public double getPlanetX(int i) { return world().planets.get(i).pos.x - world().origin.x; }
+    public double getPlanetY(int i) { return world().planets.get(i).pos.y - world().origin.y; }
+
+    /** Current primary body name (nearest planet). */
+    public String getCurrentPlanet() { Planet p = world().currentPlanet(); return p != null ? p.name : ""; }
+
+    /** Gravity vector at this part (m/s^2). */
+    public double getGravityX() { return world().gravityAt(universeX(), universeY()).x; }
+    public double getGravityY() { return world().gravityAt(universeX(), universeY()).y; }
+
+    private double universeX() { return world().origin.x + (part.body != null ? part.body.getPosition().x : 0); }
+    private double universeY() { return world().origin.y + (part.body != null ? part.body.getPosition().y : 0); }
+
+    /** Altitude above terrain surface (m) on the current planet. */
+    public double getAltitude() { return world().altitudeAt(universeX(), universeY()); }
+    public double getAtmoDensity() { return world().densityAt(universeX(), universeY()); }
+    public double getAtmoPressure() { return world().pressureAt(universeX(), universeY()); }
+    /** true if below sea level of a planet with water. */
+    public boolean isInWater() { return world().isInWater(universeX(), universeY()); }
+    /** true if sunlit (not occluded by any planet from the Sun). */
+    public boolean isInSunlight() { return world().isInSunlight(universeX(), universeY()); }
+
+    // ---------- input ----------
+    /** -1 = turn left, 0, +1 = turn right. This is the steering turn command. */
+    public double getTurn() { return world().inputTurn; }
+    /** 0..1 throttle. */
+    public double getThrottle() { return world().inputThrottle; }
+    /** true only on the frame a stage was activated. */
+    public boolean isStageActivated() { return part.stageActivatedThisFrame; }
+    /** current stage index the ship is on. */
+    public int getStage() { return part.ship.currentStage; }
+
+    // ---------- steering (round 12: SteeringIO + control.lua) ----------
+    /** Target heading (radians, body-angle convention: 0 = nose "up", CCW positive). */
+    public double getTargetHeading() { return world().getTargetHeading(); }
+    /** Command a heading (ring semantics): activates ring mode. */
+    public void setTargetHeading(double rad) { world().setTargetHeading(rad); }
+    /** Current ship heading (radians, same convention as target). */
+    public double getShipHeading() { return world().currentHeading(); }
+    /** Latest turn command in -1..1 (same value as getTurn()). */
+    public double getTurnCommand() { return world().getTurnCommand(); }
+
+    /**
+     * Raw steering input state (round 12), mirrored from SteeringIO:
+     *   active     bool — ring mode on (engines track targetRad)
+     *   buttonTurn int  — -1/0/+1 while a turn button is held (overrides ring)
+     *   targetRad  num  — ring target heading (radians, body-angle convention)
+     * The engine control law lives in mod/control.lua (controlLaw(part));
+     * angle errors must be wrapped to [-pi, pi] (see control.lua).
+     */
+    public org.luaj.vm2.LuaTable getSteering() {
+        org.luaj.vm2.LuaTable t = new org.luaj.vm2.LuaTable();
+        t.set("active", org.luaj.vm2.LuaValue.valueOf(SteeringIO.ringActive));
+        t.set("buttonTurn", SteeringIO.buttonTurn);
+        t.set("targetRad", SteeringIO.targetHeadingRad);
+        return t;
+    }
+
+    /**
+     * Read a mod file's text (player mod dir first, built-in assets as
+     * fallback — same resolution as part scripts). Plain file names only.
+     * Engine scripts use this to load control.lua into their own Lua state.
+     */
+    public String readModText(String name) {
+        if (name == null || name.length() == 0 || name.indexOf('/') >= 0
+                || name.indexOf('\\') >= 0 || name.indexOf("..") >= 0) return null;
+        com.badlogic.gdx.files.FileHandle dir = com.differentrockets.util.Res.modDir();
+        if (dir != null) {
+            com.badlogic.gdx.files.FileHandle f = dir.child(name);
+            if (f.exists()) {
+                try { return f.readString(); } catch (Exception ignored) {}
+            }
+        }
+        com.badlogic.gdx.files.FileHandle in = com.badlogic.gdx.Gdx.files.internal("mods/" + name);
+        if (in.exists()) {
+            try { return in.readString(); } catch (Exception ignored) {}
+        }
+        return null;
+    }
+
+    // ---------- fuel network ----------
+    /** Total fuel of the given type in the whole ship network. */
+    public double getFuelTotal(int fuelType) { return part.ship.fuelTotal(fuelType); }
+    public double getFuelCapacity(int fuelType) { return part.ship.fuelCapacity(fuelType); }
+    /**
+     * Drain up to `amount` units of the given fuel type for THIS part; returns
+     * actually drained. Supply scope: liquid (type 0) comes only from tanks
+     * connected to this part through fuel lines (fuelLine attach points) —
+     * tanks separated by parts without fuelLine points (pods, detachers,
+     * batteries) are isolated and will NOT supply this part. Monopropellant
+     * (type 1) and electric (type 2) are shared ship-wide; solid (type 3)
+     * only burns the consumer's own tank.
+     */
+    public double drainFuel(int fuelType, double amount) { return part.ship.drainFuel(part, fuelType, amount); }
+    /** Move fuel between tanks of this part's supply scope (liquid: fuel-line network; mono/electric: ship-wide); returns amount moved out of this tank (negative = into). */
+    public double transferFuel(int fuelType, double amount) { return part.ship.transferFuel(part, fuelType, amount); }
+
+    // ---------- own tank ----------
+    public double getFuel() { return part.getFuel(); }
+    public double getFuelMax() { return part.getFuelCapacity(); }
+    public int getFuelType() { return part.getFuelType(); }
+    public void setFuel(double v) { part.setFuel(v); }
+
+    /** Add fuel into the network (e.g. solar charging); returns amount actually added. */
+    public double addFuel(int fuelType, double amount) { return part.ship.addFuel(fuelType, amount); }
+
+    // ---------- part definition ----------
+    public double getWidth() { return part.type.width; }
+    public double getHeight() { return part.type.height; }
+    public double getEnginePower() { return part.type.engine != null ? part.type.engine.power : 0; }
+    public double getEngineConsumption() { return part.type.engine != null ? part.type.engine.consumption : 0; }
+    public double getEngineTurn() { return part.type.engine != null ? part.type.engine.turnDeg : 0; }
+    public double getEngineSize() { return part.type.engine != null ? part.type.engine.size : 0; }
+    public boolean isThrottleExponential() { return part.type.engine != null && part.type.engine.throttleExponential; }
+    public int getEngineFuelType() { return part.type.engine != null ? part.type.engine.fuelType : 0; }
+    public double getRcsPower() { return part.type.rcs != null ? part.type.rcs.power : 0; }
+    public double getRcsConsumption() { return part.type.rcs != null ? part.type.rcs.consumption : 0; }
+    public double getSolarChargeRate() { return part.type.solar != null ? part.type.solar.chargeRate : 0; }
+    public boolean hasLander() { return part.type.lander != null; }
+
+    // ---------- actions ----------
+    /** Sever all joints connecting this part (used by detachers). */
+    public void detach() { part.detachJoints(); }
+
+    public void setDeployed(boolean b) { part.deployed = b; }
+    public boolean isDeployed() { return part.deployed; }
+
+    // ---------- aerodynamics ----------
+    /**
+     * Effective drag coefficient of this part. If Lua set an absolute Cd via
+     * setDrag, that value; otherwise the 0.75 baseline + PartList.xml `drag`
+     * adjustment (nosecone drag="-1.0" -> 0.25, i.e. subtracts from ship total).
+     */
+    public double getDrag() {
+        return !Double.isNaN(part.dragCd) ? part.dragCd : Math.max(0.0, 0.75 + part.type.drag);
+    }
+    /** Set this part's absolute drag coefficient (e.g. 8 for an open parachute). */
+    public void setDrag(double cd) { part.dragCd = cd; }
+    /** Reset this part's drag to the PartList.xml-derived default. */
+    public void resetDrag() { part.dragCd = Double.NaN; }
+    /** Drag reference area in m^2 (defaults to the part's width). */
+    public double getDragArea() {
+        return !Double.isNaN(part.dragArea) ? part.dragArea : part.type.width;
+    }
+    /** Set the drag reference area in m^2 (e.g. 36 for an open parachute canopy). */
+    public void setDragArea(double a) { part.dragArea = a; }
+    /** Reset the drag reference area to the default (part width). */
+    public void resetDragArea() { part.dragArea = Double.NaN; }
+
+    /** Spawn engine flame fx: size 0..1+, angleOffset in degrees from the part's down-nozzle direction. */
+    public void emitFlame(double size, double angleOffsetDeg) { part.emitFlame((float) size, (float) angleOffsetDeg); }
+
+    // ---------- joint & actuator customization (round 9) ----------
+
+    /**
+     * Override this part's weld-joint spring-damper params, e.g.
+     *   part:setJointParams{frequencyHz=35, dampingRatio=1.2, angularDamping=0.05}
+     * Any key may be omitted (nil -> inherit physics.lua `joints` table ->
+     * Java defaults). When two parts are welded together, the override with
+     * the HIGHER frequencyHz wins (the stiffer side rules the connection) and
+     * its dampingRatio comes along; angularDamping applies to this part's own
+     * body only.
+     */
+    public void setJointParams(org.luaj.vm2.LuaTable t) {
+        if (t == null) return;
+        part.jointFreqHz = optJointNum(t, "frequencyHz");
+        part.jointDampRatio = optJointNum(t, "dampingRatio");
+        part.jointAngDamp = optJointNum(t, "angularDamping");
+        if (!Double.isNaN(part.jointAngDamp) && part.body != null) {
+            part.body.setAngularDamping((float) part.jointAngDamp);
+        }
+    }
+
+    private static double optJointNum(org.luaj.vm2.LuaTable t, String key) {
+        org.luaj.vm2.LuaValue v = t.get(key);
+        return v.isnumber() ? v.todouble() : Double.NaN;
+    }
+
+    /**
+     * This part's own joint overrides as a Lua table (round 11 item 6) —
+     * {frequencyHz=.., dampingRatio=.., angularDamping=..}, each key nil when
+     * unset. joints.lua folds these into its default resolution rule.
+     */
+    public org.luaj.vm2.LuaTable getJointParams() {
+        org.luaj.vm2.LuaTable t = new org.luaj.vm2.LuaTable();
+        if (!Double.isNaN(part.jointFreqHz)) t.set("frequencyHz", part.jointFreqHz);
+        if (!Double.isNaN(part.jointDampRatio)) t.set("dampingRatio", part.jointDampRatio);
+        if (!Double.isNaN(part.jointAngDamp)) t.set("angularDamping", part.jointAngDamp);
+        return t;
+    }
+
+    /** 0..1: how much of this part's cross-section is exposed to the airflow
+     *  (occlusion-aware drag, round 11 item 2). 1 = fully exposed. */
+    public double getDragExposure() { return part.dragExposure; }
+
+    /**
+     * Read a numeric entry from a physics.lua table, e.g.
+     * part:physicsNumber("gimbal", "kp") -> `gimbal = { kp = ... }`, with
+     * built-in defaults when the table/key is absent.
+     */
+    public double physicsNumber(String section, String key) {
+        return PhysicsScript.tableNumber(section, key);
+    }
+
+    /** Actual gimbal deflection of this engine (deg), driven by the Lua PID. */
+    public double getGimbalDeg() { return part.gimbalDeg; }
+    public void setGimbalDeg(double deg) { part.gimbalDeg = (float) deg; }
+
+    /** Log to console. */
+    public void log(String msg) { System.out.println("[lua:" + part.type.id + "] " + msg); }
+}

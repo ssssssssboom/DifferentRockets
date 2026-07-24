@@ -155,7 +155,14 @@ public final class TerrainScript {
             if (!info.istable()) return Double.NaN;
             double radius = info.get("radius").optdouble(Double.NaN);
             if (Double.isNaN(radius) || radius <= 0) return Double.NaN;
-            double abs = fn.call(info, LuaValue.valueOf(angleRad * radius)).todouble();
+            // round 19: wrap into [0, circumference) — atan2 hands us angles
+            // in [-pi, pi], and a negative x used to BYPASS every specialTerrains
+            // region (|x - center| never matched), splitting gameplay queries
+            // from render/collision on the whole lower half of the planet
+            double x = angleRad * radius;
+            double circ = 2 * Math.PI * radius;
+            x = ((x % circ) + circ) % circ;
+            double abs = fn.call(info, LuaValue.valueOf(x)).todouble();
             return abs - radius;
         } catch (LuaError e) {
             if (!callFailed) {

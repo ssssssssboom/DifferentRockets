@@ -184,14 +184,23 @@ public class OrbitPredictor {
      */
     public int computeWarp(GameWorld world, Ship ship, double dtScale,
                            double[] wx, double[] wy, double[] wvx, double[] wvy, double[] wt) {
-        impacted = false;
         if (world == null || ship == null || ship.parts.isEmpty()) return 0;
+        Vec2d sp = ship.getUniversePos();
+        Vec2d sv = ship.getUniverseVel();
+        return computeWarp(world, sp.x, sp.y, sv.x, sv.y, dtScale, wx, wy, wvx, wvy, wt);
+    }
+
+    /** Raw-state entry (probes/tests); the Ship overload delegates here. */
+    public int computeWarp(GameWorld world, double x0, double y0, double vx0, double vy0,
+                           double dtScale,
+                           double[] wx, double[] wy, double[] wvx, double[] wvy, double[] wt) {
+        impacted = false;
+        warpHitBody = -1;
+        if (world == null) return 0;
         List<Planet> planets = world.planets;
         bindPlanets(planets);
 
-        Vec2d sp = ship.getUniversePos();
-        Vec2d sv = ship.getUniverseVel();
-        double x = sp.x, y = sp.y, vx = sv.x, vy = sv.y;
+        double x = x0, y = y0, vx = vx0, vy = vy0;
         double t = world.time;
 
         wx[0] = x; wy[0] = y; wvx[0] = vx; wvy[0] = vy; wt[0] = t;
@@ -200,6 +209,7 @@ public class OrbitPredictor {
         accelAt(x, y);
 
         int cap = wx.length;
+        int hitBody = -1;
         for (int step = 0; step < cap - 1; step++) {
             double dt = adaptiveDt(x, y) * dtScale;
             // velocity-Verlet kick-drift-kick (planets advance mid-step)
@@ -226,15 +236,43 @@ public class OrbitPredictor {
                 double rim = prad[i] + Math.max(0, pl.maxHeight);
                 if (r2 < rim * rim) {
                     double surf = pl.radius + pl.heightAt(Math.atan2(dy, dx));
-                    if (r2 < surf * surf) { hit = true; break; }
+                    if (r2 < surf * surf) { hit = true; hitBody = i; break; }
                 }
             }
-            if (hit) { impacted = true; break; }
+            if (hit) {
+                impacted = true;
+                // round 19 (moon-crash fix): the raw impact point is already
+                // INSIDE the ground — the adaptive step near the surface is
+                // several seconds, so the first subsurface sample can be many
+                // km deep, and super-warp used to hand THAT to physics (no
+                // terrain colliders loaded yet inside a mountain). Truncate
+                // the trajectory at the last sample still clearing the
+                // surface by a speed-scaled margin, so the hand-back happens
+                // in open air with time for colliders (10 Hz, +-10 km window)
+                // to appear before the final approach.
+                Planet hb = planets.get(hitBody);
+                double vi = Math.hypot(vx - hb.vel.x, vy - hb.vel.y); // impact speed, planet-relative
+                double margin = Math.max(2000.0, 2.0 * vi);
+                while (cnt > 2) {
+                    int j = cnt - 1;
+                    double dx = wx[j] - px[hitBody], dy = wy[j] - py[hitBody];
+                    double surf = hb.radius
+                            + hb.heightAt(Math.atan2(dy, dx));
+                    double alt = Math.hypot(dx, dy) - surf;
+                    if (alt >= margin) break;
+                    cnt--;
+                }
+                warpHitBody = hitBody;
+                break;
+            }
             // escaped the system — enough
             if (x * x + y * y > 4e24) break; // r_sun > 2e12 m
         }
         return cnt;
     }
+
+    /** Body index of the warp-trajectory impact (-1 when none). */
+    public int warpHitBody = -1;
 
     /** Adaptive dt from the nearest body's local dynamical time. */
     private double adaptiveDt(double x, double y) {

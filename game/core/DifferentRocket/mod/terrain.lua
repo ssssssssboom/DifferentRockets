@@ -1,4 +1,4 @@
--- v2026.07.24.1
+-- v2026.07.24.2
 -- ============================================================================
 -- terrain.lua — planet terrain generation (PLAYER-EDITABLE)
 -- ============================================================================
@@ -123,38 +123,45 @@ local padHeightCache = {} -- planetName -> natural height at the pad center
 -- (collision and visuals are generated at different times). Use noise.* with
 -- fixed seeds, never math.random().
 --
--- The default below reproduces the built-in generator: per-range height
--- bands, 4 octaves of wrapped value noise, and a roughness shaping curve.
--- If this file errors, the built-in generator silently takes over.
+-- The default below EXTENDS the built-in generator (round 19): per-range
+-- height bands with smoothstep-blended edges, 7 octaves of wrapped value
+-- noise, and a roughness shaping curve. If this file errors, the built-in
+-- generator silently takes over (4 octaves, hard band edges — same family,
+-- slightly different heights).
 -- ============================================================================
 
 -- Natural terrain height WITHOUT the pad flattening (used internally for the
 -- pad-center reference height as well).
-local function baseTerrainHeight(planetName, angleRad)
-  local info = planetInfo[planetName]
-  if info == nil then return 0 end
-
-  local deg = math.deg(angleRad) % 360
-
-  -- height band: the first matching range wins
-  local lo, hi = info.minHeight, info.maxHeight
+-- Round 19: height BANDS used to switch hard at their boundaries (the Smearth
+-- mountain band 91-93 deg rose 4.8 km in a single sample = the "cliff/step"
+-- players reported) and the 4-octave noise's finest feature (~6 deg) was much
+-- WIDER than the 2 deg band, leaving the mesa top flat. Now: 7 octaves
+-- (finest ~0.6 deg features) and every band boundary is smoothstep-blended
+-- over up to 1.2 deg (capped at half the band width) toward the neighboring
+-- band, so edges are ramps and narrow bands stay rugged.
+local function bandFor(deg, info)
   for _, r in ipairs(info.ranges) do
     local s = r.startAngle % 360
     local e = r.endAngle % 360
     local inside
     if s <= e then inside = (deg >= s and deg <= e)
     else inside = (deg >= s or deg <= e) end
-    if inside then lo, hi = r.minHeight, r.maxHeight break end
+    if inside then return r.minHeight, r.maxHeight, math.min((e - s) % 360, 360) / 2 end
   end
+  return info.minHeight, info.maxHeight, math.huge
+end
 
-  local span = hi - lo
-  if span <= 0.0001 then return lo end
+local function baseTerrainHeight(planetName, angleRad)
+  local info = planetInfo[planetName]
+  if info == nil then return 0 end
 
-  -- 4 octaves of wrapped value noise, seeded per planet
+  local deg = math.deg(angleRad) % 360
+
+  -- 7 octaves of wrapped value noise, seeded per planet
   local seed = noise.hash(planetName)
   local sum, amp, norm = 0.0, 1.0, 0.0
   local baseFreq = math.floor(math.max(2.0, 6.0 + info.noise * 0.6) + 0.5)
-  for oct = 0, 3 do
+  for oct = 0, 6 do
     local f = baseFreq * 2^oct
     sum = sum + amp * noise.value1(deg / 360.0 * f, f, seed + oct * 131.7)
     norm = norm + amp
@@ -162,7 +169,37 @@ local function baseTerrainHeight(planetName, angleRad)
   end
   local n01 = (sum / norm + 1) * 0.5          -- [0,1]
   local rough = math.min(2.5, 0.25 + info.noise * 0.28)
-  return lo + span * (n01 ^ rough)
+  local shaped = n01 ^ rough
+
+  local function bandHeight(lo, hi)
+    local span = hi - lo
+    if span <= 0.0001 then return lo end
+    return lo + span * shaped
+  end
+
+  local lo, hi, halfW = bandFor(deg, info)
+  -- nearest band boundary (signed distance, deg)
+  local bestSD, bestB = math.huge, 0
+  for _, r in ipairs(info.ranges) do
+    for _, b in ipairs({ r.startAngle % 360, r.endAngle % 360 }) do
+      local sd = (deg - b + 540) % 360 - 180
+      if math.abs(sd) < math.abs(bestSD) then bestSD, bestB = sd, b end
+    end
+  end
+  if math.abs(bestSD) < 1.2 then
+    -- band heights on BOTH sides of the boundary, blended by a smoothstep of
+    -- the signed distance (+ side is CCW of the boundary)
+    local loP, hiP, halfP = bandFor((bestB + 1.2) % 360, info)
+    local loM, hiM, halfM = bandFor((bestB - 1.2 + 360) % 360, info)
+    local rim = math.min(1.2, halfP, halfM)
+    if math.abs(bestSD) < rim then
+      local t = bestSD / rim * 0.5 + 0.5
+      t = t * t * (3 - 2 * t)
+      local hM, hP = bandHeight(loM, hiM), bandHeight(loP, hiP)
+      return hM + (hP - hM) * t
+    end
+  end
+  return bandHeight(lo, hi)
 end
 
 function terrainHeight(planetName, angleRad)

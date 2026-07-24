@@ -281,38 +281,40 @@ public class SandboxScreen extends ScreenAdapter {
         // sandbox 2x: taller/wider bar for a fat-finger scrub target
         throttle = new SegmentedThrottle();
 
-        TextButton stageBtn = big(new TextButton("STAGE\n(Space)", game.ui.skin), 1.6f);
+        TextButton stageBtn = new TextButton("STAGE\n(Space)", game.ui.skin);
         stageBtn.addListener(new ClickListener() {
             @Override public void clicked(InputEvent e, float x, float y) { doStage(); }
         });
 
-        TextButton activateBtn = big(new TextButton("ACTIVATE", game.ui.skin));
+        TextButton activateBtn = new TextButton("ACTIVATE", game.ui.skin);
         activateBtn.addListener(new ClickListener() {
             @Override public void clicked(InputEvent e, float x, float y) { activateSelected(); }
         });
 
         // heading slew: "<" rotates the nose left (target heading increases)
-        TextButton leftBtn = big(holdBtn("<", 1));
-        TextButton rightBtn = big(holdBtn(">", -1));
+        // (user feedback: the 7 bottom buttons stay at the ORIGINAL 1x size —
+        //  only the top bars/throttle/ring keep the sandbox 2x upscale)
+        TextButton leftBtn = holdBtn("<", 1);
+        TextButton rightBtn = holdBtn(">", -1);
 
-        TextButton zoomIn = big(new TextButton("+", game.ui.skin));
+        TextButton zoomIn = new TextButton("+", game.ui.skin);
         zoomIn.addListener(new ClickListener() {
             @Override public void clicked(InputEvent e, float x, float y) { zoom(0.8f); }
         });
-        TextButton zoomOut = big(new TextButton("-", game.ui.skin));
+        TextButton zoomOut = new TextButton("-", game.ui.skin);
         zoomOut.addListener(new ClickListener() {
             @Override public void clicked(InputEvent e, float x, float y) { zoom(1.25f); }
         });
         // round 17: one-tap recenter — clears the drag offset so the flight
         // camera snaps back onto the ship (lost-the-ship rescue)
-        TextButton centerBtn = big(new TextButton("CENTER", game.ui.skin));
+        TextButton centerBtn = new TextButton("CENTER", game.ui.skin);
         centerBtn.addListener(new ClickListener() {
             @Override public void clicked(InputEvent e, float x, float y) { camPan.setZero(); }
         });
 
-        // portrait HUD (sandbox 2x): telemetry row / top bar (left MENU+MAP
-        // column, right two-row warp/pause/drag/frame cluster) / right-edge
-        // throttle / THREE bottom rows (turn, zoom, stage/activate)
+        // portrait HUD: telemetry row / top bar (left MENU+MAP column, right
+        // two-row warp/pause/drag/frame cluster at 2x) / right-edge throttle /
+        // TWO bottom rows (the 7 bottom buttons are back to the original 1x)
         root.top().left();
         root.add(telemetry).pad(10).left().expandX().row();
 
@@ -328,22 +330,18 @@ public class SandboxScreen extends ScreenAdapter {
         root.add(mid).expandY().fillX().row();
 
         Table bottomA = new Table();
-        bottomA.add(leftBtn).width(240).height(170).pad(4);
-        bottomA.add(rightBtn).width(240).height(170).pad(4);
+        bottomA.add(leftBtn).width(120).height(96).pad(4);
+        bottomA.add(rightBtn).width(120).height(96).pad(4);
         bottomA.add(stageLabel).expandX().center().padLeft(8);
+        bottomA.add(zoomIn).width(96).height(96).pad(4);
+        bottomA.add(zoomOut).width(96).height(96).pad(4);
+        bottomA.add(centerBtn).width(130).height(96).pad(4);
         root.add(bottomA).fillX().row();
-
-        Table bottomZ = new Table();
-        bottomZ.add(zoomIn).width(180).height(170).pad(4);
-        bottomZ.add(zoomOut).width(180).height(170).pad(4);
-        bottomZ.add(centerBtn).width(260).height(170).pad(4);
-        bottomZ.add().expandX();
-        root.add(bottomZ).fillX().row();
 
         Table bottomB = new Table();
         bottomB.add().expandX();
-        bottomB.add(activateBtn).width(340).height(200).pad(6);
-        bottomB.add(stageBtn).width(400).height(200).pad(6);
+        bottomB.add(activateBtn).width(170).height(110).pad(6);
+        bottomB.add(stageBtn).width(200).height(110).pad(6);
         bottomB.add().expandX();
         root.add(bottomB).fillX().padBottom(8);
     }

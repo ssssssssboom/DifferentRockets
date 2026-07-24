@@ -126,8 +126,8 @@ def calc_plume(thrust, density, exit_diameter=None, expansion_ratio=None,
         plume_angle = -min(4.0 * (1.0 / max(NPR, 0.01) - 1.0) ** 0.45, 45)
 
     mach_disk_dist = De * 0.65 * np.sqrt(max(abs(NPR), 0.08))
-    diamond_spacing = De * 0.87 * np.sqrt(max(abs(NPR), 0.05))
-    plume_length = De * (12 + 55 * alt_frac)
+    diamond_spacing = De * 1.05 * np.sqrt(max(abs(NPR), 0.05))
+    plume_length = De * (18 + 60 * alt_frac)
 
     vac = 1 - min(Pa / P_SEA, 1)
     pressure_norm = Pa / P_SEA
@@ -172,51 +172,74 @@ def gen_grid(p, resolution=400, seed=None):
 
     nz, nr = resolution, max(resolution // 3, 80)
     z = np.linspace(0, L, nz)
-    max_r = L * np.tan(np.radians(max(abs(angle_jitter), 8))) + De * 0.5
-    max_r = max(max_r, De * 1.2)
+    max_r = (L * np.tan(np.radians(max(abs(angle_jitter), 8))) + De * 0.5) * 0.6
+    max_r = max(max_r, De * 0.8)
     r = np.linspace(0, max_r, nr)
 
-    ZZ, RR = np.meshgrid(z, r)
-
     arad = np.radians(angle_jitter)
-    envelope = De * 0.5 + z * np.tan(arad)
+    envelope_base = De * 0.5 + z * np.tan(arad)
 
     if ds_jitter > 0 and NPR > 0.01:
-        wave = De * 0.38 * np.sin(2 * np.pi * z / ds_jitter) * np.exp(-z / (5.0 * ds_jitter))
+        wave = De * 0.12 * np.sin(2 * np.pi * z / ds_jitter) * np.exp(-z / (5.0 * ds_jitter))
         if NPR < 1:
             wave = wave * 1.8
-        envelope = envelope + wave
+        envelope_base = envelope_base + wave
 
     if seed is not None:
-        env_noise = _smooth_noise(nz, De * 0.09, seed)
-        envelope = envelope + env_noise
+        env_top = envelope_base + _smooth_noise(nz, De * 0.036, seed)
+        env_bot = envelope_base + _smooth_noise(nz, De * 0.036, seed + 5000)
+    else:
+        env_top = envelope_base
+        env_bot = envelope_base
 
-    envelope = np.maximum(envelope, De * 0.22)
+    env_top = np.maximum(env_top, De * 0.22)
+    env_bot = np.maximum(env_bot, De * 0.22)
 
-    rel = RR / np.maximum(envelope, 1e-9)
+    ZZ, RR = np.meshgrid(z, r)
+    envelope_sym = (env_top + env_bot) * 0.5
+    envelope_asym = np.where(ZZ >= 0, env_top, env_bot)
+    env_2d = np.tile(env_top, (nr, 1))
+
+    rel = RR / np.maximum(env_2d, 1e-9)
     radial = np.exp(-2.8 * np.clip(rel, 0, 5) ** 2)
 
-    ax_decay = np.exp(-z / (L * 0.55))
+    ax_decay = np.exp(-z / (L * 0.20))
 
     diamond = np.zeros(nz)
     if ds_jitter > 0 and NPR > 0.01:
         phase = 0 if seed is None else np.random.RandomState(seed + 1000).uniform(-0.15, 0.15)
         dwave = (np.sin(2 * np.pi * z / ds_jitter + np.pi * 0.5 + phase) + 1) * 0.5
         ddecay = np.exp(-z / (3.0 * ds_jitter))
-        diamond = 0.70 * dwave * ddecay
+        diamond = 0.50 * dwave * ddecay
 
     if seed is not None:
         flicker = 1 + _smooth_noise(nz, 0.12, seed + 2000)
-        intensity = radial * ax_decay * flicker * (1 + diamond)
+        streak_z_top = _smooth_noise(nz, 1.80, seed + 3000)
+        streak_z_bot = _smooth_noise(nz, 1.80, seed + 3500)
+        streak_r_top = _smooth_noise(nr, 0.06, seed + 4000)
+        streak_r_bot = _smooth_noise(nr, 0.06, seed + 4500)
+        streak_top = 1 + np.clip(np.outer(streak_r_top, streak_z_top), -1.0, 1.0)
+        streak_bot = 1 + np.clip(np.outer(streak_r_bot, streak_z_bot), -1.0, 1.0)
+        intensity_top = radial * ax_decay * flicker * streak_top * (1 + diamond)
+        intensity_bot = radial * ax_decay * flicker * streak_bot * (1 + diamond)
+        intensity = intensity_top
     else:
         intensity = radial * ax_decay * (1 + diamond)
+    intensity = np.clip(intensity, 0, 1.2)
 
-    mask = RR > envelope * 1.03
-    intensity[mask] = 0
+    cutoff = 0.07
+    intensity[intensity < cutoff] = 0
+    fade = np.clip(intensity / (cutoff * 3.5), 0, 1)
+    intensity = intensity * fade ** 0.55
 
     return {
         'z': z, 'r': r, 'ZZ': ZZ, 'RR': RR,
-        'intensity': intensity, 'envelope': envelope,
+        'intensity': intensity,
+        'intensity_top': intensity_top if seed is not None else intensity,
+        'intensity_bot': intensity_bot if seed is not None else intensity,
+        'envelope_top': env_top,
+        'envelope_bot': env_bot,
+        'envelope': envelope_sym,
         'seed': seed,
     }
 
@@ -234,15 +257,17 @@ def visualize(g, p, out_path=None):
 
     z = g['z']
     r = g['r']
-    I = g['intensity']
-    env = g['envelope']
+    I_top = g['intensity_top']
+    I_bot = g['intensity_bot']
+    env_top = g['envelope_top']
+    env_bot = g['envelope_bot']
     De = p['De']
     L = p['plume_length']
 
-    ax.pcolormesh(z, r, I, cmap=cmap, norm=norm, shading='auto', rasterized=True)
-    ax.pcolormesh(z, -r[::-1], I[::-1], cmap=cmap, norm=norm, shading='auto', rasterized=True)
-    ax.plot(z, env, 'w--', lw=0.7, alpha=0.55)
-    ax.plot(z, -env, 'w--', lw=0.7, alpha=0.55)
+    ax.pcolormesh(z, r, I_top, cmap=cmap, norm=norm, shading='auto', rasterized=True)
+    ax.pcolormesh(z, -r[::-1], I_bot[::-1], cmap=cmap, norm=norm, shading='auto', rasterized=True)
+    ax.plot(z, env_top, 'w--', lw=0.7, alpha=0.55)
+    ax.plot(z, -env_bot, 'w--', lw=0.7, alpha=0.55)
 
     rect_w = De * 0.25
     ax.add_patch(plt.Rectangle((-rect_w, -De * 0.5), rect_w, De,
@@ -258,8 +283,8 @@ def visualize(g, p, out_path=None):
             if xd < L:
                 ax.axvline(xd, color='#ffffff', lw=0.4, alpha=0.15, ls='--')
 
-    ax.set_xlim(-rect_w * 1.3, L * 1.02)
-    max_env = np.max(env) * 1.15
+    ax.set_xlim(-rect_w * 1.3, L * 0.85)
+    max_env = max(np.max(env_top), np.max(env_bot)) * 1.15
     ax.set_ylim(-max_env, max_env)
     ax.set_aspect('equal')
     ax.set_xlabel('Axial distance  (m)', color='#888888', fontsize=9)
@@ -343,19 +368,21 @@ def visualize(g, p, out_path=None):
 def _draw_frame(g, p, ax, cmap, norm):
     z = g['z']
     r = g['r']
-    I = g['intensity']
-    env = g['envelope']
+    I_top = g['intensity_top']
+    I_bot = g['intensity_bot']
+    env_top = g['envelope_top']
+    env_bot = g['envelope_bot']
     De = p['De']
     L = p['plume_length']
 
     ax.clear()
     ax.set_facecolor('#080810')
-    ax.pcolormesh(z, r, I, cmap=cmap, norm=norm, shading='auto', rasterized=True)
-    ax.pcolormesh(z, -r[::-1], I[::-1], cmap=cmap, norm=norm, shading='auto', rasterized=True)
-    ax.plot(z, env, 'w--', lw=0.6, alpha=0.45)
-    ax.plot(z, -env, 'w--', lw=0.6, alpha=0.45)
-    ax.set_xlim(-0.25, L * 1.02)
-    max_env = max(np.max(env) * 1.15, De * 0.7)
+    ax.pcolormesh(z, r, I_top, cmap=cmap, norm=norm, shading='auto', rasterized=True)
+    ax.pcolormesh(z, -r[::-1], I_bot[::-1], cmap=cmap, norm=norm, shading='auto', rasterized=True)
+    ax.plot(z, env_top, 'w--', lw=0.5, alpha=0.35)
+    ax.plot(z, -env_bot, 'w--', lw=0.5, alpha=0.35)
+    ax.set_xlim(-0.25, L * 0.85)
+    max_env = max(np.max(env_top), np.max(env_bot)) * 1.15
     ax.set_ylim(-max_env, max_env)
     ax.set_aspect('equal')
     ax.axis('off')
@@ -384,7 +411,7 @@ def animate_plume(p, frames=40, output='plume_anim.gif', resolution=250, fps=12)
     try:
         writer = PillowWriter(fps=fps)
         ani.save(output, writer=writer, dpi=120, savefig_kwargs={
-            'facecolor': '#080810', 'bbox_inches': 'tight', 'pad_inches': 0.1,
+            'facecolor': '#080810', 'pad_inches': 0.1,
         })
         print(f"  -> GIF saved: {output}  ({frames} frames @ {fps} fps)")
     except Exception:
@@ -656,6 +683,8 @@ def main():
     ], help='Quick preset instead of manual thrust/density')
     parser.add_argument('--sweep', action='store_true',
                         help='Fixed thrust, sweep density sea->vacuum, plot curves')
+    parser.add_argument('--gif', type=int, default=0, metavar='N',
+                        help='Generate N-frame flicker GIF (e.g. --gif 40)')
 
     args = parser.parse_args()
 
@@ -702,6 +731,25 @@ def main():
             plt.show()
         else:
             plt.close('all')
+        return
+
+    if args.gif > 0:
+        if args.preset and args.output and args.output.endswith('.png'):
+            args.output = args.output.replace('.png', '.gif')
+        if args.output is None:
+            args.output = 'plume_anim.gif'
+        if args.thrust is None or args.density is None:
+            parser.error("--thrust and --density are required for --gif (or use --preset)")
+        p = calc_plume(
+            thrust=args.thrust,
+            density=args.density,
+            exit_diameter=args.exit_diameter,
+            expansion_ratio=args.expansion_ratio,
+            chamber_pressure=args.chamber_pressure,
+        )
+        print_summary(p)
+        animate_plume(p, frames=args.gif, output=args.output,
+                      resolution=max(args.resolution // 2, 160))
         return
 
     if args.thrust is None or args.density is None:

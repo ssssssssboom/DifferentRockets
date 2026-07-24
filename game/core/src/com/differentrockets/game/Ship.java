@@ -561,10 +561,19 @@ public class Ship {
         // snapshot targets BEFORE firing: a detacher's onStage defers joint
         // destruction + ship split, which mutates `parts` after we return —
         // resolving the group to references first keeps every member reachable.
+        // Order within the stage (round 26): DETACHERS FIRE LAST. The parts
+        // being dropped (engines, tanks...) must complete their onStage
+        // first, so a staged-away engine is already burning at the instant
+        // the cut happens instead of waking up dead.
         List<Part> targets = new ArrayList<>();
+        List<Part> detachers = new ArrayList<>();
         for (Part p : parts) {
-            if (p.group == next) targets.add(p);
+            if (p.group == next) {
+                if ("detacher".equals(p.type.type)) detachers.add(p);
+                else targets.add(p);
+            }
         }
+        targets.addAll(detachers);
         for (Part p : targets) {
             if (p.body == null || p.ship == null || !p.ship.parts.contains(p)) continue;
             p.callOnStage();

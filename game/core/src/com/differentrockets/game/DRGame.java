@@ -13,6 +13,13 @@ public class DRGame extends Game {
 
     /** Global UI font scale (owner requirement: bigger buttons/touch targets). */
     public static final float FONT_SCALE = 1.75f;
+    /**
+     * Sandbox-only upscale (owner task: sandbox buttons at least 2x larger).
+     * Deliberately NOT folded into FONT_SCALE — Ui.UI_SCALE already upscales
+     * every screen globally, so menus/editor would double up. SandboxScreen
+     * multiplies its own button boxes and per-label font scales by this.
+     */
+    public static final float SANDBOX_SCALE = 2.0f;
 
     public SpriteBatch batch;
     public ShapeRenderer shapes;

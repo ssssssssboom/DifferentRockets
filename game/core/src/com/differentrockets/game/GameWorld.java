@@ -542,6 +542,19 @@ public class GameWorld {
         updateRailsFlags(); // super-warp parks/reactivates the active ship
         double simDt;
         if (warp <= PHYS_WARP_MAX) {
+            // round 26 (burn-then-warp continuity fix): ANY frame at physical
+            // warp can change the ship's state — engine burns, drag,
+            // collisions, staging. The precomputed super-warp trajectory
+            // (wtX/wtVX/...) is a pure function of the state at compute time,
+            // so it is VOID the moment physics runs again. Without this,
+            // dropping from 25x to 4x for a course change and re-entering
+            // 25x resurrected the PRE-BURN trajectory: warpTrajValid only
+            // checks warp level / part count / time window, none of which a
+            // burn touches — the ship visibly snapped back onto its old
+            // orbit, undoing the maneuver ("回到变轨前状态"). Zeroing wtCount
+            // here forces superWarp() to recompute from the LIVE state on
+            // the next super-warp entry.
+            wtCount = 0;
             int steps = Math.max(1, Math.min(8, Math.round(frameDt * warp / PHYS_DT)));
             for (int i = 0; i < steps; i++) {
                 substep(PHYS_DT);

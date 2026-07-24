@@ -175,19 +175,33 @@ public class SandboxScreen extends ScreenAdapter {
 
     // ---------------------------------------------------------------- HUD
 
+    // sandbox-only upscale (owner task: sandbox buttons at least 2x). The skin
+    // font is shared with the menu/editor (Ui.UI_SCALE), so we never touch the
+    // font itself — button boxes scale by DRGame.SANDBOX_SCALE and each
+    // button's label gets its own fontScale multiplier on top.
+    private static final float BS = DRGame.SANDBOX_SCALE;
+
+    /** Apply the sandbox font multiplier to a button's label (2x by default). */
+    private static TextButton big(TextButton b) { return big(b, BS); }
+    private static TextButton big(TextButton b, float fontScale) {
+        b.getLabel().setFontScale(fontScale);
+        return b;
+    }
+
     private void buildHud() {
         Table root = new Table();
         root.setFillParent(true);
         stage.addActor(root);
 
         telemetry = new Label("", game.ui.skin);
-        // global font is scaled up; keep telemetry near its old effective size (~1.05x)
-        telemetry.setFontScale(1.0f); // global 1.75x already applied; keep telemetry at full UI scale
+        // sandbox upscale: telemetry 1.3x on top of the shared UI font
+        telemetry.setFontScale(1.3f);
 
         stageLabel = new Label("", game.ui.skin);
         stageLabel.setColor(new Color(1f, 0.85f, 0.3f, 1f));
+        stageLabel.setFontScale(1.3f);
 
-        TextButton mapBtn = new TextButton("MAP", game.ui.skin);
+        TextButton mapBtn = big(new TextButton("MAP", game.ui.skin));
         mapBtn.addListener(new ClickListener() {
             @Override public void clicked(InputEvent e, float x, float y) { toggleMap(); }
         });
@@ -195,21 +209,21 @@ public class SandboxScreen extends ScreenAdapter {
         // list (see toggleFrameList). State is shown in the TEXT (like
         // DRAG:on/off); a plain ClickListener keeps the return-to-gray
         // behavior (no checked state).
-        frameBtn = new TextButton("FRAME:Auto", game.ui.skin);
+        frameBtn = big(new TextButton("FRAME:Auto", game.ui.skin), 1.4f);
         frameBtn.addListener(new ClickListener() {
             @Override public void clicked(InputEvent e, float x, float y) { toggleFrameList(); }
         });
         // item 6: toggle for the aerodynamic drag resultant overlay.
         // Round 14: buttons must return to gray on touch-up — the on/off
         // state is shown in the TEXT, not a stuck green tint.
-        final TextButton dragBtn = new TextButton("DRAG:on", game.ui.skin);
+        final TextButton dragBtn = big(new TextButton("DRAG:on", game.ui.skin));
         dragBtn.addListener(new ClickListener() {
             @Override public void clicked(InputEvent e, float x, float y) {
                 dragOverlay = !dragOverlay;
                 dragBtn.setText(dragOverlay ? "DRAG:on" : "DRAG:off");
             }
         });
-        TextButton pauseBtn = new TextButton("II", game.ui.skin);
+        TextButton pauseBtn = big(new TextButton("II", game.ui.skin));
         pauseBtn.addListener(new ClickListener() {
             @Override public void clicked(InputEvent e, float x, float y) {
                 game.world.paused = !game.world.paused;
@@ -219,98 +233,107 @@ public class SandboxScreen extends ScreenAdapter {
         // drawer (toggleMenuDrawer); MAP moved to the left column below MENU
         // round 14 item 7: warp ladder — "-" / "+" step through WARP_LEVELS
         // (1x 2x 4x physical, then 25x..250000x on rails), label shows current.
-        TextButton warpDown = new TextButton("-", game.ui.skin);
+        TextButton warpDown = big(new TextButton("-", game.ui.skin));
         warpDown.addListener(new ClickListener() {
             @Override public void clicked(InputEvent e, float x, float y) { warpStep(-1); }
         });
         warpLabel = new Label("1x", game.ui.skin);
+        warpLabel.setFontScale(BS);
         warpLabel.setAlignment(com.badlogic.gdx.utils.Align.center);
-        TextButton warpUp = new TextButton("+", game.ui.skin);
+        TextButton warpUp = big(new TextButton("+", game.ui.skin));
         warpUp.addListener(new ClickListener() {
             @Override public void clicked(InputEvent e, float x, float y) { warpStep(1); }
         });
 
+        // sandbox 2x layout: the top-right cluster is split into TWO rows so
+        // the doubled boxes still fit a portrait phone width
         Table topRight = new Table();
-        topRight.add(warpDown).width(60).height(64).pad(2);
-        topRight.add(warpLabel).width(110).height(64).pad(2);
-        topRight.add(warpUp).width(60).height(64).pad(2);
-        topRight.add(pauseBtn).width(60).height(64).pad(2);
-        topRight.add(dragBtn).width(110).height(64).pad(2);
-        topRight.add(frameBtn).width(170).height(64).pad(2);
+        topRight.add(warpDown).width(120).height(128).pad(2);
+        topRight.add(warpLabel).width(220).height(128).pad(2);
+        topRight.add(warpUp).width(120).height(128).pad(2);
+        topRight.add(pauseBtn).width(120).height(128).pad(2).row();
+        topRight.add(dragBtn).width(220).height(128).pad(2);
+        topRight.add(frameBtn).width(340).height(128).pad(2);
 
         // task D1: top-left column — MENU on top, MAP directly below it.
         // MENU slides out the drawer (switch-ship list + MAIN MENU entry);
         // a plain ClickListener keeps the return-to-gray behavior.
-        TextButton menuBtn = new TextButton("MENU", game.ui.skin);
+        TextButton menuBtn = big(new TextButton("MENU", game.ui.skin));
         menuBtn.addListener(new ClickListener() {
             @Override public void clicked(InputEvent e, float x, float y) { toggleMenuDrawer(); }
         });
         Table leftTop = new Table();
-        leftTop.add(menuBtn).width(120).height(64).pad(2).row();
-        leftTop.add(mapBtn).width(120).height(64).pad(2);
+        leftTop.add(menuBtn).width(240).height(128).pad(2).row();
+        leftTop.add(mapBtn).width(240).height(128).pad(2);
 
         // throttle: 10-segment bar from the Runtime atlas, right edge
-        // (round 11 item 10 — ThrottleControl track + ThrottleLevel sprites)
+        // (round 11 item 10 — ThrottleControl track + ThrottleLevel sprites);
+        // sandbox 2x: taller/wider bar for a fat-finger scrub target
         throttle = new SegmentedThrottle();
 
-        TextButton stageBtn = new TextButton("STAGE\n(Space)", game.ui.skin);
+        TextButton stageBtn = big(new TextButton("STAGE\n(Space)", game.ui.skin), 1.6f);
         stageBtn.addListener(new ClickListener() {
             @Override public void clicked(InputEvent e, float x, float y) { doStage(); }
         });
 
-        TextButton activateBtn = new TextButton("ACTIVATE", game.ui.skin);
+        TextButton activateBtn = big(new TextButton("ACTIVATE", game.ui.skin));
         activateBtn.addListener(new ClickListener() {
             @Override public void clicked(InputEvent e, float x, float y) { activateSelected(); }
         });
 
         // heading slew: "<" rotates the nose left (target heading increases)
-        TextButton leftBtn = holdBtn("<", 1);
-        TextButton rightBtn = holdBtn(">", -1);
+        TextButton leftBtn = big(holdBtn("<", 1));
+        TextButton rightBtn = big(holdBtn(">", -1));
 
-        TextButton zoomIn = new TextButton("+", game.ui.skin);
+        TextButton zoomIn = big(new TextButton("+", game.ui.skin));
         zoomIn.addListener(new ClickListener() {
             @Override public void clicked(InputEvent e, float x, float y) { zoom(0.8f); }
         });
-        TextButton zoomOut = new TextButton("-", game.ui.skin);
+        TextButton zoomOut = big(new TextButton("-", game.ui.skin));
         zoomOut.addListener(new ClickListener() {
             @Override public void clicked(InputEvent e, float x, float y) { zoom(1.25f); }
         });
         // round 17: one-tap recenter — clears the drag offset so the flight
         // camera snaps back onto the ship (lost-the-ship rescue)
-        TextButton centerBtn = new TextButton("CENTER", game.ui.skin);
+        TextButton centerBtn = big(new TextButton("CENTER", game.ui.skin));
         centerBtn.addListener(new ClickListener() {
             @Override public void clicked(InputEvent e, float x, float y) { camPan.setZero(); }
         });
 
-        // portrait HUD: telemetry row / button row / right-edge throttle /
-        // two bottom button rows
+        // portrait HUD (sandbox 2x): telemetry row / top bar (left MENU+MAP
+        // column, right two-row warp/pause/drag/frame cluster) / right-edge
+        // throttle / THREE bottom rows (turn, zoom, stage/activate)
         root.top().left();
         root.add(telemetry).pad(10).left().expandX().row();
 
         Table topBar = new Table();
-        topBar.add(leftTop).left().padLeft(6);
+        topBar.add(leftTop).left().padLeft(6).top();
         topBar.add().expandX();
         topBar.add(topRight).right();
         root.add(topBar).fillX().padRight(6).row();
 
         Table mid = new Table();
         mid.add().expandX();
-        mid.add(throttle).height(320).width(90).right().padRight(10);
+        mid.add(throttle).height(640).width(150).right().padRight(10);
         root.add(mid).expandY().fillX().row();
 
         Table bottomA = new Table();
-        bottomA.add(leftBtn).width(120).height(96).pad(4);
-        bottomA.add(rightBtn).width(120).height(96).pad(4);
+        bottomA.add(leftBtn).width(240).height(170).pad(4);
+        bottomA.add(rightBtn).width(240).height(170).pad(4);
         bottomA.add(stageLabel).expandX().center().padLeft(8);
-        bottomA.add(zoomIn).width(96).height(96).pad(4);
-        bottomA.add(zoomOut).width(96).height(96).pad(4);
-        bottomA.add(centerBtn).width(130).height(96).pad(4);
         root.add(bottomA).fillX().row();
+
+        Table bottomZ = new Table();
+        bottomZ.add(zoomIn).width(180).height(170).pad(4);
+        bottomZ.add(zoomOut).width(180).height(170).pad(4);
+        bottomZ.add(centerBtn).width(260).height(170).pad(4);
+        bottomZ.add().expandX();
+        root.add(bottomZ).fillX().row();
 
         Table bottomB = new Table();
         bottomB.add().expandX();
-        bottomB.add(activateBtn).width(170).height(110).pad(6);
-        bottomB.add(stageBtn).width(200).height(110).pad(6);
+        bottomB.add(activateBtn).width(340).height(200).pad(6);
+        bottomB.add(stageBtn).width(400).height(200).pad(6);
         bottomB.add().expandX();
         root.add(bottomB).fillX().padBottom(8);
     }
@@ -818,20 +841,20 @@ public class SandboxScreen extends ScreenAdapter {
         }
         backDialog = new Table();
         backDialog.setBackground(game.ui.tinted(new Color(0.10f, 0.11f, 0.16f, 0.95f)));
-        backDialog.add(new Label("Return to the editor?", game.ui.skin)).pad(18).colspan(2).row();
-        TextButton yes = new TextButton("YES", game.ui.skin);
+        backDialog.add(new Label("Return to the editor?", game.ui.skin)).pad(24).colspan(2).row();
+        TextButton yes = big(new TextButton("YES", game.ui.skin));
         yes.addListener(new ClickListener() {
             @Override public void clicked(InputEvent e, float x, float y) {
                 game.world.save();
                 game.setScreen(new EditorScreen(game, null));
             }
         });
-        TextButton no = new TextButton("NO", game.ui.skin);
+        TextButton no = big(new TextButton("NO", game.ui.skin));
         no.addListener(new ClickListener() {
             @Override public void clicked(InputEvent e, float x, float y) { toggleBackDialog(); }
         });
-        backDialog.add(yes).width(160).height(72).pad(12);
-        backDialog.add(no).width(160).height(72).pad(12);
+        backDialog.add(yes).width(300).height(130).pad(16);
+        backDialog.add(no).width(300).height(130).pad(16);
         backDialog.pack();
         backDialog.setPosition((Gdx.graphics.getWidth() - backDialog.getWidth()) / 2f,
                 (Gdx.graphics.getHeight() - backDialog.getHeight()) / 2f);
@@ -1023,23 +1046,23 @@ public class SandboxScreen extends ScreenAdapter {
             bodies.sort((a, b) -> Double.compare(gOn(sp, b), gOn(sp, a)));
         }
         frameList = new Table();
-        TextButton auto = new TextButton("Auto (dominant)", game.ui.skin);
+        TextButton auto = big(new TextButton("Auto (dominant)", game.ui.skin), 1.3f);
         auto.addListener(new ClickListener() {
             @Override public void clicked(InputEvent e, float x, float y) { selectAnchor(-1, "Auto"); }
         });
-        frameList.add(auto).width(240).height(56).pad(2).row();
+        frameList.add(auto).width(460).height(104).pad(2).row();
         for (final Planet p : bodies) {
             final int idx = game.world.planets.indexOf(p);
-            TextButton b = new TextButton(p.name, game.ui.skin);
+            TextButton b = big(new TextButton(p.name, game.ui.skin), 1.3f);
             b.addListener(new ClickListener() {
                 @Override public void clicked(InputEvent e, float x, float y) { selectAnchor(idx, p.name); }
             });
-            frameList.add(b).width(240).height(56).pad(2).row();
+            frameList.add(b).width(460).height(104).pad(2).row();
         }
         frameList.pack();
         float sw = Gdx.graphics.getWidth(), sh = Gdx.graphics.getHeight();
         frameList.setPosition(sw - frameList.getWidth() - 6,
-                Math.max(6, sh - 76 - frameList.getHeight())); // under the top-right bar
+                Math.max(6, sh - 390 - frameList.getHeight())); // under the top-right bar
         stage.addActor(frameList);
     }
 
@@ -1084,24 +1107,24 @@ public class SandboxScreen extends ScreenAdapter {
         }
         for (final Ship s : others) {
             double d = ap != null ? s.getUniversePos().dist(ap) : 0;
-            TextButton b = new TextButton(s.name + "  " + fmt(d), game.ui.skin);
+            TextButton b = big(new TextButton(s.name + "  " + fmt(d), game.ui.skin), 1.4f);
             b.addListener(new ClickListener() {
                 @Override public void clicked(InputEvent e, float x, float y) { selectShip(s); }
             });
-            menuDrawer.add(b).width(300).height(56).pad(2).row();
+            menuDrawer.add(b).width(560).height(104).pad(2).row();
         }
-        TextButton mainMenu = new TextButton("MAIN MENU", game.ui.skin);
+        TextButton mainMenu = big(new TextButton("MAIN MENU", game.ui.skin));
         mainMenu.addListener(new ClickListener() {
             @Override public void clicked(InputEvent e, float x, float y) {
                 game.world.save();
                 game.setScreen(new MenuScreen(game));
             }
         });
-        menuDrawer.add(mainMenu).width(300).height(56).pad(6).row();
+        menuDrawer.add(mainMenu).width(560).height(104).pad(6).row();
         menuDrawer.pack();
         // start off-screen left, slide in below the MENU/MAP column
         float sh = Gdx.graphics.getHeight();
-        float dy = Math.max(6, sh - 148 - menuDrawer.getHeight());
+        float dy = Math.max(6, sh - 400 - menuDrawer.getHeight());
         menuDrawer.setPosition(-menuDrawer.getWidth() - 8, dy);
         stage.addActor(menuDrawer);
         menuDrawer.addAction(Actions.moveTo(6, dy, 0.18f));
@@ -1412,13 +1435,13 @@ public class SandboxScreen extends ScreenAdapter {
         float sw = Gdx.graphics.getWidth(), sh = Gdx.graphics.getHeight();
         game.batch.setProjectionMatrix(ringMat.setToOrtho2D(0, 0, sw, sh));
         game.batch.begin();
-        game.font.getData().setScale(1.0f);
+        game.font.getData().setScale(BS);
         game.font.setColor(1f, 0.72f, 0.3f, 1f);
         String label = fTot >= 1e6 ? String.format("%.2f MN", fTot / 1e6)
                 : fTot >= 1e3 ? String.format("%.1f kN", fTot / 1e3)
                 : String.format("%.0f N", fTot);
         game.font.draw(game.batch, label, tmp3.x + 12, tmp3.y - 6);
-        game.font.getData().setScale(DRGame.FONT_SCALE);
+        game.font.getData().setScale(game.ui.fontScale);
         game.font.setColor(Color.WHITE);
         game.batch.end();
     }
@@ -1568,6 +1591,9 @@ public class SandboxScreen extends ScreenAdapter {
         game.shapes.setProjectionMatrix(ringMat.setToOrtho2D(0, 0, w, h));
         Gdx.gl.glEnable(GL20.GL_BLEND);
         Gdx.gl.glBlendFunc(GL20.GL_SRC_ALPHA, GL20.GL_ONE_MINUS_SRC_ALPHA);
+        // sandbox 2x: thicker ring lines (best effort — some GLES drivers cap
+        // glLineWidth at 1; the doubled markers below still carry the upscale)
+        Gdx.gl.glLineWidth(2f * BS); // sandbox 2x ring thickness
 
         double cur = game.world.currentHeading();
         double tgt = game.world.getTargetHeading();
@@ -1583,10 +1609,11 @@ public class SandboxScreen extends ScreenAdapter {
             game.shapes.end();
             game.shapes.begin(ShapeRenderer.ShapeType.Filled);
             game.shapes.setColor(1f, 1f, 1f, 0.30f);
-            game.shapes.circle(ringX, ringY, 2.5f, 12);
+            game.shapes.circle(ringX, ringY, 4f, 12);
             game.shapes.setColor(1f, 1f, 1f, 0.6f);
-            game.shapes.circle(ringPtX(cur), ringPtY(cur), 4f, 12);
+            game.shapes.circle(ringPtX(cur), ringPtY(cur), 6f, 12);
             game.shapes.end();
+            Gdx.gl.glLineWidth(1f);
             return;
         }
 
@@ -1649,33 +1676,34 @@ public class SandboxScreen extends ScreenAdapter {
         // center cross
         game.shapes.begin(ShapeRenderer.ShapeType.Filled);
         game.shapes.setColor(1f, 1f, 1f, 0.5f);
-        game.shapes.circle(ringX, ringY, 2.5f, 12);
+        game.shapes.circle(ringX, ringY, 4f, 12);
         game.shapes.setColor(0.3f, 1f, 0.45f, 0.95f);
-        game.shapes.circle(ringX + (ringPtX(tgt) - ringX) * 1.14f, ringY + (ringPtY(tgt) - ringY) * 1.14f, 5f, 12);
+        game.shapes.circle(ringX + (ringPtX(tgt) - ringX) * 1.14f, ringY + (ringPtY(tgt) - ringY) * 1.14f, 8f, 12);
         game.shapes.setColor(1f, 1f, 1f, 0.95f);
-        game.shapes.circle(ringPtX(cur), ringPtY(cur), 4f, 12);
+        game.shapes.circle(ringPtX(cur), ringPtY(cur), 6f, 12);
         // velocity arrowhead on the ring at the velocity heading — item 3
         if (spd > 0.5) {
             float bx = ringPtX(vHead), by = ringPtY(vHead);
             float ox = (bx - ringX) / ringR, oy = (by - ringY) / ringR; // unit outward
             float pxu = -oy, pyu = ox;                                  // unit tangent
             game.shapes.setColor(vr, vg, vb, 0.95f);
-            game.shapes.triangle(bx + ox * 14, by + oy * 14,
-                    bx - pxu * 7, by - pyu * 7,
-                    bx + pxu * 7, by + pyu * 7);
+            game.shapes.triangle(bx + ox * 24, by + oy * 24,
+                    bx - pxu * 12, by - pyu * 12,
+                    bx + pxu * 12, by + pyu * 12);
         }
         game.shapes.end();
+        Gdx.gl.glLineWidth(1f);
 
         // numeric speed readout just outside the ring at the velocity heading
         if (spd > 0.5) {
             game.batch.setProjectionMatrix(ringMat);
             game.batch.begin();
-            game.font.getData().setScale(1.0f);
+            game.font.getData().setScale(BS);
             game.font.setColor(vr, vg, vb, 0.95f);
             float tx = ringX + (float) -Math.sin(vHead) * ringR * 1.22f;
             float ty = ringY + (float) Math.cos(vHead) * ringR * 1.22f;
             game.font.draw(game.batch, fmt(spd) + " m/s", tx, ty);
-            game.font.getData().setScale(DRGame.FONT_SCALE);
+            game.font.getData().setScale(game.ui.fontScale);
             game.font.setColor(Color.WHITE);
             game.batch.end();
         }
@@ -1835,7 +1863,7 @@ public class SandboxScreen extends ScreenAdapter {
         double msw = Gdx.graphics.getWidth(), msh = Gdx.graphics.getHeight();
         game.batch.setProjectionMatrix(ringMat.setToOrtho2D(0, 0, (float) msw, (float) msh));
         game.batch.begin();
-        game.font.getData().setScale(1.0f);
+        game.font.getData().setScale(BS);
         game.font.setColor(1f, 1f, 1f, 0.85f);
         for (Planet p : game.world.planets) {
             // skip labels for bodies too small to see at this zoom
@@ -1853,7 +1881,7 @@ public class SandboxScreen extends ScreenAdapter {
             if (sx < -200 || sx > msw + 200 || sy < -50 || sy > msh + 50) continue;
             game.font.draw(game.batch, s.name, sx + 10, sy - 6);
         }
-        game.font.getData().setScale(DRGame.FONT_SCALE);
+        game.font.getData().setScale(game.ui.fontScale);
         game.font.setColor(Color.WHITE);
         game.batch.end();
 
@@ -1906,16 +1934,16 @@ public class SandboxScreen extends ScreenAdapter {
         game.shapes.begin(ShapeRenderer.ShapeType.Line);
         if (close) game.shapes.setColor(0.75f, 0.35f, 1f, 0.95f); // purple
         else game.shapes.setColor(0.55f, 0.95f, 1f, 0.95f);        // light cyan
-        game.shapes.circle(sx, sy, 22f, 32);
+        game.shapes.circle(sx, sy, 34f, 32);
         game.shapes.end();
         game.batch.setProjectionMatrix(ringMat);
         game.batch.begin();
-        game.font.getData().setScale(1.0f);
+        game.font.getData().setScale(BS);
         if (close) game.font.setColor(0.75f, 0.35f, 1f, 1f);
         else game.font.setColor(0.55f, 0.95f, 1f, 1f);
-        // center the letter in the circle (glyph ~10x14 px at scale 1)
-        game.font.draw(game.batch, close ? "X" : "C", sx - 5, sy + 7);
-        game.font.getData().setScale(DRGame.FONT_SCALE);
+        // center the letter in the circle (glyph ~20x28 px at sandbox scale)
+        game.font.draw(game.batch, close ? "X" : "C", sx - 10, sy + 14);
+        game.font.getData().setScale(game.ui.fontScale);
         game.font.setColor(Color.WHITE);
         game.batch.end();
     }

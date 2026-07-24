@@ -73,6 +73,14 @@ public class EditorScreen extends ScreenAdapter {
     // stage-drawer drag targets: header actors parallel to their stage numbers
     private final List<Actor> stageHeaders = new ArrayList<>();
     private final List<Integer> stageHeaderNums = new ArrayList<>();
+    // stage-drawer part rows (parallel lists) for RAW drag-to-assign (issue 2):
+    // the ScrollPane steals vertical drags mid-gesture in this gdx version (same
+    // class of bug as the palette drag-out), so row drags are intercepted raw,
+    // in front of the stage, exactly like palette drag-outs.
+    private final List<Actor> stageRows = new ArrayList<>();
+    private final List<Integer> stageRowParts = new ArrayList<>();
+    private int stageRowCandidate = -1;  // row hit at touch-down, not yet dragging
+    private int stageRowDrag = -1;       // row actively being dragged (index into stageRows)
 
     // build-operation history (task C3): JSON snapshots of the design
     private final List<String> undoStack = new ArrayList<>();
@@ -261,20 +269,47 @@ public class EditorScreen extends ScreenAdapter {
         private PartType candidate;
         private int downX, downY;
 
-        void reset() { candidate = null; }
+        void reset() {
+            candidate = null;
+            stageRowCandidate = -1;
+            endStageRowDragVisual();
+            stageRowDrag = -1;
+        }
 
         @Override public boolean touchDown(int screenX, int screenY, int pointer, int button) {
-            if (pointer != 0 || dragOutType != null) return false;
+            if (pointer != 0 || dragOutType != null || stageRowDrag != -1) return false;
             candidate = paletteRowAt(screenX, screenY);
+            stageRowCandidate = stageRowAt(screenX, screenY);
             downX = screenX; downY = screenY;
             return false; // never consume the press: tap/scroll need it
         }
 
         @Override public boolean touchDragged(int screenX, int screenY, int pointer) {
             if (pointer != 0) return false;
+            if (stageRowDrag != -1) {
+                return true; // ours now: the ScrollPane/stage must not steal this drag
+            }
             if (dragOutType != null) {
                 dragScrX = screenX; dragScrY = screenY;
                 return true; // ours now: the pane/stage must not see this drag
+            }
+            if (stageRowCandidate != -1) {
+                // any direction counts: assigning to another STAGE is mostly a
+                // VERTICAL drag, which the ScrollPane would steal from a scene2d
+                // listener (issue 2)
+                if (Math.hypot(screenX - downX, screenY - downY) > 14) {
+                    stageRowDrag = stageRowCandidate;
+                    stageRowCandidate = -1;
+                    // the stage focused the row at touch-down; drop that focus so
+                    // the pane cannot cancel us and no phantom row tap fires later
+                    stage.cancelTouchFocus();
+                    Actor row = stageRows.get(stageRowDrag);
+                    row.setColor(1f, 1f, 0.6f, 1f); // drag feedback
+                    int part = stageRowParts.get(stageRowDrag);
+                    PartType t = part < design.parts.size() ? PartList.get(design.parts.get(part).typeId) : null;
+                    status("Drag " + (t != null ? t.name : "part") + " onto a STAGE header");
+                    return true;
+                }
             }
             if (candidate != null) {
                 float dx = screenX - downX, dy = screenY - downY;
@@ -290,13 +325,25 @@ public class EditorScreen extends ScreenAdapter {
 
         @Override public boolean touchUp(int screenX, int screenY, int pointer, int button) {
             candidate = null;
-            if (pointer != 0 || dragOutType == null) return false;
+            stageRowCandidate = -1;
+            if (pointer != 0) return false;
+            if (stageRowDrag != -1) {
+                finishStageRowDrag(screenX, screenY);
+                return true; // release consumed: stage never sees it
+            }
+            if (dragOutType == null) return false;
             finishDragOut(screenX, screenY);
             return true; // release consumed: stage never sees it
         }
 
         @Override public boolean touchCancelled(int screenX, int screenY, int pointer, int button) {
             candidate = null;
+            stageRowCandidate = -1;
+            if (stageRowDrag != -1) {
+                endStageRowDragVisual();
+                stageRowDrag = -1;
+                return true;
+            }
             if (dragOutType != null) {
                 dragOutType = null;
                 placing = null;
@@ -304,6 +351,58 @@ public class EditorScreen extends ScreenAdapter {
             }
             return false;
         }
+    }
+
+    /** Index (into stageRows) of the stage-drawer part row under a screen point. */
+    private int stageRowAt(float screenX, float screenY) {
+        if (openDrawer != 3) return -1;
+        float stageY = Gdx.graphics.getHeight() - screenY;
+        com.badlogic.gdx.math.Vector2 tmpA = new com.badlogic.gdx.math.Vector2();
+        com.badlogic.gdx.math.Vector2 tmpB = new com.badlogic.gdx.math.Vector2();
+        for (int i = 0; i < stageRows.size(); i++) {
+            Actor row = stageRows.get(i);
+            if (row.getStage() == null) continue;
+            row.localToStageCoordinates(tmpA.set(0, 0));
+            row.localToStageCoordinates(tmpB.set(row.getWidth(), row.getHeight()));
+            if (screenX >= tmpA.x && screenX <= tmpB.x && stageY >= tmpA.y && stageY <= tmpB.y) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    private void endStageRowDragVisual() {
+        if (stageRowDrag != -1 && stageRowDrag < stageRows.size()) {
+            stageRows.get(stageRowDrag).setColor(1f, 1f, 1f, 1f);
+        }
+    }
+
+    /** Drop a dragged stage-drawer row: assign its part to the header under the finger. */
+    private void finishStageRowDrag(float screenX, float screenY) {
+        int rowIdx = stageRowDrag;
+        endStageRowDragVisual();
+        stageRowDrag = -1;
+        stage.cancelTouchFocus(); // defensive (same class of leak as item 8)
+        if (rowIdx >= stageRowParts.size()) return;
+        int part = stageRowParts.get(rowIdx);
+        if (part >= design.parts.size()) return;
+        com.badlogic.gdx.math.Vector2 sp = stage.screenToStageCoordinates(
+                new com.badlogic.gdx.math.Vector2(screenX, Gdx.graphics.getHeight() - screenY));
+        Integer target = stageHeaderAt(sp.x, sp.y);
+        PartType t = PartList.get(design.parts.get(part).typeId);
+        if (target == null) {
+            status("Drop cancelled — release over a STAGE header");
+            return;
+        }
+        if (design.parts.get(part).group == target) {
+            status("Already in " + (target == 0 ? "Unassigned" : "STAGE " + target));
+            return;
+        }
+        pushHistory();
+        design.parts.get(part).group = target;
+        status("Moved " + (t != null ? t.name : "part")
+                + (target == 0 ? " to Unassigned" : " into STAGE " + target));
+        rebuildStageList();
     }
 
     /** The palette row (if any) under a screen point, for drag-out interception. */
@@ -442,6 +541,14 @@ public class EditorScreen extends ScreenAdapter {
         slide(drawerStages, false);
     }
 
+    /** Re-open the Add-Part drawer (issue 3: rapid consecutive placement). */
+    private void openPartsDrawer() {
+        openDrawer = 2;
+        slide(drawerMenu, false);
+        slide(drawerParts, true);
+        slide(drawerStages, false);
+    }
+
     private void slide(Table d, boolean open) {
         if (d == null) return;
         d.clearActions();
@@ -571,9 +678,28 @@ public class EditorScreen extends ScreenAdapter {
         stageListTable.top();
         ScrollPane sp = new ScrollPane(stageListTable, game.ui.skin);
         sp.setFadeScrollBars(false);
+        sp.setScrollingDisabled(true, false); // issue 1: never scroll sideways
         d.add(sp).expand().fill().padTop(TOP_H + 8).padBottom(330).padLeft(6).padRight(6);
         return d;
     }
+
+    /** Truncate with an ellipsis so the rendered text fits maxW px (issue 1). */
+    private String fitText(String s, float maxW) {
+        com.badlogic.gdx.graphics.g2d.GlyphLayout layout =
+                new com.badlogic.gdx.graphics.g2d.GlyphLayout();
+        layout.setText(game.font, s);
+        if (layout.width <= maxW) return s;
+        String ell = "..";
+        while (s.length() > 1) {
+            s = s.substring(0, s.length() - 1);
+            layout.setText(game.font, s + ell);
+            if (layout.width <= maxW) return s + ell;
+        }
+        return s;
+    }
+
+    /** Width budget for stage-drawer content rows (drawer minus pads/scrollbar). */
+    private float stageRowWidth() { return drawerW - 12 - 24; }
 
     /**
      * Rebuild the stages drawer content: one section per activation group
@@ -586,9 +712,13 @@ public class EditorScreen extends ScreenAdapter {
         stageListTable.clear();
         stageHeaders.clear();
         stageHeaderNums.clear();
-        stageListTable.add(new Label("STAGES", game.ui.skin)).pad(8).row();
-        stageListTable.add(new Label("Tap header = highlight; drag part row onto a header = assign",
-                game.ui.skin)).pad(4).row();
+        stageRows.clear();
+        stageRowParts.clear();
+        stageListTable.add(new Label("STAGES", game.ui.skin)).pad(8).left().row();
+        Label hint = new Label("Tap header = highlight; drag a part row onto a header = assign",
+                game.ui.skin);
+        hint.setWrap(true);
+        stageListTable.add(hint).width(stageRowWidth()).pad(4).row();
         for (int g = 1; g <= 8; g++) addStageSection(g);
         addStageSection(0);
     }
@@ -598,8 +728,9 @@ public class EditorScreen extends ScreenAdapter {
         for (ShipDesign.DesignPart dp : design.parts) if (dp.group == g) count++;
         Table h = new Table();
         h.setBackground(game.ui.tinted(new Color(0.14f, 0.16f, 0.24f, 1f)));
-        TextButton hb = new TextButton((g == 0 ? "Unassigned" : "STAGE " + g) + "  (" + count + ")",
-                game.ui.skin);
+        TextButton hb = new TextButton(
+                fitText((g == 0 ? "Unassigned" : "STAGE " + g) + "  (" + count + ")",
+                        stageRowWidth() - 120 - 8), game.ui.skin);
         hb.addListener(new ClickListener() {
             @Override public void clicked(InputEvent e, float x, float y) { selectGroup(g); }
         });
@@ -607,63 +738,53 @@ public class EditorScreen extends ScreenAdapter {
         asg.addListener(new ClickListener() {
             @Override public void clicked(InputEvent e, float x, float y) { assignSelected(g); }
         });
-        h.add(hb).expandX().fillX().height(ROW_H).pad(2);
+        h.add(hb).width(stageRowWidth() - 120 - 4).height(ROW_H).pad(2);
         h.add(asg).width(120).height(ROW_H).pad(2);
-        stageListTable.add(h).expandX().fillX().pad(3).row();
+        stageListTable.add(h).width(stageRowWidth()).pad(3).row();
         stageHeaders.add(h);
         stageHeaderNums.add(g);
         for (int i = 0; i < design.parts.size(); i++) {
             if (design.parts.get(i).group != g) continue;
-            stageListTable.add(partStageRow(i)).expandX().fillX().height(ROW_H).pad(2)
-                    .padLeft(24).row();
+            stageListTable.add(partStageRow(i)).width(stageRowWidth() - 14).height(ROW_H).pad(2)
+                    .padLeft(14).row();
         }
     }
 
-    /** A draggable part row inside a stage section (C5 drag-to-assign). */
+    /**
+     * A part row inside a stage section. Tap = highlight the part on the canvas.
+     * Drag-to-assign is handled RAW by DragOutInterceptor (issue 2): the
+     * ScrollPane steals vertical drags from scene2d listeners in this gdx
+     * version, so an in-row drag listener can never complete the gesture.
+     */
     private Table partStageRow(final int idx) {
         PartType t = PartList.get(design.parts.get(idx).typeId);
         final Table row = new Table();
         row.setBackground(game.ui.tinted(new Color(0.18f, 0.2f, 0.28f, 1f)));
-        Label name = new Label((t != null ? t.name : "?"), game.ui.skin);
+        Label name = new Label(fitText(t != null ? t.name : "?", stageRowWidth() - 14 - 20),
+                game.ui.skin);
         row.add(name).expandX().left().padLeft(10);
         row.addListener(new InputListener() {
             private float downX, downY;
-            private boolean dragging;
+            private boolean moved;
             @Override public boolean touchDown(InputEvent e, float x, float y, int pointer, int button) {
                 downX = x; downY = y;
-                dragging = false;
+                moved = false;
                 return true;
             }
             @Override public void touchDragged(InputEvent e, float x, float y, int pointer) {
-                if (Math.hypot(x - downX, y - downY) > 14) {
-                    dragging = true;
-                    row.setColor(1f, 1f, 0.6f, 1f); // drag feedback
-                }
+                if (Math.hypot(x - downX, y - downY) > 14) moved = true;
             }
             @Override public void touchUp(InputEvent e, float x, float y, int pointer, int button) {
-                row.setColor(1f, 1f, 1f, 1f);
-                if (dragging && idx < design.parts.size()) {
-                    com.badlogic.gdx.math.Vector2 sp =
-                            row.localToStageCoordinates(new com.badlogic.gdx.math.Vector2(x, y));
-                    Integer target = stageHeaderAt(sp.x, sp.y);
-                    if (target != null && design.parts.get(idx).group != target) {
-                        pushHistory();
-                        design.parts.get(idx).group = target;
-                        status("Moved " + (t != null ? t.name : "part")
-                                + (target == 0 ? " to Unassigned" : " into STAGE " + target));
-                        rebuildStageList();
-                    }
-                    dragging = false;
-                    return;
-                }
-                dragging = false;
-                // simple tap: highlight just this part on the canvas
+                // taps only: drags are owned (and consumed) by the raw interceptor
+                if (moved || e.isCancelled()) return;
                 selected.clear();
                 if (idx < design.parts.size()) selected.add(idx);
                 updateDelButton();
                 status("Selected " + (t != null ? t.name : "part"));
             }
         });
+        stageRows.add(row);
+        stageRowParts.add(idx);
         return row;
     }
 
@@ -994,7 +1115,10 @@ public class EditorScreen extends ScreenAdapter {
                 updateDelButton();
                 design.autoStage();
                 rebuildStageList();
-                if (!Gdx.input.isKeyPressed(Input.Keys.SHIFT_LEFT)) placing = null;
+                if (!Gdx.input.isKeyPressed(Input.Keys.SHIFT_LEFT)) {
+                    placing = null;
+                    openPartsDrawer(); // issue 3: ready for the next part right away
+                }
                 return true;
             }
             int idx = partAt(w);
@@ -1257,6 +1381,8 @@ public class EditorScreen extends ScreenAdapter {
             design.autoStage();
             rebuildStageList();
             status("Placed " + placing.name + " — drag another from the list, or tap a row");
+            placing = null;
+            openPartsDrawer(); // issue 3: ready for the next part right away
         } else {
             status("Cancelled");
         }

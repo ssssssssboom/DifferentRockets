@@ -1,4 +1,4 @@
--- v2026.07.25
+-- v2026.07.25.1
 -- ============================================================================
 -- terrain.lua — planet terrain generation (PLAYER-EDITABLE)
 -- ============================================================================
@@ -86,7 +86,10 @@ specialTerrains = {
 --   flattenPad.enabled     master switch (true)
 --   flattenPad.angleDeg    pad center angle in degrees (90 = spawn site)
 --   flattenPad.halfWidthM  half-width of the leveled area in meters of
---                          surface arc (24). Heights blend back to the
+--                          surface arc (120; round 21: was 24 — a 48 m pad
+--                          on the ~0.4-grade natural slope next to the 91-93
+--                          deg mountain band left the spawn area sloped).
+--                          Heights blend back to the
 --                          natural terrain with a smoothstep across this
 --                          half-width, so pad center is perfectly level and
 --                          the rim joins the slopes tangentially.
@@ -96,7 +99,7 @@ specialTerrains = {
 flattenPad = {
   enabled = true,
   angleDeg = 90.0,
-  halfWidthM = 24.0,
+  halfWidthM = 120.0,
 }
 local padRadii = {
   Sun = 69634200.0, Smercury = 243970.0, Smenus = 605180.0,
@@ -148,17 +151,8 @@ local padHeightCache = {} -- planetName -> natural height at the pad center
 -- (finest ~0.6 deg features) and every band boundary is smoothstep-blended
 -- over up to 1.2 deg (capped at half the band width) toward the neighboring
 -- band, so edges are ramps and narrow bands stay rugged.
-local function bandFor(deg, info)
-  for _, r in ipairs(info.ranges) do
-    local s = r.startAngle % 360
-    local e = r.endAngle % 360
-    local inside
-    if s <= e then inside = (deg >= s and deg <= e)
-    else inside = (deg >= s or deg <= e) end
-    if inside then return r.minHeight, r.maxHeight, math.min((e - s) % 360, 360) / 2 end
-  end
-  return info.minHeight, info.maxHeight, math.huge
-end
+-- Round 21: the single-nearest-boundary blend was replaced by continuous
+-- per-band membership weights inside baseTerrainHeight below (see there).
 
 local function baseTerrainHeight(planetName, angleRad)
   local info = planetInfo[planetName]
@@ -206,29 +200,42 @@ local function baseTerrainHeight(planetName, angleRad)
     return lo + span * shaped
   end
 
-  local lo, hi, halfW = bandFor(deg, info)
-  -- nearest band boundary (signed distance, deg)
-  local bestSD, bestB = math.huge, 0
+  local function smooth01(x)
+    if x <= 0 then return 0 end
+    if x >= 1 then return 1 end
+    return x * x * (3 - 2 * x)
+  end
+
+  -- Round 21 fix (spawn-pad crack): the old code blended across only the
+  -- SINGLE nearest band boundary. Exactly midway between two boundaries
+  -- (the Smearth spawn site at 90 deg sits at the midpoint of the ocean
+  -- band's 89 deg end and the mountain band's 91 deg start) the "nearest"
+  -- boundary flips and the two sides blend DIFFERENT band pairs with
+  -- different rims — a ~65-80 m height discontinuity that the 24 m pad
+  -- flatten could not cover. Now every band contributes a smooth
+  -- membership weight (0 outside past the rim, 1 inside past the rim,
+  -- smoothstep across both edges) and the result is the weighted mix of
+  -- all band heights plus the remaining default-band share — continuous
+  -- everywhere, including boundary-overlap zones, and identical to the old
+  -- heights deep inside any band.
+  local h, wsum = 0.0, 0.0
   for _, r in ipairs(info.ranges) do
-    for _, b in ipairs({ r.startAngle % 360, r.endAngle % 360 }) do
-      local sd = (deg - b + 540) % 360 - 180
-      if math.abs(sd) < math.abs(bestSD) then bestSD, bestB = sd, b end
+    local s = r.startAngle % 360
+    local e = r.endAngle % 360
+    local rim = math.min(1.2, ((e - s) % 360) / 2)
+    if rim > 1e-6 then
+      local dS = (deg - s + 540) % 360 - 180  -- >0 inside (CCW of start edge)
+      local dE = (e - deg + 540) % 360 - 180  -- >0 inside (CW of end edge)
+      local w = smooth01(dS / rim * 0.5 + 0.5) * smooth01(dE / rim * 0.5 + 0.5)
+      if w > 0 then
+        h = h + w * bandHeight(r.minHeight, r.maxHeight)
+        wsum = wsum + w
+      end
     end
   end
-  if math.abs(bestSD) < 1.2 then
-    -- band heights on BOTH sides of the boundary, blended by a smoothstep of
-    -- the signed distance (+ side is CCW of the boundary)
-    local loP, hiP, halfP = bandFor((bestB + 1.2) % 360, info)
-    local loM, hiM, halfM = bandFor((bestB - 1.2 + 360) % 360, info)
-    local rim = math.min(1.2, halfP, halfM)
-    if math.abs(bestSD) < rim then
-      local t = bestSD / rim * 0.5 + 0.5
-      t = t * t * (3 - 2 * t)
-      local hM, hP = bandHeight(loM, hiM), bandHeight(loP, hiP)
-      return hM + (hP - hM) * t + micro
-    end
-  end
-  return bandHeight(lo, hi) + micro
+  local wdef = 1.0 - wsum
+  if wdef < 0 then wdef = 0 end
+  return h + wdef * bandHeight(info.minHeight, info.maxHeight) + micro
 end
 
 function terrainHeight(planetName, angleRad)

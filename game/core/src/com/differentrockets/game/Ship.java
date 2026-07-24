@@ -32,12 +32,20 @@ public class Ship {
         public Part a, b;
         public boolean fuelEdge;
         public float breakForce = Float.MAX_VALUE;
+        /** index of each side's attach point in its part's attachDefs (-1 = unknown). */
+        public int attachIndexA = -1, attachIndexB = -1;
     }
 
     public final GameWorld world;
     public final List<Part> parts = new ArrayList<>();
     public final List<Link> links = new ArrayList<>();
+    /**
+     * Legacy design stage list (design-part indices). Still loaded/saved for
+     * backward compatibility, but STAGE activation is group-number based now
+     * (see activateStage); this no longer drives anything.
+     */
     public final List<List<Integer>> stages = new ArrayList<>();
+    /** Last stage NUMBER fired (group-based staging, round 26); 0 = none. */
     public int currentStage = 0;
 
     /** universe position of this ship's local frame origin */
@@ -167,6 +175,8 @@ public class Ship {
         l.b = b;
         l.fuelEdge = apA.fuelLine && apB.fuelLine;
         l.breakForce = breakForce;
+        l.attachIndexA = a.attachDefs().indexOf(apA);
+        l.attachIndexB = b.attachDefs().indexOf(apB);
         links.add(l);
     }
 
@@ -177,6 +187,25 @@ public class Ship {
         }
         for (Link l : dead) destroyLink(l);
         splitIfDisconnected();
+    }
+
+    /**
+     * Detach MODE 2 (detacher-*.lua, round 26): sever ONLY the joint sitting
+     * on this part's FIRST attach point (index 0 — the parent/upstream side:
+     * TopCenter on detacher-1, LeftCenter on detacher-2). Joints on every
+     * other attach point survive, so the detacher ring stays with the lower
+     * stage instead of falling free. Links without a recorded attach index
+     * (-1, e.g. rebuilt from an old save) are treated as parent joints and
+     * severed too — a detacher that keeps a mystery link would never staged.
+     */
+    public void removeParentJointOf(Part p) {
+        List<Link> dead = new ArrayList<>();
+        for (Link l : links) {
+            if (l.a == p && l.attachIndexA <= 0) dead.add(l);
+            else if (l.b == p && l.attachIndexB <= 0) dead.add(l);
+        }
+        for (Link l : dead) destroyLink(l);
+        if (!dead.isEmpty()) splitIfDisconnected();
     }
 
     private void destroyLink(Link l) {
@@ -509,23 +538,40 @@ public class Ship {
 
     // ---------------------------------------------------------------- stages
 
-    /** Activate the next stage; returns the stage index fired or -1. */
+    /**
+     * STAGE semantics (round 26, item B4): a part's `group` IS its stage
+     * number (0 = not staged, set in the editor by dragging parts into STAGE
+     * slots). Pressing STAGE fires the NEXT stage number — the smallest
+     * group number greater than `currentStage` among this ship's parts — by
+     * calling onStage on every part in it (engines ignite at the current
+     * throttle, detachers sever per their MODE, chutes/legs deploy).
+     * Returns the stage number fired, or -1 when no staged parts remain.
+     *
+     * This replaces the old design-stage-list semantics (the `stages` list
+     * is still loaded/saved for backward compatibility but no longer drives
+     * activation) and supersedes the ACTIVATE-by-group behavior.
+     * `currentStage` now means "last stage number fired".
+     */
     public int activateStage() {
-        if (currentStage >= stages.size()) return -1;
+        int next = -1;
+        for (Part p : parts) {
+            if (p.group > currentStage && (next < 0 || p.group < next)) next = p.group;
+        }
+        if (next < 0) return -1;
         // snapshot targets BEFORE firing: a detacher's onStage defers joint
         // destruction + ship split, which mutates `parts` after we return —
-        // resolving indices to references first keeps every member reachable.
+        // resolving the group to references first keeps every member reachable.
         List<Part> targets = new ArrayList<>();
-        for (int idx : stages.get(currentStage)) {
-            if (idx >= 0 && idx < parts.size()) targets.add(parts.get(idx));
+        for (Part p : parts) {
+            if (p.group == next) targets.add(p);
         }
         for (Part p : targets) {
             if (p.body == null || p.ship == null || !p.ship.parts.contains(p)) continue;
             p.callOnStage();
         }
         world.processDeferredStructure();
-        currentStage++;
-        return currentStage - 1;
+        currentStage = next;
+        return next;
     }
 
     /** map from design-part index to runtime Part (same order, parts may have been filtered). */

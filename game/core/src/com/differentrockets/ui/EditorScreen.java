@@ -22,7 +22,6 @@ import com.badlogic.gdx.scenes.scene2d.ui.Table;
 import com.badlogic.gdx.scenes.scene2d.ui.TextButton;
 import com.badlogic.gdx.scenes.scene2d.ui.TextField;
 import com.badlogic.gdx.scenes.scene2d.utils.ClickListener;
-import com.badlogic.gdx.utils.Align;
 import com.badlogic.gdx.utils.viewport.ScreenViewport;
 import com.differentrockets.game.Attach;
 import com.differentrockets.game.DRGame;
@@ -46,6 +45,12 @@ public class EditorScreen extends ScreenAdapter {
     private ShipDesign design = new ShipDesign();
     private String shipName = "Untitled";
 
+    // scaled editor chrome constants (task C1: ~1.35x the original 64px bar)
+    private static final int TOP_H = 88;
+    private static final int BTN_W = 190;
+    private static final int BTN_H = 88;
+    private static final int ROW_H = 76;
+
     private Stage stage;
     private OrthographicCamera cam;
     private final InputAdapter editorInput = new EditorInput();
@@ -55,7 +60,24 @@ public class EditorScreen extends ScreenAdapter {
     private PartType dragOutType;     // non-null while a palette drag-out gesture is live
     private int dragOutPointer = -1;
     private float dragScrX, dragScrY; // last known screen pos of the drag-out finger
-    private final TextButton[] groupButtons = new TextButton[9];
+
+    // drawers (task C2): 0 = none, 1 = menu, 2 = add part, 3 = stages
+    private int openDrawer = 0;
+    private float drawerW;
+    private Table drawerMenu, drawerParts, drawerStages;
+    private Table menuShipList;       // saved-ship buttons inside the menu drawer
+    private Table stageListTable;     // stage sections inside the stages drawer
+    private TextField nameField;      // rename field inside the menu drawer
+    private Label nameLabel;          // ship name in the top bar
+    private TextButton delButton;     // floating delete button (selection only)
+    // stage-drawer drag targets: header actors parallel to their stage numbers
+    private final List<Actor> stageHeaders = new ArrayList<>();
+    private final List<Integer> stageHeaderNums = new ArrayList<>();
+
+    // build-operation history (task C3): JSON snapshots of the design
+    private final List<String> undoStack = new ArrayList<>();
+    private final List<String> redoStack = new ArrayList<>();
+    private static final int HISTORY_MAX = 60;
 
     // dragging state
     private PartType placing;         // palette part being placed
@@ -67,25 +89,89 @@ public class EditorScreen extends ScreenAdapter {
     // two-finger gesture state (item 2): A = first finger, B = second finger
     private int touchPtrA = -1, touchPtrB = -1;
     private float gpaX, gpaY, gpbX, gpbY;
-    private Table stageTable;
     private Label statusLabel;
-    private Table overlay;            // modal overlays (launch picker / load dialog)
+    private Table overlay;            // modal overlays (launch picker)
 
     // activation groups (item 6a): multi-select + group assignment
     private final Set<Integer> selected = new HashSet<>();
     private int downIndex = -1;       // part under touch-down (tap=select, drag=move)
     private float downScrX, downScrY;
     private boolean dragMoved;
-    private Table groupBar;
 
     public EditorScreen(DRGame game, ShipDesign existing) {
         this.game = game;
         if (existing != null) this.design = existing;
+        else restoreAutosave(); // task C6: resume the last build session
         // every new rocket starts with a command pod
         if (this.design.parts.isEmpty()) {
             this.design.parts.add(new ShipDesign.DesignPart("pod-1", 0, 0, 0));
             this.design.autoStage();
         }
+    }
+
+    // ------------------------------------------------------------ autosave (C6)
+
+    private void autosave() {
+        try {
+            com.badlogic.gdx.files.FileHandle dir = Gdx.files.local("save");
+            dir.mkdirs();
+            dir.child("editor_autosave.json").writeString(design.toJson(), false);
+            dir.child("editor_autosave.name").writeString(shipName, false);
+        } catch (Exception e) {
+            Gdx.app.log("editor", "autosave failed: " + e.getMessage());
+        }
+    }
+
+    private void restoreAutosave() {
+        try {
+            com.badlogic.gdx.files.FileHandle f = Gdx.files.local("save/editor_autosave.json");
+            if (!f.exists()) return;
+            ShipDesign d = ShipDesign.fromJson(f.readString());
+            if (d.parts.isEmpty()) return;
+            this.design.copyFrom(d);
+            com.badlogic.gdx.files.FileHandle n = Gdx.files.local("save/editor_autosave.name");
+            if (n.exists()) {
+                String nm = n.readString().trim();
+                if (!nm.isEmpty()) this.shipName = nm;
+            }
+        } catch (Exception e) {
+            Gdx.app.log("editor", "autosave restore failed: " + e.getMessage());
+        }
+    }
+
+    // ------------------------------------------------------------ undo/redo (C3)
+
+    /** Snapshot the design BEFORE a mutating build operation. */
+    private void pushHistory() {
+        undoStack.add(design.toJson());
+        if (undoStack.size() > HISTORY_MAX) undoStack.remove(0);
+        redoStack.clear();
+    }
+
+    private void undo() {
+        if (undoStack.isEmpty()) { status("Nothing to undo"); return; }
+        redoStack.add(design.toJson());
+        applySnapshot(undoStack.remove(undoStack.size() - 1));
+        status("Undo (" + undoStack.size() + " more)");
+    }
+
+    private void redo() {
+        if (redoStack.isEmpty()) { status("Nothing to redo"); return; }
+        undoStack.add(design.toJson());
+        applySnapshot(redoStack.remove(redoStack.size() - 1));
+        status("Redo");
+    }
+
+    private void applySnapshot(String json) {
+        try {
+            design.copyFrom(ShipDesign.fromJson(json));
+        } catch (Exception e) {
+            status("History restore failed: " + e.getMessage());
+            return;
+        }
+        selected.clear();
+        rebuildStageList();
+        updateDelButton();
     }
 
     public ShipDesign getDesign() { return design; }
@@ -106,7 +192,11 @@ public class EditorScreen extends ScreenAdapter {
         return i < paletteItems.size() ? actorScreenPos(paletteItems.get(i)) : null;
     }
     public int[] groupButtonScreenPos(int g) {
-        return g >= 1 && g <= 8 ? actorScreenPos(groupButtons[g]) : null;
+        // group buttons moved into the stages drawer (task C5); use the header row
+        for (int i = 0; i < stageHeaderNums.size(); i++) {
+            if (stageHeaderNums.get(i) == g) return actorScreenPos(stageHeaders.get(i));
+        }
+        return null;
     }
     public int[] partScreenPos(int designIndex) {
         if (designIndex >= design.parts.size()) return null;
@@ -131,9 +221,8 @@ public class EditorScreen extends ScreenAdapter {
         cam = new OrthographicCamera();
         cam.viewportHeight = 40;
         cam.viewportWidth = 40f * Gdx.graphics.getWidth() / Gdx.graphics.getHeight();
-        // portrait with left palette: frame the rocket in the visible canvas
-        // band right of the palette column (canvas center != screen center)
-        cam.position.set(-4.5f, -3, 0);
+        // full-screen canvas (drawers slide over it): center the rocket
+        cam.position.set(0, -3, 0);
         cam.update();
 
         stage = new Stage(new ScreenViewport());
@@ -219,6 +308,7 @@ public class EditorScreen extends ScreenAdapter {
 
     /** The palette row (if any) under a screen point, for drag-out interception. */
     private PartType paletteRowAt(float screenX, float screenY) {
+        if (openDrawer != 2) return null; // palette only lives in the Add-Part drawer (C2/C4)
         float stageY = Gdx.graphics.getHeight() - screenY; // stage coords are y-up
         com.badlogic.gdx.math.Vector2 tmpA = new com.badlogic.gdx.math.Vector2();
         com.badlogic.gdx.math.Vector2 tmpB = new com.badlogic.gdx.math.Vector2();
@@ -235,63 +325,226 @@ public class EditorScreen extends ScreenAdapter {
     // ------------------------------------------------------------ UI chrome
 
     private void buildChrome() {
-        Table root = new Table();
-        root.setFillParent(true);
-        root.top();
-        stage.addActor(root);
+        drawerW = Gdx.graphics.getWidth() * 0.44f;
 
-        // --- top bar row 1: Menu / ship name / LAUNCH ---
-        final TextField nameField = new TextField(shipName, game.ui.skin);
-        nameField.setTextFieldListener((tf, c) -> shipName = tf.getText());
+        // --- full-screen canvas layer (bottom-most; the only region treated as canvas) ---
+        canvasArea = new Table();
+        canvasArea.setFillParent(true);
+        stage.addActor(canvasArea);
 
-        TextButton launch = new TextButton("LAUNCH >>", game.ui.skin);
-        launch.addListener(new ClickListener() {
-            @Override public void clicked(InputEvent e, float x, float y) { showLaunchPicker(); }
-        });
-        TextButton back = new TextButton("Menu", game.ui.skin);
-        back.addListener(new ClickListener() {
-            @Override public void clicked(InputEvent e, float x, float y) {
-                game.setScreen(new MenuScreen(game));
-            }
-        });
+        // --- drawers (task C2): slide in from the left, under the top bar ---
+        drawerMenu = buildMenuDrawer();
+        drawerParts = buildPartsDrawer();
+        drawerStages = buildStagesDrawer();
+        for (Table d : new Table[]{drawerMenu, drawerParts, drawerStages}) {
+            d.setSize(drawerW, Gdx.graphics.getHeight());
+            d.setPosition(-drawerW - 8, 0);
+            stage.addActor(d);
+        }
 
-        Table top1 = new Table();
-        top1.add(back).height(64).pad(4);
-        top1.add(nameField).expandX().fillX().height(64).pad(4);
-        top1.add(launch).width(150).height(64).pad(4);
-
-        // --- top bar row 2: Rotate / Save / Load / Stages ---
+        // --- top bar: ship name / Rotate / LAUNCH ---
+        nameLabel = new Label(shipName, game.ui.skin);
         TextButton rotate = new TextButton("Rotate (R)", game.ui.skin);
         rotate.addListener(new ClickListener() {
             @Override public void clicked(InputEvent e, float x, float y) { rotateGhost(); }
         });
-        TextButton save = new TextButton("Save", game.ui.skin);
-        save.addListener(new ClickListener() {
-            @Override public void clicked(InputEvent e, float x, float y) { saveShip(); }
+        TextButton launch = new TextButton("LAUNCH >>", game.ui.skin);
+        launch.addListener(new ClickListener() {
+            @Override public void clicked(InputEvent e, float x, float y) { showLaunchPicker(); }
         });
-        TextButton load = new TextButton("Load", game.ui.skin);
-        load.addListener(new ClickListener() {
-            @Override public void clicked(InputEvent e, float x, float y) { showLoadDialog(); }
-        });
-        TextButton stages = new TextButton("Stages", game.ui.skin);
-        stages.addListener(new ClickListener() {
-            @Override public void clicked(InputEvent e, float x, float y) { showStagesDialog(); }
-        });
-
-        Table top2 = new Table();
-        top2.add(rotate).expandX().fillX().height(64).pad(4);
-        top2.add(save).expandX().fillX().height(64).pad(4);
-        top2.add(load).expandX().fillX().height(64).pad(4);
-        top2.add(stages).expandX().fillX().height(64).pad(4);
-
+        Table bar = new Table();
+        bar.setBackground(game.ui.tinted(new Color(0.09f, 0.1f, 0.15f, 0.95f)));
+        bar.add(nameLabel).expandX().left().padLeft(16).height(TOP_H);
+        bar.add(rotate).width(230).height(TOP_H - 14).pad(7);
+        bar.add(launch).width(240).height(TOP_H - 14).pad(7);
         Table top = new Table();
-        top.setBackground(game.ui.tinted(new Color(0.09f, 0.1f, 0.15f, 0.95f)));
-        top.add(top1).fillX().row();
-        top.add(top2).fillX().row();
+        top.setFillParent(true);
+        top.top();
+        top.setTouchable(Touchable.childrenOnly); // container must not swallow canvas taps
+        top.add(bar).fillX();
+        stage.addActor(top);
 
-        // --- middle: LEFT palette column (~40% width) + canvas ---
-        stageTable = new Table(); // content shown inside the Stages dialog
+        // --- bottom-left drawer buttons (above the drawers in z-order) ---
+        Table btns = new Table();
+        btns.setFillParent(true);
+        btns.bottom().left();
+        btns.setTouchable(Touchable.childrenOnly);
+        TextButton bMenu = new TextButton("Menu", game.ui.skin);
+        bMenu.addListener(new ClickListener() {
+            @Override public void clicked(InputEvent e, float x, float y) { toggleDrawer(1); }
+        });
+        TextButton bParts = new TextButton("Add Part", game.ui.skin);
+        bParts.addListener(new ClickListener() {
+            @Override public void clicked(InputEvent e, float x, float y) { toggleDrawer(2); }
+        });
+        TextButton bStages = new TextButton("Stages", game.ui.skin);
+        bStages.addListener(new ClickListener() {
+            @Override public void clicked(InputEvent e, float x, float y) { toggleDrawer(3); }
+        });
+        btns.add(bMenu).width(BTN_W).height(BTN_H).pad(6).row();
+        btns.add(bParts).width(BTN_W).height(BTN_H).pad(6).row();
+        btns.add(bStages).width(BTN_W).height(BTN_H).pad(6).padBottom(130).row();
+        stage.addActor(btns);
 
+        // --- floating delete button (bottom-right, visible with a selection) ---
+        delButton = new TextButton("DEL", game.ui.skin);
+        delButton.addListener(new ClickListener() {
+            @Override public void clicked(InputEvent e, float x, float y) { deleteSelected(); }
+        });
+        Table delWrap = new Table();
+        delWrap.setFillParent(true);
+        delWrap.bottom().right();
+        delWrap.setTouchable(Touchable.childrenOnly);
+        delWrap.add(delButton).width(BTN_W).height(BTN_H).pad(10).padBottom(130);
+        stage.addActor(delWrap);
+
+        // --- bottom status bar ---
+        statusLabel = new Label("Tap [Add Part] for parts. Tap part = select; drag = move; DEL deletes.",
+                game.ui.skin);
+        statusLabel.setColor(new Color(0.7f, 0.75f, 0.85f, 1f));
+        statusLabel.setWrap(true);
+        Table bbar = new Table();
+        bbar.setBackground(game.ui.tinted(new Color(0.09f, 0.1f, 0.15f, 0.95f)));
+        bbar.add(statusLabel).width(Gdx.graphics.getWidth() - 24).left().padLeft(12).padTop(6).padBottom(6);
+        Table bottom = new Table();
+        bottom.setFillParent(true);
+        bottom.bottom();
+        bottom.setTouchable(Touchable.childrenOnly);
+        bottom.add(bbar).fillX();
+        stage.addActor(bottom);
+
+        rebuildStageList();
+        updateDelButton();
+    }
+
+    /** Common drawer shell: dark panel, content starts below the top bar. */
+    private Table drawerShell() {
+        Table d = new Table();
+        d.setBackground(game.ui.tinted(new Color(0.09f, 0.1f, 0.15f, 0.97f)));
+        d.top();
+        return d;
+    }
+
+    private void toggleDrawer(int which) {
+        if (openDrawer == which) { closeDrawers(); return; }
+        openDrawer = which;
+        if (which == 1) rebuildMenuList();
+        if (which == 3) rebuildStageList();
+        slide(drawerMenu, which == 1);
+        slide(drawerParts, which == 2);
+        slide(drawerStages, which == 3);
+    }
+
+    private void closeDrawers() {
+        openDrawer = 0;
+        slide(drawerMenu, false);
+        slide(drawerParts, false);
+        slide(drawerStages, false);
+    }
+
+    private void slide(Table d, boolean open) {
+        if (d == null) return;
+        d.clearActions();
+        d.addAction(com.badlogic.gdx.scenes.scene2d.actions.Actions.moveTo(
+                open ? 0 : -drawerW - 8, 0, 0.22f,
+                com.badlogic.gdx.math.Interpolation.pow2Out));
+    }
+
+    // ------------------------------------------------------------ menu drawer (C3)
+
+    private Table buildMenuDrawer() {
+        Table d = drawerShell();
+        Table content = new Table();
+        content.top();
+        content.add(new Label("MENU", game.ui.skin)).pad(10).row();
+        addMenuButton(content, "Save Ship", new Runnable() { public void run() { saveShip(); rebuildMenuList(); } });
+        content.add(new Label("Ship name:", game.ui.skin)).left().padLeft(10).padTop(8).row();
+        nameField = new TextField(shipName, game.ui.skin);
+        content.add(nameField).fillX().height(ROW_H).pad(6).row();
+        addMenuButton(content, "Apply Name", new Runnable() { public void run() {
+            shipName = nameField.getText();
+            nameLabel.setText(shipName);
+            status("Renamed to " + shipName);
+        } });
+        addMenuButton(content, "Undo", new Runnable() { public void run() { undo(); } });
+        addMenuButton(content, "Redo", new Runnable() { public void run() { redo(); } });
+        addMenuButton(content, "New Ship", new Runnable() { public void run() { newShip(); } });
+        addMenuButton(content, "Share Ship", new Runnable() { public void run() {
+            status("Share Ship: not implemented yet"); // placeholder (C3)
+        } });
+        addMenuButton(content, "Exit to Menu", new Runnable() { public void run() {
+            game.setScreen(new MenuScreen(game));
+        } });
+        content.add(new Label("OPEN SHIP:", game.ui.skin)).pad(10).row();
+        menuShipList = new Table();
+        content.add(menuShipList).fillX().row();
+        ScrollPane sp = new ScrollPane(content, game.ui.skin);
+        sp.setFadeScrollBars(false);
+        d.add(sp).expand().fill().padTop(TOP_H + 8).padBottom(330).padLeft(6).padRight(6);
+        return d;
+    }
+
+    private void addMenuButton(Table content, String label, final Runnable action) {
+        TextButton b = new TextButton(label, game.ui.skin);
+        b.addListener(new ClickListener() {
+            @Override public void clicked(InputEvent e, float x, float y) { action.run(); }
+        });
+        content.add(b).fillX().height(ROW_H).pad(5).row();
+    }
+
+    /** Saved-ship buttons inside the menu drawer (replaces the old Load dialog). */
+    private void rebuildMenuList() {
+        if (menuShipList == null) return;
+        menuShipList.clear();
+        com.badlogic.gdx.files.FileHandle dir = Gdx.files.local("save/ships");
+        boolean any = false;
+        if (dir.exists()) {
+            for (final com.badlogic.gdx.files.FileHandle f : dir.list(".json")) {
+                any = true;
+                TextButton b = new TextButton(f.nameWithoutExtension(), game.ui.skin);
+                b.addListener(new ClickListener() {
+                    @Override public void clicked(InputEvent e, float x, float y) { loadShip(f); }
+                });
+                menuShipList.add(b).fillX().height(ROW_H).pad(4).row();
+            }
+        }
+        if (!any) menuShipList.add(new Label("(no saved ships)", game.ui.skin)).pad(8).row();
+    }
+
+    private void loadShip(com.badlogic.gdx.files.FileHandle f) {
+        try {
+            pushHistory();
+            design.copyFrom(ShipDesign.fromJson(f.readString()));
+            shipName = f.nameWithoutExtension();
+            if (nameField != null) nameField.setText(shipName);
+            if (nameLabel != null) nameLabel.setText(shipName);
+            selected.clear();
+            rebuildStageList();
+            updateDelButton();
+            status("Loaded " + shipName);
+        } catch (Exception ex) {
+            status("Load failed: " + ex.getMessage());
+        }
+    }
+
+    private void newShip() {
+        pushHistory();
+        design.clear();
+        design.parts.add(new ShipDesign.DesignPart("pod-1", 0, 0, 0));
+        design.autoStage();
+        shipName = "Untitled";
+        if (nameField != null) nameField.setText(shipName);
+        if (nameLabel != null) nameLabel.setText(shipName);
+        selected.clear();
+        rebuildStageList();
+        updateDelButton();
+        status("New ship");
+    }
+
+    // ------------------------------------------------------------ parts drawer (C4)
+
+    private Table buildPartsDrawer() {
+        Table d = drawerShell();
         Table paletteCol = new Table();
         paletteCol.top();
         paletteItems.clear();
@@ -306,130 +559,169 @@ public class EditorScreen extends ScreenAdapter {
         scroll.setFadeScrollBars(false);
         scroll.setScrollingDisabled(true, false); // vertical drag only
         paletteScroll = scroll;
-        Table paletteWrap = new Table();
-        paletteWrap.setBackground(game.ui.tinted(new Color(0.09f, 0.1f, 0.15f, 0.95f)));
-        paletteWrap.add(scroll).expand().fill();
-
-        groupBar = new Table();
-        canvasArea = new Table();
-        canvasArea.add().expand().fill().row();
-        canvasArea.add(groupBar).padBottom(6).row();
-
-        Table middle = new Table();
-        middle.add(paletteWrap).width(Gdx.graphics.getWidth() * 0.4f).expandY().fillY();
-        middle.add(canvasArea).expand().fill();
-
-        // --- bottom: status line only ---
-        statusLabel = new Label("Drag a part row onto the canvas, or tap it then click to place. Tap part = select; DEL deletes.",
-                game.ui.skin);
-        statusLabel.setColor(new Color(0.7f, 0.75f, 0.85f, 1f));
-        statusLabel.setWrap(true);
-        Table bottom = new Table();
-        bottom.setBackground(game.ui.tinted(new Color(0.09f, 0.1f, 0.15f, 0.95f)));
-        bottom.add(statusLabel).width(Gdx.graphics.getWidth() - 24).left().padLeft(12);
-
-        root.add(top).fillX().row();
-        root.add(middle).expand().fill().row();
-        root.add(bottom).fillX();
-        rebuildGroupBar();
+        d.add(scroll).expand().fill().padTop(TOP_H + 8).padBottom(330);
+        return d;
     }
 
-    /** Bottom bar with the 8 activation-group toggles; visible when parts are selected. */
-    private void rebuildGroupBar() {
-        groupBar.clear();
-        java.util.Arrays.fill(groupButtons, null);
-        if (selected.isEmpty()) return;
-        groupBar.setBackground(game.ui.tinted(new Color(0.09f, 0.1f, 0.15f, 0.9f)));
-        // three compact rows (the canvas column beside the palette is narrow):
-        // Grp 1-4 / 5-8 / Clear+DEL
-        Table r1 = new Table();
-        r1.add(new Label("Grp:", game.ui.skin)).padRight(6);
-        Table r2 = new Table();
-        for (int g = 1; g <= 8; g++) {
-            final int grp = g;
-            TextButton b = new TextButton(String.valueOf(g), game.ui.skin);
-            b.addListener(new ClickListener() {
-                @Override public void clicked(InputEvent e, float x, float y) { toggleGroup(grp); }
-            });
-            groupButtons[g] = b;
-            (g <= 4 ? r1 : r2).add(b).width(48).height(56).pad(2);
-        }
-        groupBar.add(r1).row();
-        groupBar.add(r2).row();
-        Table r3 = new Table();
-        TextButton clr = new TextButton("Clear grp", game.ui.skin);
-        clr.addListener(new ClickListener() {
-            @Override public void clicked(InputEvent e, float x, float y) {
-                for (int i : selected) design.parts.get(i).group = 0;
-                status("Cleared groups on " + selected.size() + " parts");
-                rebuildGroupBar();
-            }
-        });
-        TextButton del = new TextButton("DEL parts", game.ui.skin);
-        del.addListener(new ClickListener() {
-            @Override public void clicked(InputEvent e, float x, float y) {
-                // touch-friendly delete (right-click does not exist on phones)
-                List<Integer> idx = new ArrayList<>(selected);
-                idx.sort(java.util.Collections.reverseOrder());
-                for (int i : idx) design.parts.remove(i);
-                selected.clear();
-                design.autoStage();
-                rebuildStageList();
-                rebuildGroupBar();
-                status("Deleted " + idx.size() + " parts");
-            }
-        });
-        r3.add(clr).width(130).height(52).pad(3);
-        r3.add(del).width(130).height(52).pad(3);
-        groupBar.add(r3);
+    // ------------------------------------------------------------ stages drawer (C5)
+
+    private Table buildStagesDrawer() {
+        Table d = drawerShell();
+        stageListTable = new Table();
+        stageListTable.top();
+        ScrollPane sp = new ScrollPane(stageListTable, game.ui.skin);
+        sp.setFadeScrollBars(false);
+        d.add(sp).expand().fill().padTop(TOP_H + 8).padBottom(330).padLeft(6).padRight(6);
+        return d;
     }
 
-    /** Assign/toggle one activation group on every selected part (one group per part). */
-    private void toggleGroup(int grp) {
-        if (selected.isEmpty()) return;
-        boolean allIn = true;
-        for (int i : selected) {
-            if (design.parts.get(i).group != grp) { allIn = false; break; }
-        }
-        for (int i : selected) design.parts.get(i).group = allIn ? 0 : grp;
-        status(allIn ? "Removed group " + grp : "Assigned group " + grp + " to " + selected.size() + " parts");
-        rebuildGroupBar();
-    }
-
+    /**
+     * Rebuild the stages drawer content: one section per activation group
+     * (STAGE 1..8) plus Unassigned (group 0). Tap a section header to highlight
+     * that group's parts on the canvas; drag a part row onto another header to
+     * move the part into that STAGE (Part.group = stage number, 0 = unassigned).
+     */
     private void rebuildStageList() {
-        stageTable.clear();
-        stageTable.add(new Label("STAGES", game.ui.skin)).pad(6).row();
-        for (int i = 0; i < design.stages.size(); i++) {
-            List<Integer> st = design.stages.get(i);
-            StringBuilder sb = new StringBuilder();
-            for (int idx : st) {
-                if (idx < design.parts.size()) {
-                    PartType t = PartList.get(design.parts.get(idx).typeId);
-                    if (t != null) sb.append(t.name).append(", ");
+        if (stageListTable == null) return;
+        stageListTable.clear();
+        stageHeaders.clear();
+        stageHeaderNums.clear();
+        stageListTable.add(new Label("STAGES", game.ui.skin)).pad(8).row();
+        stageListTable.add(new Label("Tap header = highlight; drag part row onto a header = assign",
+                game.ui.skin)).pad(4).row();
+        for (int g = 1; g <= 8; g++) addStageSection(g);
+        addStageSection(0);
+    }
+
+    private void addStageSection(final int g) {
+        int count = 0;
+        for (ShipDesign.DesignPart dp : design.parts) if (dp.group == g) count++;
+        Table h = new Table();
+        h.setBackground(game.ui.tinted(new Color(0.14f, 0.16f, 0.24f, 1f)));
+        TextButton hb = new TextButton((g == 0 ? "Unassigned" : "STAGE " + g) + "  (" + count + ")",
+                game.ui.skin);
+        hb.addListener(new ClickListener() {
+            @Override public void clicked(InputEvent e, float x, float y) { selectGroup(g); }
+        });
+        TextButton asg = new TextButton("< Sel", game.ui.skin);
+        asg.addListener(new ClickListener() {
+            @Override public void clicked(InputEvent e, float x, float y) { assignSelected(g); }
+        });
+        h.add(hb).expandX().fillX().height(ROW_H).pad(2);
+        h.add(asg).width(120).height(ROW_H).pad(2);
+        stageListTable.add(h).expandX().fillX().pad(3).row();
+        stageHeaders.add(h);
+        stageHeaderNums.add(g);
+        for (int i = 0; i < design.parts.size(); i++) {
+            if (design.parts.get(i).group != g) continue;
+            stageListTable.add(partStageRow(i)).expandX().fillX().height(ROW_H).pad(2)
+                    .padLeft(24).row();
+        }
+    }
+
+    /** A draggable part row inside a stage section (C5 drag-to-assign). */
+    private Table partStageRow(final int idx) {
+        PartType t = PartList.get(design.parts.get(idx).typeId);
+        final Table row = new Table();
+        row.setBackground(game.ui.tinted(new Color(0.18f, 0.2f, 0.28f, 1f)));
+        Label name = new Label((t != null ? t.name : "?"), game.ui.skin);
+        row.add(name).expandX().left().padLeft(10);
+        row.addListener(new InputListener() {
+            private float downX, downY;
+            private boolean dragging;
+            @Override public boolean touchDown(InputEvent e, float x, float y, int pointer, int button) {
+                downX = x; downY = y;
+                dragging = false;
+                return true;
+            }
+            @Override public void touchDragged(InputEvent e, float x, float y, int pointer) {
+                if (Math.hypot(x - downX, y - downY) > 14) {
+                    dragging = true;
+                    row.setColor(1f, 1f, 0.6f, 1f); // drag feedback
                 }
             }
-            String txt = sb.length() > 2 ? sb.substring(0, sb.length() - 2) : "(empty)";
-            stageTable.add(new Label((i + 1) + ": " + txt, game.ui.skin))
-                    .pad(4).align(Align.left).row();
-        }
+            @Override public void touchUp(InputEvent e, float x, float y, int pointer, int button) {
+                row.setColor(1f, 1f, 1f, 1f);
+                if (dragging && idx < design.parts.size()) {
+                    com.badlogic.gdx.math.Vector2 sp =
+                            row.localToStageCoordinates(new com.badlogic.gdx.math.Vector2(x, y));
+                    Integer target = stageHeaderAt(sp.x, sp.y);
+                    if (target != null && design.parts.get(idx).group != target) {
+                        pushHistory();
+                        design.parts.get(idx).group = target;
+                        status("Moved " + (t != null ? t.name : "part")
+                                + (target == 0 ? " to Unassigned" : " into STAGE " + target));
+                        rebuildStageList();
+                    }
+                    dragging = false;
+                    return;
+                }
+                dragging = false;
+                // simple tap: highlight just this part on the canvas
+                selected.clear();
+                if (idx < design.parts.size()) selected.add(idx);
+                updateDelButton();
+                status("Selected " + (t != null ? t.name : "part"));
+            }
+        });
+        return row;
     }
 
-    /** Portrait: the stage list lives in a modal dialog (screen estate). */
-    private void showStagesDialog() {
-        closeOverlay();
+    /** Stage number whose header contains the stage-space point, or null. */
+    private Integer stageHeaderAt(float sx, float sy) {
+        com.badlogic.gdx.math.Vector2 a = new com.badlogic.gdx.math.Vector2();
+        com.badlogic.gdx.math.Vector2 b = new com.badlogic.gdx.math.Vector2();
+        for (int i = 0; i < stageHeaders.size(); i++) {
+            Actor h = stageHeaders.get(i);
+            h.localToStageCoordinates(a.set(0, 0));
+            h.localToStageCoordinates(b.set(h.getWidth(), h.getHeight()));
+            if (sx >= a.x && sx <= b.x && sy >= a.y && sy <= b.y) return stageHeaderNums.get(i);
+        }
+        return null;
+    }
+
+    /** Highlight every part of one activation group on the canvas (C5). */
+    private void selectGroup(int g) {
+        selected.clear();
+        for (int i = 0; i < design.parts.size(); i++) {
+            if (design.parts.get(i).group == g) selected.add(i);
+        }
+        updateDelButton();
+        status(g == 0 ? selected.size() + " unassigned part(s) highlighted"
+                : "STAGE " + g + ": " + selected.size() + " part(s) highlighted");
+    }
+
+    /** Assign the current canvas selection to a STAGE (0 = unassigned). */
+    private void assignSelected(int g) {
+        if (selected.isEmpty()) { status("Select parts on the canvas first"); return; }
+        pushHistory();
+        for (int i : selected) {
+            if (i < design.parts.size()) design.parts.get(i).group = g;
+        }
+        status(g == 0 ? "Unassigned " + selected.size() + " part(s)"
+                : "Assigned " + selected.size() + " part(s) to STAGE " + g);
         rebuildStageList();
-        overlay = newOverlay();
-        Table box = new Table();
-        box.setBackground(game.ui.tinted(new Color(0.12f, 0.14f, 0.2f, 1f)));
-        box.pad(20);
-        box.add(stageTable).row();
-        TextButton close = new TextButton("Close", game.ui.skin);
-        close.addListener(new ClickListener() {
-            @Override public void clicked(InputEvent e, float x, float y) { closeOverlay(); }
-        });
-        box.add(close).width(300).height(56).pad(8).row();
-        overlay.add(box);
-        stage.addActor(overlay);
+    }
+
+    private void deleteSelected() {
+        if (selected.isEmpty()) return;
+        pushHistory();
+        // touch-friendly delete (right-click does not exist on phones)
+        List<Integer> idx = new ArrayList<>(selected);
+        idx.sort(java.util.Collections.reverseOrder());
+        for (int i : idx) design.parts.remove(i);
+        selected.clear();
+        design.autoStage();
+        rebuildStageList();
+        updateDelButton();
+        status("Deleted " + idx.size() + " parts");
+    }
+
+    /** Show/hide the floating DEL button with the selection state. */
+    private void updateDelButton() {
+        if (delButton == null) return;
+        delButton.setVisible(!selected.isEmpty());
+        delButton.setText("DEL (" + selected.size() + ")");
     }
 
     /** Modal overlay that swallows taps so they never leak to the canvas below. */
@@ -471,53 +763,13 @@ public class EditorScreen extends ScreenAdapter {
                     launch(p);
                 }
             });
-            box.add(b).width(300).height(44).pad(4).row();
+            box.add(b).width(420).height(64).pad(5).row();
         }
         TextButton cancel = new TextButton("Cancel", game.ui.skin);
         cancel.addListener(new ClickListener() {
             @Override public void clicked(InputEvent e, float x, float y) { closeOverlay(); }
         });
-        box.add(cancel).width(300).height(40).pad(8).row();
-        overlay.add(box);
-        stage.addActor(overlay);
-    }
-
-    private void showLoadDialog() {
-        closeOverlay();
-        overlay = newOverlay();
-        Table box = new Table();
-        box.setBackground(game.ui.tinted(new Color(0.12f, 0.14f, 0.2f, 1f)));
-        box.pad(20);
-        box.add(new Label("Load ship", game.ui.skin)).pad(10).row();
-        com.badlogic.gdx.files.FileHandle dir = Gdx.files.local("save/ships");
-        boolean any = false;
-        if (dir.exists()) {
-            for (com.badlogic.gdx.files.FileHandle f : dir.list(".json")) {
-                any = true;
-                TextButton b = new TextButton(f.nameWithoutExtension(), game.ui.skin);
-                b.addListener(new ClickListener() {
-                    @Override public void clicked(InputEvent e, float x, float y) {
-                        try {
-                            design = ShipDesign.fromJson(f.readString());
-                            shipName = f.nameWithoutExtension();
-                            selected.clear();
-                            rebuildGroupBar();
-                            rebuildStageList();
-                        } catch (Exception ex) {
-                            status("Load failed: " + ex.getMessage());
-                        }
-                        closeOverlay();
-                    }
-                });
-                box.add(b).width(300).height(44).pad(4).row();
-            }
-        }
-        if (!any) box.add(new Label("(no saved ships)", game.ui.skin)).pad(8).row();
-        TextButton cancel = new TextButton("Cancel", game.ui.skin);
-        cancel.addListener(new ClickListener() {
-            @Override public void clicked(InputEvent e, float x, float y) { closeOverlay(); }
-        });
-        box.add(cancel).width(300).height(40).pad(8).row();
+        box.add(cancel).width(420).height(56).pad(10).row();
         overlay.add(box);
         stage.addActor(overlay);
     }
@@ -541,6 +793,7 @@ public class EditorScreen extends ScreenAdapter {
 
     private void launch(Planet planet) {
         design.autoStage();
+        autosave(); // C6: keep the build for the next editor visit
         game.world.launchShip(design, planet);
         game.setScreen(new SandboxScreen(game));
     }
@@ -666,6 +919,7 @@ public class EditorScreen extends ScreenAdapter {
         // parts — the old code only knew the placing ghost and the mid-drag
         // part, so a tap-selection was a dead target. Rotate all selected.
         if (!selected.isEmpty()) {
+            pushHistory();
             int n = 0;
             for (int idx : selected) {
                 if (idx < 0 || idx >= design.parts.size()) continue;
@@ -722,9 +976,10 @@ public class EditorScreen extends ScreenAdapter {
                 if (placing != null) { placing = null; return true; }
                 int idx = partAt(w);
                 if (idx >= 0) {
+                    pushHistory();
                     design.parts.remove(idx);
                     selected.clear();
-                    rebuildGroupBar();
+                    updateDelButton();
                     design.autoStage();
                     rebuildStageList();
                     return true;
@@ -732,10 +987,11 @@ public class EditorScreen extends ScreenAdapter {
                 return false;
             }
             if (placing != null) {
+                pushHistory();
                 Vector2 snapped = snap(w.x, w.y, dragRot, placing, -1);
                 design.parts.add(new ShipDesign.DesignPart(placing.id, snapped.x, snapped.y, dragRot));
                 selected.clear();
-                rebuildGroupBar();
+                updateDelButton();
                 design.autoStage();
                 rebuildStageList();
                 if (!Gdx.input.isKeyPressed(Input.Keys.SHIFT_LEFT)) placing = null;
@@ -805,7 +1061,8 @@ public class EditorScreen extends ScreenAdapter {
             if (pointer != touchPtrA) return false;
             if (downIndex >= 0 && !dragMoved
                     && Math.hypot(screenX - downScrX, screenY - downScrY) > 12) {
-                // promote to a drag-move
+                // promote to a drag-move: snapshot BEFORE the first mutation (undo)
+                pushHistory();
                 dragMoved = true;
                 dragIndex = downIndex;
                 dragRot = design.parts.get(dragIndex).rot;
@@ -857,11 +1114,11 @@ public class EditorScreen extends ScreenAdapter {
             touchPtrA = -1;
             if (downIndex >= 0) {
                 if (!dragMoved) {
-                    // tap: toggle selection for group assignment
+                    // tap: toggle selection for group assignment / deletion
                     if (!selected.remove(downIndex)) selected.add(downIndex);
-                    status(selected.isEmpty() ? "Drag a part row onto the canvas, or tap it then click to place. Tap part = select; DEL deletes."
-                            : selected.size() + " selected — tap a group number below");
-                    rebuildGroupBar();
+                    status(selected.isEmpty() ? "Tap [Add Part] for parts. Tap part = select; drag = move; DEL deletes."
+                            : selected.size() + " selected — open [Stages] to assign a group");
+                    updateDelButton();
                 } else {
                     design.autoStage();
                     rebuildStageList();
@@ -876,7 +1133,7 @@ public class EditorScreen extends ScreenAdapter {
                 if (Math.hypot(screenX - downScrX, screenY - downScrY) < 12 && !selected.isEmpty()) {
                     // tapped empty space: clear selection
                     selected.clear();
-                    rebuildGroupBar();
+                    updateDelButton();
                 }
                 return false;
             }
@@ -909,10 +1166,12 @@ public class EditorScreen extends ScreenAdapter {
             if (keycode == Input.Keys.ESCAPE) {
                 if (overlay != null) closeOverlay();
                 else if (placing != null) placing = null;
+                else if (openDrawer != 0) closeDrawers();
                 else game.setScreen(new MenuScreen(game));
                 return true;
             }
             if (keycode == Input.Keys.DEL || keycode == Input.Keys.BACKSPACE) {
+                deleteSelected();
                 return true;
             }
             return false;
@@ -922,6 +1181,7 @@ public class EditorScreen extends ScreenAdapter {
     public void selectPart(PartType t) {
         placing = t;
         dragRot = 0;
+        closeDrawers(); // free the canvas for placement
         status("Placing: " + t.name + " (R = rotate, right-click = cancel, shift = keep placing)");
     }
 
@@ -949,6 +1209,7 @@ public class EditorScreen extends ScreenAdapter {
         dragOutType = t;
         dragScrX = screenX;
         dragScrY = screenY;
+        closeDrawers(); // free the canvas for the drop
         status("Drag onto the canvas and release to place " + t.name);
     }
 
@@ -986,13 +1247,13 @@ public class EditorScreen extends ScreenAdapter {
         // finger on the palette mid-drag could have re-armed one)
         stage.cancelTouchFocus();
         if (placing == null) return;
-        float paletteW = Gdx.graphics.getWidth() * 0.4f;
-        if (screenX > paletteW) {
+        if (screenX > drawerW) {
+            pushHistory();
             Vector2 w = screenToWorld(screenX, screenY);
             Vector2 snapped = snap(w.x, w.y, dragRot, placing, -1);
             design.parts.add(new ShipDesign.DesignPart(placing.id, snapped.x, snapped.y, dragRot));
             selected.clear();
-            rebuildGroupBar();
+            updateDelButton();
             design.autoStage();
             rebuildStageList();
             status("Placed " + placing.name + " — drag another from the list, or tap a row");
@@ -1010,7 +1271,7 @@ public class EditorScreen extends ScreenAdapter {
         PaletteItem(PartType t) {
             partType = t;
             setBackground(game.ui.tinted(new Color(0.14f, 0.16f, 0.22f, 1f)));
-            float textW = Gdx.graphics.getWidth() * 0.4f - 20; // palette width minus pads
+            float textW = drawerW - 24; // drawer width minus pads
             Label name = new Label(t.name, game.ui.skin);
             name.setFontScale(2.0f); // item 3: 2x, wrapped to stay inside the panel
             name.setWrap(true);
@@ -1141,7 +1402,7 @@ public class EditorScreen extends ScreenAdapter {
                         dp.x + t.width / 2f - 0.28f * cam.viewportHeight / 40f,
                         dp.y + t.height / 2f + 0.34f * cam.viewportHeight / 40f);
             }
-            game.font.getData().setScale(com.differentrockets.game.DRGame.FONT_SCALE);
+            game.font.getData().setScale(game.ui.fontScale);
             game.batch.end();
         }
 
@@ -1181,6 +1442,16 @@ public class EditorScreen extends ScreenAdapter {
             cam.viewportWidth = cam.viewportHeight * w / h;
             cam.update();
         }
+        // keep the drawers glued to the left edge at the new size
+        drawerW = w * 0.44f;
+        if (drawerMenu != null) {
+            Table[] ds = {drawerMenu, drawerParts, drawerStages};
+            for (int i = 0; i < ds.length; i++) {
+                ds[i].setSize(drawerW, h);
+                ds[i].clearActions();
+                ds[i].setPosition(openDrawer == i + 1 ? 0 : -drawerW - 8, 0);
+            }
+        }
     }
 
     @Override
@@ -1195,6 +1466,7 @@ public class EditorScreen extends ScreenAdapter {
      */
     @Override
     public void hide() {
+        autosave(); // C6: persist the in-progress build on exit
         dragOutInterceptor.reset();
         dragOutType = null;
         placing = null;

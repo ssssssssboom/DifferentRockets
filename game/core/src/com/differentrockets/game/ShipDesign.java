@@ -31,6 +31,21 @@ public class ShipDesign {
 
     public void clear() { parts.clear(); stages.clear(); }
 
+    /** Deep copy via the JSON round-trip (used for undo/redo snapshots). */
+    public ShipDesign snapshot() { return fromJson(toJson()); }
+
+    /** Replace this design's contents with another design's (keeps identity). */
+    public void copyFrom(ShipDesign o) {
+        parts.clear();
+        for (DesignPart p : o.parts) {
+            DesignPart np = new DesignPart(p.typeId, p.x, p.y, p.rot);
+            np.group = p.group;
+            parts.add(np);
+        }
+        stages.clear();
+        for (List<Integer> s : o.stages) stages.add(new ArrayList<>(s));
+    }
+
     public void autoStage() {
         stages.clear();
         // stage 0: engines; stage 1: detachers; stage 2: parachutes + landers (if any)

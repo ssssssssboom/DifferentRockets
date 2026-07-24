@@ -1,4 +1,4 @@
--- v2026.07.24.3
+-- v2026.07.25
 -- ============================================================================
 -- terrain.lua — planet terrain generation (PLAYER-EDITABLE)
 -- ============================================================================
@@ -54,6 +54,15 @@ terrainRender = {
 -- surrounding terrain, so the rim is a ramp, not a wall.
 -- x/h in points are arc meters / meters above the nominal radius; list them
 -- left to right.
+--
+-- Round 21 fix (item A2): start/end mapping. OUTSIDE the keypoint span the
+-- base used to CLAMP to the endpoint height, so the special terrain only
+-- started rising BEYOND the first keypoint — the region's start point had
+-- no transition and the terrain effect was offset from the authored start.
+-- Now the region edges (center -/+ range) act as virtual keypoints at the
+-- NATURAL height: from the edge boundary the surface smoothsteps up (or
+-- down) from natural terrain so each authored keypoint — peak or pit — is
+-- reached exactly at its specified x.
 specialTerrains = {
   Smearth = {
     -- coastal plain: a level +6 m shelf rising from a shallow-sea area
@@ -288,14 +297,36 @@ function surfaceHeight(info, x)
     for i, rg in ipairs(regions) do
       local d = math.abs(x - rg.center)
       if d < rg.range then
-        -- keypoint base: smoothstep interpolation between neighbors,
-        -- clamped to the end heights outside the point span
+        -- keypoint base: smoothstep interpolation between neighbors. Round 21
+        -- fix (item A2): instead of clamping to the endpoint heights outside
+        -- the point span, the region edges (center -/+ range) are virtual
+        -- keypoints at the NATURAL height, so the special terrain starts its
+        -- smooth rise/descent exactly at the edge boundary and reaches the
+        -- authored peak/pit exactly at its keypoint x.
         local pts = rg.points
+        local leftEdge = rg.center - rg.range
+        local rightEdge = rg.center + rg.range
         local base
         if x <= pts[1].x then
-          base = pts[1].h
+          -- left ramp: natural at leftEdge -> pts[1].h at pts[1].x
+          local span = pts[1].x - leftEdge
+          if span <= 0 then
+            base = pts[1].h
+          else
+            local t = (x - leftEdge) / span
+            t = t * t * (3 - 2 * t)
+            base = natural + (pts[1].h - natural) * t
+          end
         elseif x >= pts[#pts].x then
-          base = pts[#pts].h
+          -- right ramp: pts[#pts].h at pts[#pts].x -> natural at rightEdge
+          local span = rightEdge - pts[#pts].x
+          if span <= 0 then
+            base = pts[#pts].h
+          else
+            local t = (x - pts[#pts].x) / span
+            t = t * t * (3 - 2 * t)
+            base = pts[#pts].h + (natural - pts[#pts].h) * t
+          end
         else
           for k = 1, #pts - 1 do
             local a, b = pts[k], pts[k + 1]

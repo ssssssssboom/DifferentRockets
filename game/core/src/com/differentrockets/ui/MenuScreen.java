@@ -60,11 +60,11 @@ public class MenuScreen extends ScreenAdapter {
             }
         });
 
-        root.add(title).padBottom(8).row();
-        root.add(sub).padBottom(60).row();
-        root.add(build).width(400).height(88).pad(12).row();
-        root.add(cont).width(400).height(88).pad(12).row();
-        root.add(reset).width(400).height(88).pad(12).row();
+        root.add(title).padBottom(12).row();
+        root.add(sub).padBottom(80).row();
+        root.add(build).width(560).height(120).pad(16).row();
+        root.add(cont).width(560).height(120).pad(16).row();
+        root.add(reset).width(560).height(120).pad(16).row();
     }
 
     @Override

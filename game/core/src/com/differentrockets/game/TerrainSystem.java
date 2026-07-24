@@ -95,6 +95,7 @@ public class TerrainSystem implements Disposable {
     /** junction index (mod totalCols) -> absolute radius; pure-function cache. */
     private final Map<Integer, Double> hCache = new HashMap<>();
     private double refreshT = REFRESH_S;   // manage on the first update
+    private boolean lastPhysicsActive = true; // B3: super-warp suspends terrain physics
 
     // live parameters from terrain.lua (hot-reloaded; changes rebuild everything)
     private final LuaScript cfgScript = new LuaScript("terrain.lua");
@@ -268,6 +269,19 @@ public class TerrainSystem implements Disposable {
     /** Call every frame with the active ship's universe position + this frame's simulated seconds. */
     public void update(Vec2d shipUniverse, double simDt) {
         refreshParams();
+        // round 26 item B3: at super-warp (> PHYS_WARP_MAX) there is no Box2D
+        // stepping for ships at all — every ship rides rails and a landed
+        // ship is held by the planet-riding logic in GameWorld.superWarp /
+        // Ship.integrateRails, NOT by chunk contacts. Managing kinematic
+        // chunk bodies (create/drive/destroy) is pure waste then, so terrain
+        // PHYSICS is suspended: chunk bodies are dropped and not recreated
+        // while the RENDER mesh keeps streaming normally. Bodies come back
+        // automatically via manage() within one refresh after warp ends.
+        boolean physicsActive = world.warp <= GameWorld.PHYS_WARP_MAX;
+        if (physicsActive && !lastPhysicsActive) {
+            refreshT = REFRESH_S; // warp just ended: rebuild colliders immediately
+        }
+        lastPhysicsActive = physicsActive;
         // pick the planet we're closest to the surface of
         Planet best = null;
         double bestAlt = Double.MAX_VALUE;
@@ -295,6 +309,10 @@ public class TerrainSystem implements Disposable {
         double py = planet.pos.y - world.origin.y;
         for (Chunk c : loaded.values()) {
             if (c.body != null) {
+                if (!physicsActive) { // super-warp: no contacts needed (B3)
+                    c.destroyBody();
+                    continue;
+                }
                 double tx = px + c.cx, ty = py + c.cy;
                 if (c.hasLast && simDt > 1e-9) {
                     double mvx = tx - c.lastBX, mvy = ty - c.lastBY;
@@ -356,10 +374,12 @@ public class TerrainSystem implements Disposable {
             want.add(idx);
             if (!loaded.containsKey(idx)) loadChunk(idx);
         }
-        // physics membership follows the (smaller) physics window
+        // physics membership follows the (smaller) physics window; suspended
+        // entirely during super-warp (B3 — no ship contacts exist then)
+        boolean physicsActive = world.warp <= GameWorld.PHYS_WARP_MAX;
         for (Chunk c : loaded.values()) {
             double d = wrappedArcDist(c.arcCenter, shipArc);
-            boolean need = d <= physRangeM;
+            boolean need = physicsActive && d <= physRangeM;
             if (need && c.body == null) createBody(c);
             else if (!need && c.body != null) c.destroyBody();
         }

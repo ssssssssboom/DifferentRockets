@@ -21,6 +21,7 @@ import com.badlogic.gdx.scenes.scene2d.ui.Label;
 import com.badlogic.gdx.scenes.scene2d.ui.Table;
 import com.badlogic.gdx.scenes.scene2d.ui.TextButton;
 import com.badlogic.gdx.scenes.scene2d.utils.ClickListener;
+import com.badlogic.gdx.scenes.scene2d.actions.Actions;
 import com.badlogic.gdx.scenes.scene2d.Actor;
 import com.badlogic.gdx.utils.viewport.ScreenViewport;
 import com.differentrockets.game.Attach;
@@ -58,10 +59,18 @@ public class SandboxScreen extends ScreenAdapter {
     private int anchorIndex = -1;
     private TextButton frameBtn;
     private Table frameList;
-    // switch-ship UI (round 20 item 6): SHIP button opens a distance-sorted
-    // list of the other ships; selecting one re-targets control/camera/orbit
-    private TextButton shipBtn;
-    private Table shipList;
+    // menu drawer (task D1): the top-left MENU button slides out a drawer
+    // holding the SWITCH SHIP list (round-20 logic, distance-sorted) and the
+    // MAIN MENU entry; SHIP/Menu no longer live in the top-right bar
+    private Table menuDrawer;
+    // map target marker (task D4): tapping another ship or a planet in map
+    // view selects it as the relative target — the map draws a "C" circle at
+    // the closest point of the predicted orbit to it (purple "X" under 500 m),
+    // and the steering ring shows the velocity relative to it (task D6)
+    private Ship mapTargetShip;
+    private Planet mapTargetPlanet;
+    // back-key confirmation (task D2): modal ask-before-leaving dialog
+    private Table backDialog;
     /** Camera-follow state: the map center rides the selected anchor body. */
     private Planet lastAnchorBody;
     private double lastAnchorX, lastAnchorY;
@@ -206,13 +215,8 @@ public class SandboxScreen extends ScreenAdapter {
                 game.world.paused = !game.world.paused;
             }
         });
-        TextButton editorBtn = new TextButton("Menu", game.ui.skin);
-        editorBtn.addListener(new ClickListener() {
-            @Override public void clicked(InputEvent e, float x, float y) {
-                game.world.save();
-                game.setScreen(new MenuScreen(game));
-            }
-        });
+        // task D1: the old Menu/SHIP buttons moved into the top-left MENU
+        // drawer (toggleMenuDrawer); MAP moved to the left column below MENU
         // round 14 item 7: warp ladder — "-" / "+" step through WARP_LEVELS
         // (1x 2x 4x physical, then 25x..250000x on rails), label shows current.
         TextButton warpDown = new TextButton("-", game.ui.skin);
@@ -232,15 +236,18 @@ public class SandboxScreen extends ScreenAdapter {
         topRight.add(warpUp).width(60).height(64).pad(2);
         topRight.add(pauseBtn).width(60).height(64).pad(2);
         topRight.add(dragBtn).width(110).height(64).pad(2);
-        topRight.add(mapBtn).width(96).height(64).pad(2);
         topRight.add(frameBtn).width(170).height(64).pad(2);
-        // round 20 item 6: switch the controlled ship (list like FRAME's)
-        shipBtn = new TextButton("SHIP", game.ui.skin);
-        shipBtn.addListener(new ClickListener() {
-            @Override public void clicked(InputEvent e, float x, float y) { toggleShipList(); }
+
+        // task D1: top-left column — MENU on top, MAP directly below it.
+        // MENU slides out the drawer (switch-ship list + MAIN MENU entry);
+        // a plain ClickListener keeps the return-to-gray behavior.
+        TextButton menuBtn = new TextButton("MENU", game.ui.skin);
+        menuBtn.addListener(new ClickListener() {
+            @Override public void clicked(InputEvent e, float x, float y) { toggleMenuDrawer(); }
         });
-        topRight.add(shipBtn).width(104).height(64).pad(2);
-        topRight.add(editorBtn).width(104).height(64).pad(2);
+        Table leftTop = new Table();
+        leftTop.add(menuBtn).width(120).height(64).pad(2).row();
+        leftTop.add(mapBtn).width(120).height(64).pad(2);
 
         // throttle: 10-segment bar from the Runtime atlas, right edge
         // (round 11 item 10 — ThrottleControl track + ThrottleLevel sprites)
@@ -281,6 +288,7 @@ public class SandboxScreen extends ScreenAdapter {
         root.add(telemetry).pad(10).left().expandX().row();
 
         Table topBar = new Table();
+        topBar.add(leftTop).left().padLeft(6);
         topBar.add().expandX();
         topBar.add(topRight).right();
         root.add(topBar).fillX().padRight(6).row();
@@ -404,6 +412,7 @@ public class SandboxScreen extends ScreenAdapter {
         public boolean keyDown(int keycode) {
             switch (keycode) {
                 case Input.Keys.SPACE: doStage(); return true;
+                case Input.Keys.BACK: case Input.Keys.ESCAPE: toggleBackDialog(); return true;
                 case Input.Keys.TAB: toggleMap(); return true;
                 case Input.Keys.P: game.world.paused = !game.world.paused; return true;
                 case Input.Keys.Z: setThrottleLevel(throttleLevel() + 1); return true;
@@ -454,10 +463,13 @@ public class SandboxScreen extends ScreenAdapter {
             if (touchA == -1) {
                 touchA = pointer; paX = screenX; paY = screenY;
                 if (mapMode) {
-                    // round 13 item 2: the nav ring stays INTERACTIVE in map
-                    // view — touches inside its annulus steer, others pan/tap
+                    // task D5: the ring check runs FIRST in map view too —
+                    // a touch landing in the annulus is steering (activate +
+                    // drag), never a map pan/tap; mapPanPointer is left
+                    // cleared so the drag can never fall through to panning
                     ringDrag = nearRing(screenX, screenY);
                     if (ringDrag) {
+                        mapPanPointer = -1;
                         SteeringIO.ringActive = true;
                         setSteerTarget(game.world.currentHeading());
                         ringDelta = ringAngle(screenX, screenY) - game.world.getTargetHeading();
@@ -675,71 +687,110 @@ public class SandboxScreen extends ScreenAdapter {
         setSteerTarget(ringAngle(sx, sy) - ringDelta);
     }
 
-    /** Tap on the map: switch ship or center a planet. */
+    /**
+     * Tap on the map (task D4): select a TARGET — the tapped other-ship or
+     * planet. The target gets a "C" circle marker at the closest point of the
+     * predicted orbit (purple "X" when the gap is under 500 m, see
+     * drawMapTargetMarker) and the steering ring switches to the velocity
+     * relative to it (task D6). Tapping the same target again deselects.
+     * (Ship switching moved to the MENU drawer, task D1.)
+     */
     private void mapTap(int screenX, int screenY) {
         // an open anchor list eats the next tap anywhere (collapse-only)
         if (frameList != null) {
             toggleFrameList();
             return;
         }
-        if (shipList != null) {
-            toggleShipList();
+        if (menuDrawer != null) {
+            toggleMenuDrawer();
             return;
         }
         // tap point in world coords from the double-precision center (round 13)
         double sw = Gdx.graphics.getWidth(), sh = Gdx.graphics.getHeight();
         double wx = mapCX + (screenX - sw / 2) / sw * mapCam.viewportWidth;
         double wy = mapCY + (sh / 2 - screenY) / sh * mapCam.viewportHeight;
-        Ship best = null;
+        Ship bestShip = null;
         double bestD = mapCam.viewportHeight * 0.05;
         for (Ship s : game.world.ships) {
+            if (s == game.world.active) continue;
             Vec2d p = s.getUniversePos();
             double d = Math.hypot(p.x - wx, p.y - wy);
-            if (d < bestD) { bestD = d; best = s; }
+            if (d < bestD) { bestD = d; bestShip = s; }
         }
-        if (best != null && best != game.world.active) {
-            game.world.setActive(best);
-            mapMode = false;
+        if (bestShip != null) {
+            if (mapTargetShip == bestShip) {
+                mapTargetShip = null; // tapped the same target again: deselect
+                stageLabel.setText("");
+            } else {
+                mapTargetShip = bestShip;
+                mapTargetPlanet = null;
+                stageLabel.setText("Target " + bestShip.name);
+            }
             return;
         }
         for (Planet p : game.world.planets) {
             double d = Math.hypot(p.pos.x - wx, p.pos.y - wy);
             if (d < Math.max(p.radius * 1.5, mapCam.viewportHeight * 0.03)) {
-                mapCX = p.pos.x;
-                mapCY = p.pos.y;
+                if (mapTargetPlanet == p) {
+                    mapTargetPlanet = null;
+                    stageLabel.setText("");
+                } else {
+                    mapTargetPlanet = p;
+                    mapTargetShip = null;
+                    stageLabel.setText("Target " + p.name);
+                }
                 return;
             }
         }
     }
 
     /** Tap in flight view: select a part of the active ship (item 6b).
-     *  Round 11 item 8: nearest-EDGE distance wins — the tap point is measured
-     *  against every polygon edge of every fixture (no QueryAABB/testPoint),
-     *  so thin parts (struts, panels) are as easy to tap as fat tanks.
-     *  Threshold: max(3 m, 64 px in world units). */
+     *  Task D3 rewrite: the primary test is a DIRECT per-part hit test —
+     *  Box2D body.testPoint against every part's fixtures, i.e. the tapped
+     *  point must lie inside the part's actual collision polygon (the same
+     *  shape the sprite covers). Among overlapping hits the part whose center
+     *  is nearest the tap wins. When no polygon contains the point, the old
+     *  round-11 nearest-EDGE fallback still runs so thin parts (struts,
+     *  panels) remain tappable. Threshold: max(3 m, 64 px in world units). */
     private void flightTap(int screenX, int screenY) {
         if (game.world.active == null) return;
         tmp3.set(screenX, screenY, 0);
         cam.unproject(tmp3);
         final float wx = tmp3.x, wy = tmp3.y;
         final float threshold = Math.max(3f, 64f / Gdx.graphics.getHeight() * cam.viewportHeight);
+        // pass 1 (task D3): direct inside-the-part hit test
         Part best = null;
-        float bestD = threshold;
-        Vector2 va = new Vector2(), vb = new Vector2();
+        float bestD = Float.MAX_VALUE;
         for (Part p : game.world.active.parts) {
             if (p.body == null) continue;
+            boolean inside = false;
             for (com.badlogic.gdx.physics.box2d.Fixture f : p.body.getFixtureList()) {
-                if (!(f.getShape() instanceof com.badlogic.gdx.physics.box2d.PolygonShape)) continue;
-                com.badlogic.gdx.physics.box2d.PolygonShape poly =
-                        (com.badlogic.gdx.physics.box2d.PolygonShape) f.getShape();
-                int n = poly.getVertexCount();
-                for (int i = 0; i < n; i++) {
-                    poly.getVertex(i, va);
-                    p.body.getWorldPoint(va);
-                    poly.getVertex((i + 1) % n, vb);
-                    p.body.getWorldPoint(vb);
-                    float d = Attach.closestOnSegment(tmp2.set(wx, wy), va, vb, va).dst(tmp2);
-                    if (d < bestD) { bestD = d; best = p; }
+                if (f.testPoint(wx, wy)) { inside = true; break; }
+            }
+            if (inside) {
+                float d = p.body.getPosition().dst(wx, wy);
+                if (d < bestD) { bestD = d; best = p; }
+            }
+        }
+        if (best == null) {
+            // pass 2: nearest-edge fallback for thin parts
+            bestD = threshold;
+            Vector2 va = new Vector2(), vb = new Vector2();
+            for (Part p : game.world.active.parts) {
+                if (p.body == null) continue;
+                for (com.badlogic.gdx.physics.box2d.Fixture f : p.body.getFixtureList()) {
+                    if (!(f.getShape() instanceof com.badlogic.gdx.physics.box2d.PolygonShape)) continue;
+                    com.badlogic.gdx.physics.box2d.PolygonShape poly =
+                            (com.badlogic.gdx.physics.box2d.PolygonShape) f.getShape();
+                    int n = poly.getVertexCount();
+                    for (int i = 0; i < n; i++) {
+                        poly.getVertex(i, va);
+                        p.body.getWorldPoint(va);
+                        poly.getVertex((i + 1) % n, vb);
+                        p.body.getWorldPoint(vb);
+                        float d = Attach.closestOnSegment(tmp2.set(wx, wy), va, vb, va).dst(tmp2);
+                        if (d < bestD) { bestD = d; best = p; }
+                    }
                 }
             }
         }
@@ -753,6 +804,42 @@ public class SandboxScreen extends ScreenAdapter {
                 ? "Selected " + best.type.name + (best.group > 0 ? " [group " + best.group + "]" : "")
                 : "");
     }
+
+    /**
+     * Back-key confirmation (task D2): the phone back key opens a modal ask —
+     * "Return to the editor?" — YES saves the world and goes straight to the
+     * build editor (EditorScreen), NO (or back again) dismisses.
+     */
+    private void toggleBackDialog() {
+        if (backDialog != null) {
+            backDialog.remove();
+            backDialog = null;
+            return;
+        }
+        backDialog = new Table();
+        backDialog.setBackground(game.ui.tinted(new Color(0.10f, 0.11f, 0.16f, 0.95f)));
+        backDialog.add(new Label("Return to the editor?", game.ui.skin)).pad(18).colspan(2).row();
+        TextButton yes = new TextButton("YES", game.ui.skin);
+        yes.addListener(new ClickListener() {
+            @Override public void clicked(InputEvent e, float x, float y) {
+                game.world.save();
+                game.setScreen(new EditorScreen(game, null));
+            }
+        });
+        TextButton no = new TextButton("NO", game.ui.skin);
+        no.addListener(new ClickListener() {
+            @Override public void clicked(InputEvent e, float x, float y) { toggleBackDialog(); }
+        });
+        backDialog.add(yes).width(160).height(72).pad(12);
+        backDialog.add(no).width(160).height(72).pad(12);
+        backDialog.pack();
+        backDialog.setPosition((Gdx.graphics.getWidth() - backDialog.getWidth()) / 2f,
+                (Gdx.graphics.getHeight() - backDialog.getHeight()) / 2f);
+        stage.addActor(backDialog);
+    }
+
+    /** test hook: true while the back-key confirmation is on screen. */
+    public boolean backDialogForTest() { return backDialog != null; }
 
     /** ACTIVATE button: fire onStage on the selected part and its activation group. */
     public void activateSelected() {
@@ -964,46 +1051,60 @@ public class SandboxScreen extends ScreenAdapter {
     }
 
     /**
-     * Switch-ship list (round 20 item 6): every ship in the world, nearest
-     * first, labelled with name + distance from the active one. Picking an
-     * entry calls GameWorld.setActive (floating origin re-anchors, rails
-     * flags recompute, the old ship keeps the usual non-active rules), then
-     * re-centers the camera and re-propagates the orbit line. Landed ships
-     * are switchable like any other.
+     * Menu drawer (task D1): opened by the top-left MENU button, slides out
+     * from the left edge. Holds the SWITCH SHIP list (the round-20 item 6
+     * logic, distance-sorted, GameWorld.setActive on pick) plus a MAIN MENU
+     * entry that saves and returns to the menu screen. Tapping MENU again or
+     * tapping the map slides it back out.
      */
-    private void toggleShipList() {
-        if (shipList != null) {
-            shipList.remove();
-            shipList = null;
+    private void toggleMenuDrawer() {
+        if (menuDrawer != null) {
+            final Table closing = menuDrawer;
+            menuDrawer = null;
+            closing.addAction(Actions.sequence(
+                    Actions.moveTo(-closing.getWidth() - 8, closing.getY(), 0.18f),
+                    Actions.removeActor()));
             return;
         }
+        menuDrawer = new Table();
+        menuDrawer.setBackground(game.ui.tinted(new Color(0.10f, 0.11f, 0.16f, 0.92f)));
+        Label header = new Label("SWITCH SHIP", game.ui.skin);
+        menuDrawer.add(header).pad(6).row();
         final java.util.List<Ship> others = new java.util.ArrayList<>();
         for (Ship s : game.world.ships) {
             if (s != game.world.active && !s.parts.isEmpty()) others.add(s);
-        }
-        if (others.isEmpty()) {
-            stageLabel.setText("No other ships to switch to");
-            return;
         }
         final Vec2d ap = game.world.active != null ? game.world.active.getUniversePos() : null;
         if (ap != null) {
             others.sort((a, b) -> Double.compare(
                     a.getUniversePos().dist(ap), b.getUniversePos().dist(ap)));
         }
-        shipList = new Table();
+        if (others.isEmpty()) {
+            menuDrawer.add(new Label("No other ships", game.ui.skin)).pad(4).row();
+        }
         for (final Ship s : others) {
             double d = ap != null ? s.getUniversePos().dist(ap) : 0;
             TextButton b = new TextButton(s.name + "  " + fmt(d), game.ui.skin);
             b.addListener(new ClickListener() {
                 @Override public void clicked(InputEvent e, float x, float y) { selectShip(s); }
             });
-            shipList.add(b).width(300).height(56).pad(2).row();
+            menuDrawer.add(b).width(300).height(56).pad(2).row();
         }
-        shipList.pack();
-        float sw = Gdx.graphics.getWidth(), sh = Gdx.graphics.getHeight();
-        shipList.setPosition(sw - shipList.getWidth() - 6,
-                Math.max(6, sh - 76 - shipList.getHeight())); // under the top-right bar
-        stage.addActor(shipList);
+        TextButton mainMenu = new TextButton("MAIN MENU", game.ui.skin);
+        mainMenu.addListener(new ClickListener() {
+            @Override public void clicked(InputEvent e, float x, float y) {
+                game.world.save();
+                game.setScreen(new MenuScreen(game));
+            }
+        });
+        menuDrawer.add(mainMenu).width(300).height(56).pad(6).row();
+        menuDrawer.pack();
+        // start off-screen left, slide in below the MENU/MAP column
+        float sh = Gdx.graphics.getHeight();
+        float dy = Math.max(6, sh - 148 - menuDrawer.getHeight());
+        menuDrawer.setPosition(-menuDrawer.getWidth() - 8, dy);
+        stage.addActor(menuDrawer);
+        menuDrawer.addAction(Actions.moveTo(6, dy, 0.18f));
     }
 
     private void selectShip(Ship s) {
@@ -1011,8 +1112,10 @@ public class SandboxScreen extends ScreenAdapter {
         camPan.setZero();            // flight camera snaps onto the new ship
         mapInit = false;             // map view re-fits on it too
         orbitTimer = Float.MAX_VALUE; // orbit line re-propagates NOW
+        // task D4: a target pointing at the newly active ship is meaningless
+        if (mapTargetShip == s) mapTargetShip = null;
         stageLabel.setText("Controlling " + s.name);
-        if (shipList != null) toggleShipList(); // collapse
+        if (menuDrawer != null) toggleMenuDrawer(); // slide the drawer back
     }
 
     /**
@@ -1167,17 +1270,8 @@ public class SandboxScreen extends ScreenAdapter {
 
         drawFlames();
 
-        // selected-part highlight (tap-to-activate, item 6b)
-        if (selectedPart != null && selectedPart.body != null
-                && game.world.active != null && game.world.active.parts.contains(selectedPart)) {
-            Vector2 sp = selectedPart.body.getPosition();
-            float sr = Math.max(selectedPart.type.width, selectedPart.type.height) * 0.75f;
-            game.shapes.setProjectionMatrix(cam.combined);
-            game.shapes.begin(ShapeRenderer.ShapeType.Line);
-            game.shapes.setColor(0.3f, 0.9f, 1f, 0.9f);
-            game.shapes.circle(sp.x, sp.y, sr, 32);
-            game.shapes.end();
-        }
+        // selected-part highlight (task D3): the selected part's sprite is
+        // tinted light blue directly in drawShip — no more blue circle
 
         drawTankLevels();
 
@@ -1349,9 +1443,13 @@ public class SandboxScreen extends ScreenAdapter {
             Vector2 pos = p.body.getPosition();
             float angleDeg = (float) Math.toDegrees(p.body.getAngle());
             if (r != null) {
+                // task D3: the tap-selected part glows light blue (tint)
+                boolean sel = p == selectedPart;
+                if (sel) game.batch.setColor(0.60f, 0.85f, 1f, 1f);
                 game.batch.draw(r, pos.x - p.type.width / 2f, pos.y - p.type.height / 2f,
                         p.type.width / 2f, p.type.height / 2f, p.type.width, p.type.height,
                         1f, 1f, angleDeg);
+                if (sel) game.batch.setColor(Color.WHITE);
             }
             // engine flames are drawn procedurally in drawFlames() after batch.end()
             // parachute canopy when deployed
@@ -1492,15 +1590,29 @@ public class SandboxScreen extends ScreenAdapter {
             return;
         }
 
-        // item 3: ship velocity vector on the ring — planet-relative wind
-        // frame (same as the telemetry SPD), marker at the velocity heading
+        // item 3: ship velocity vector on the ring. Task D6: when a map
+        // target is selected the ring shows the velocity RELATIVE TO THE
+        // TARGET (pink) instead of the usual planet-relative one (cyan).
         Ship actShip = game.world.active;
         Vec2d sv = actShip.getUniverseVel();
-        Planet vcp = game.world.currentPlanet();
-        double rvx = sv.x - (vcp != null ? vcp.vel.x : 0);
-        double rvy = sv.y - (vcp != null ? vcp.vel.y : 0);
+        boolean relToTarget = mapTargetShip != null || mapTargetPlanet != null;
+        double rvx, rvy;
+        if (mapTargetShip != null) {
+            Vec2d tv = mapTargetShip.getUniverseVel();
+            rvx = sv.x - tv.x; rvy = sv.y - tv.y;
+        } else if (mapTargetPlanet != null) {
+            rvx = sv.x - mapTargetPlanet.vel.x; rvy = sv.y - mapTargetPlanet.vel.y;
+        } else {
+            Planet vcp = game.world.currentPlanet();
+            rvx = sv.x - (vcp != null ? vcp.vel.x : 0);
+            rvy = sv.y - (vcp != null ? vcp.vel.y : 0);
+        }
         double spd = Math.hypot(rvx, rvy);
         double vHead = Math.atan2(-rvx, rvy); // ring heading convention
+        // velocity marker color: pink relative-to-target, cyan planet-relative
+        final float vr = relToTarget ? 1f : 0.35f;
+        final float vg = relToTarget ? 0.45f : 0.85f;
+        final float vb = relToTarget ? 0.80f : 1f;
 
         game.shapes.begin(ShapeRenderer.ShapeType.Line);
         game.shapes.setColor(1f, 1f, 1f, 0.30f);
@@ -1526,9 +1638,9 @@ public class SandboxScreen extends ScreenAdapter {
         game.shapes.setColor(0.3f, 1f, 0.45f, 0.95f);
         game.shapes.line(ringPtX(tgt), ringPtY(tgt),
                 ringX + (ringPtX(tgt) - ringX) * 1.14f, ringY + (ringPtY(tgt) - ringY) * 1.14f);
-        // velocity marker (cyan radial tick, slightly inside) — item 3
+        // velocity marker (cyan tick, pink when target-relative — task D6)
         if (spd > 0.5) {
-            game.shapes.setColor(0.35f, 0.85f, 1f, 0.95f);
+            game.shapes.setColor(vr, vg, vb, 0.95f);
             game.shapes.line(ringX + (ringPtX(vHead) - ringX) * 0.90f, ringY + (ringPtY(vHead) - ringY) * 0.90f,
                     ringX + (ringPtX(vHead) - ringX) * 1.05f, ringY + (ringPtY(vHead) - ringY) * 1.05f);
         }
@@ -1547,7 +1659,7 @@ public class SandboxScreen extends ScreenAdapter {
             float bx = ringPtX(vHead), by = ringPtY(vHead);
             float ox = (bx - ringX) / ringR, oy = (by - ringY) / ringR; // unit outward
             float pxu = -oy, pyu = ox;                                  // unit tangent
-            game.shapes.setColor(0.35f, 0.85f, 1f, 0.95f);
+            game.shapes.setColor(vr, vg, vb, 0.95f);
             game.shapes.triangle(bx + ox * 14, by + oy * 14,
                     bx - pxu * 7, by - pyu * 7,
                     bx + pxu * 7, by + pyu * 7);
@@ -1559,7 +1671,7 @@ public class SandboxScreen extends ScreenAdapter {
             game.batch.setProjectionMatrix(ringMat);
             game.batch.begin();
             game.font.getData().setScale(1.0f);
-            game.font.setColor(0.35f, 0.85f, 1f, 0.95f);
+            game.font.setColor(vr, vg, vb, 0.95f);
             float tx = ringX + (float) -Math.sin(vHead) * ringR * 1.22f;
             float ty = ringY + (float) Math.cos(vHead) * ringR * 1.22f;
             game.font.draw(game.batch, fmt(spd) + " m/s", tx, ty);
@@ -1741,6 +1853,68 @@ public class SandboxScreen extends ScreenAdapter {
             if (sx < -200 || sx > msw + 200 || sy < -50 || sy > msh + 50) continue;
             game.font.draw(game.batch, s.name, sx + 10, sy - 6);
         }
+        game.font.getData().setScale(DRGame.FONT_SCALE);
+        game.font.setColor(Color.WHITE);
+        game.batch.end();
+
+        drawMapTargetMarker(); // task D4: "C"/"X" closest-approach marker
+    }
+
+    /** Universe position of a planet at absolute time t (Kepler rails, parents chained). */
+    private void planetPosAt(Planet p, double t, double[] out) {
+        if (p.parent == null) { out[0] = 0; out[1] = 0; return; }
+        planetPosAt(p.parent, t, out);
+        double[] rel = orbitRelAt(p, t);
+        out[0] += rel[0];
+        out[1] += rel[1];
+    }
+
+    /**
+     * Task D4: with a map target selected (tapped ship/planet), find the point
+     * of the predicted orbit closest to the target and mark it — a circle
+     * labelled "C"; when the closest gap is under 500 m the marker turns into
+     * a purple "X" circle. Planet targets move along their Kepler rails during
+     * the prediction (position evaluated per-point at ts[i]); ship targets
+     * are approximated by their current position. All math in double against
+     * (mapCX, mapCY), floats only in screen space (round-18 rule).
+     */
+    private void drawMapTargetMarker() {
+        if (mapTargetShip == null && mapTargetPlanet == null) return;
+        if (predictor.count < 1) return;
+        double[] tpos = new double[2];
+        double bestD = Double.MAX_VALUE;
+        double bestX = 0, bestY = 0;
+        for (int i = 0; i < predictor.count; i++) {
+            if (mapTargetPlanet != null) {
+                planetPosAt(mapTargetPlanet, predictor.ts[i], tpos);
+            } else {
+                Vec2d tp = mapTargetShip.getUniversePos();
+                tpos[0] = tp.x; tpos[1] = tp.y;
+            }
+            double dx = predictor.xs[i] - tpos[0], dy = predictor.ys[i] - tpos[1];
+            double d = Math.sqrt(dx * dx + dy * dy);
+            if (mapTargetPlanet != null) d -= mapTargetPlanet.radius; // gap to the surface
+            if (d < bestD) { bestD = d; bestX = predictor.xs[i]; bestY = predictor.ys[i]; }
+        }
+        double sw = Gdx.graphics.getWidth(), sh = Gdx.graphics.getHeight();
+        float sx = (float) ((bestX - mapCX) / mapCam.viewportWidth * sw + sw / 2);
+        float sy = (float) ((bestY - mapCY) / mapCam.viewportHeight * sh + sh / 2);
+        boolean close = bestD < 500;
+        Gdx.gl.glEnable(GL20.GL_BLEND);
+        Gdx.gl.glBlendFunc(GL20.GL_SRC_ALPHA, GL20.GL_ONE_MINUS_SRC_ALPHA);
+        game.shapes.setProjectionMatrix(ringMat.setToOrtho2D(0, 0, (float) sw, (float) sh));
+        game.shapes.begin(ShapeRenderer.ShapeType.Line);
+        if (close) game.shapes.setColor(0.75f, 0.35f, 1f, 0.95f); // purple
+        else game.shapes.setColor(0.55f, 0.95f, 1f, 0.95f);        // light cyan
+        game.shapes.circle(sx, sy, 22f, 32);
+        game.shapes.end();
+        game.batch.setProjectionMatrix(ringMat);
+        game.batch.begin();
+        game.font.getData().setScale(1.0f);
+        if (close) game.font.setColor(0.75f, 0.35f, 1f, 1f);
+        else game.font.setColor(0.55f, 0.95f, 1f, 1f);
+        // center the letter in the circle (glyph ~10x14 px at scale 1)
+        game.font.draw(game.batch, close ? "X" : "C", sx - 5, sy + 7);
         game.font.getData().setScale(DRGame.FONT_SCALE);
         game.font.setColor(Color.WHITE);
         game.batch.end();

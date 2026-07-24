@@ -1,4 +1,4 @@
--- v2026.07.22
+-- v2026.07.25
 -- ============================================================================
 -- physics.lua — physics laws (PLAYER-EDITABLE)
 -- ============================================================================
@@ -97,6 +97,16 @@ joints = { frequencyHz = 20.0, dampingRatio = 1.1, angularDamping = 0.6 }
 -- genuinely shields the parts behind it. Exposure refreshes ~15x/sec and
 -- whenever the airflow direction swings more than ~8 degrees. Scripts can
 -- read the current value via part:getDragExposure().
+--
+-- DRAG SCALE (round 21, item A1): drag force is F = k above, and k scales
+-- linearly with rho — the ONLY part of the drag law routed through this file
+-- is atmosphereDensity below (GameWorld.java hardcodes 0.5 * rho * v^2 * Cd *
+-- area * exposure and calls densityAt -> physics.lua since round 14). To cut
+-- ALL aerodynamic drag to 1/10 as requested, atmosphereDensity returns 0.1x
+-- the physical density (dragScale below). Buoyancy is unaffected (it uses
+-- water density), but part scripts reading part:getAtmoDensity() see the
+-- scaled value too.
+local dragScale = 0.1
 
 -- SUPERSEDED (round 12): the per-engine gimbal PID actuator was replaced by
 -- the shared control law in mod/control.lua — gimbal deflection now EQUALS
@@ -127,6 +137,6 @@ function atmosphereDensity(planetName, altitude)
   local e = planetEnv[planetName]
   if e == nil or e.atmoHeight <= 0 or e.surfacePressure <= 0 then return 0 end
   if altitude > e.atmoHeight or altitude < -e.scaleHeight * 3 then return 0 end
-  -- 1.225 kg/m^3 at pressure 1.0
-  return 1.225 * e.surfacePressure * math.exp(-math.max(altitude, 0) / e.scaleHeight)
+  -- 1.225 kg/m^3 at pressure 1.0; dragScale (round 21) cuts all drag to 1/10
+  return 1.225 * e.surfacePressure * math.exp(-math.max(altitude, 0) / e.scaleHeight) * dragScale
 end

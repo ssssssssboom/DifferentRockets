@@ -162,18 +162,36 @@ public class Part {
     }
 
     /**
-     * Destroy all joints connecting this part to anything else. DEFERRED to a
-     * post-callback queue — detacher onStage runs while callers iterate part
-     * lists, and splitting the ship inline there corrupts those iterations.
+     * Destroy joints connecting this part, honoring the detacher's MODE
+     * (detacher-*.lua, round 26 item B2):
+     *   MODE 1 — sever ALL joints of this part (classic behavior);
+     *   MODE 2 — sever only the joint on the FIRST (parent) attach point
+     *            (default), leaving the ring welded to the lower stage.
+     * The mode is read from the part script's global `MODE` (Lua locals are
+     * not visible to Java, hence a global). DEFERRED to a post-callback
+     * queue — detacher onStage runs while callers iterate part lists, and
+     * splitting the ship inline there corrupts those iterations.
      */
     public void detachJoints() {
         final Part self = this;
+        final int mode = detachMode();
         ship.world.deferStructure(() -> {
             // the part may already have been moved/destroyed by an earlier op
             if (self.body != null && self.ship != null && self.ship.parts.contains(self)) {
-                self.ship.removeJointsOf(self);
+                if (mode == 1) self.ship.removeJointsOf(self);
+                else self.ship.removeParentJointOf(self);
             }
         });
+    }
+
+    /** Detach mode from the Lua global MODE (1 or 2); default 2 when unset/unreadable. */
+    private int detachMode() {
+        if (lua != null) {
+            try {
+                return lua.get("MODE").optint(2) == 1 ? 1 : 2;
+            } catch (Throwable ignored) {}
+        }
+        return 2;
     }
 
     public void emitFlame(float size, float gimbalDeg) {

@@ -15,10 +15,19 @@ import com.badlogic.gdx.utils.Disposable;
 /** Programmatic scene2d skin (clean functional UI without GUI atlas art). */
 public class Ui implements Disposable {
 
+    /** Global UI scale-up (task C1): applied on top of DRGame.FONT_SCALE. */
+    public static final float UI_SCALE = 1.35f;
+
     public final Skin skin;
+    /** Effective font scale after the C1 global upscale; screens that reset
+     *  game.font mid-render should restore this value, not DRGame.FONT_SCALE. */
+    public final float fontScale;
     private final Texture white;
 
     public Ui(BitmapFont font) {
+        fontScale = font.getData().scaleX * UI_SCALE;
+        font.getData().setScale(fontScale);
+
         Pixmap pm = new Pixmap(8, 8, Pixmap.Format.RGBA8888);
         pm.setColor(Color.WHITE);
         pm.fill();

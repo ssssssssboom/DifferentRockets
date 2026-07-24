@@ -1,9 +1,20 @@
--- v2026.07.22
+-- v2026.07.25
 -- DifferentRockets generic engine behavior.
 -- Thrust vector = power * throttle along the nozzle, gimbal follows the SHARED
 -- control law in mod/control.lua (round 12), fuel drained through the ship's
 -- fuel network. SRBs (fuelType 3) burn their internal tank at full power with
 -- no throttle/gimbal. Ion (fuelType 2) drains the electric network.
+--
+-- 激活即按当前油门 (round 26, item B1): onStage 只是解除保险; 推力在
+-- onUpdate 里每帧实时读取 part:getThrottle() (SteeringIO/油门条共享的当前
+-- 油门), 所以引擎在激活瞬间以及之后的每一帧都严格按当前油门运行 ——
+-- 0 油门激活不点火, 之后推油门即点火, 不存在默认满油门。
+-- Activation honors the CURRENT throttle (round 26, item B1): onStage only
+-- re-arms the engine; thrust reads part:getThrottle() live every onUpdate,
+-- so the engine runs at whatever the throttle is the instant it activates
+-- and thereafter — staging at 0 throttle stays dark until throttle is
+-- raised; there is no implicit full-throttle default. (SRBs stay
+-- full-throttle by design: a lit solid booster cannot be throttled.)
 --
 -- 燃油供给规则 (part:drainFuel): 化油(type 0)发动机只从通过 fuelLine 连接点
 -- 与它相连的油箱(以及直接贴在它身上的油箱)组成的燃料管网中取油; 被无
@@ -22,11 +33,16 @@
 -- in mod/control.lua (button = max deflection / ring = clamped heading error
 -- / no input = centered) — the round-9 per-engine PID is superseded.
 local staged = false
+local ignitionThrottle = 0 -- B1: throttle captured at the activation instant
 
 function onLoad(part)
-  -- re-arm after a save/load roundtrip: the stage list persists, but this
-  -- Lua upvalue does not — derive it from the ship's stage counter instead
-  staged = part:getStage() > 0
+  -- re-arm after a save/load roundtrip: staging is group-number based now
+  -- (round 26, item B4 — part:getGroup() is this part's stage number,
+  -- part:getStage() is the last stage number fired), so this engine is
+  -- already burning iff its own stage has fired. Group-0 parts (activated
+  -- manually via ACTIVATE) are NOT re-armed: re-activate them after load.
+  local grp = part:getGroup()
+  staged = grp > 0 and part:getStage() >= grp
   -- load the shared control law into THIS engine's Lua state (every part
   -- instance owns a separate state; control.lua edits apply to newly
   -- created ships / after a resource reload)
@@ -38,6 +54,10 @@ end
 
 function onStage(part)
   staged = true
+  -- B1: read the current throttle at the activation instant too (the live
+  -- per-frame read in onUpdate is what actually drives thrust); igniting at
+  -- 0 throttle is legal and simply waits for throttle.
+  ignitionThrottle = part:getThrottle()
 end
 
 local function drainOwn(part, dt)

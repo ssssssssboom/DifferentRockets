@@ -27,3 +27,7 @@ game/local.properties
 .project
 .settings/
 bin/
+
+# ---- 运行时存档（桌面运行会改写，不入库） ----
+game/core/assets/save/
+/world.json

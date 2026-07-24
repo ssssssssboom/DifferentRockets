@@ -58,6 +58,10 @@ public class SandboxScreen extends ScreenAdapter {
     private int anchorIndex = -1;
     private TextButton frameBtn;
     private Table frameList;
+    // switch-ship UI (round 20 item 6): SHIP button opens a distance-sorted
+    // list of the other ships; selecting one re-targets control/camera/orbit
+    private TextButton shipBtn;
+    private Table shipList;
     /** Camera-follow state: the map center rides the selected anchor body. */
     private Planet lastAnchorBody;
     private double lastAnchorX, lastAnchorY;
@@ -230,6 +234,12 @@ public class SandboxScreen extends ScreenAdapter {
         topRight.add(dragBtn).width(110).height(64).pad(2);
         topRight.add(mapBtn).width(96).height(64).pad(2);
         topRight.add(frameBtn).width(170).height(64).pad(2);
+        // round 20 item 6: switch the controlled ship (list like FRAME's)
+        shipBtn = new TextButton("SHIP", game.ui.skin);
+        shipBtn.addListener(new ClickListener() {
+            @Override public void clicked(InputEvent e, float x, float y) { toggleShipList(); }
+        });
+        topRight.add(shipBtn).width(104).height(64).pad(2);
         topRight.add(editorBtn).width(104).height(64).pad(2);
 
         // throttle: 10-segment bar from the Runtime atlas, right edge
@@ -334,6 +344,9 @@ public class SandboxScreen extends ScreenAdapter {
             @Override public boolean touchDown(InputEvent e, float x, float y, int pointer, int button) {
                 slewDir = dir;
                 syncButtonTurn();
+                // round 20 item 2: grabbing a TURN button hands steering to
+                // the buttons — the ring loses activation (gray standby)
+                SteeringIO.ringActive = false;
                 return true;
             }
             @Override public void touchUp(InputEvent e, float x, float y, int pointer, int button) {
@@ -669,6 +682,10 @@ public class SandboxScreen extends ScreenAdapter {
             toggleFrameList();
             return;
         }
+        if (shipList != null) {
+            toggleShipList();
+            return;
+        }
         // tap point in world coords from the double-precision center (round 13)
         double sw = Gdx.graphics.getWidth(), sh = Gdx.graphics.getHeight();
         double wx = mapCX + (screenX - sw / 2) / sw * mapCam.viewportWidth;
@@ -944,6 +961,58 @@ public class SandboxScreen extends ScreenAdapter {
         frameBtn.setText("FRAME:" + label);
         orbitTimer = Float.MAX_VALUE; // re-propagate NOW with the new frame
         if (frameList != null) toggleFrameList(); // collapse
+    }
+
+    /**
+     * Switch-ship list (round 20 item 6): every ship in the world, nearest
+     * first, labelled with name + distance from the active one. Picking an
+     * entry calls GameWorld.setActive (floating origin re-anchors, rails
+     * flags recompute, the old ship keeps the usual non-active rules), then
+     * re-centers the camera and re-propagates the orbit line. Landed ships
+     * are switchable like any other.
+     */
+    private void toggleShipList() {
+        if (shipList != null) {
+            shipList.remove();
+            shipList = null;
+            return;
+        }
+        final java.util.List<Ship> others = new java.util.ArrayList<>();
+        for (Ship s : game.world.ships) {
+            if (s != game.world.active && !s.parts.isEmpty()) others.add(s);
+        }
+        if (others.isEmpty()) {
+            stageLabel.setText("No other ships to switch to");
+            return;
+        }
+        final Vec2d ap = game.world.active != null ? game.world.active.getUniversePos() : null;
+        if (ap != null) {
+            others.sort((a, b) -> Double.compare(
+                    a.getUniversePos().dist(ap), b.getUniversePos().dist(ap)));
+        }
+        shipList = new Table();
+        for (final Ship s : others) {
+            double d = ap != null ? s.getUniversePos().dist(ap) : 0;
+            TextButton b = new TextButton(s.name + "  " + fmt(d), game.ui.skin);
+            b.addListener(new ClickListener() {
+                @Override public void clicked(InputEvent e, float x, float y) { selectShip(s); }
+            });
+            shipList.add(b).width(300).height(56).pad(2).row();
+        }
+        shipList.pack();
+        float sw = Gdx.graphics.getWidth(), sh = Gdx.graphics.getHeight();
+        shipList.setPosition(sw - shipList.getWidth() - 6,
+                Math.max(6, sh - 76 - shipList.getHeight())); // under the top-right bar
+        stage.addActor(shipList);
+    }
+
+    private void selectShip(Ship s) {
+        game.world.setActive(s);
+        camPan.setZero();            // flight camera snaps onto the new ship
+        mapInit = false;             // map view re-fits on it too
+        orbitTimer = Float.MAX_VALUE; // orbit line re-propagates NOW
+        stageLabel.setText("Controlling " + s.name);
+        if (shipList != null) toggleShipList(); // collapse
     }
 
     /**
@@ -1388,9 +1457,11 @@ public class SandboxScreen extends ScreenAdapter {
      */
     private void drawSteeringRing() {
         if (game.world.active == null) return;
-        // round 19: parked on the ground there is nothing to steer — don't
-        // hang the giant ring (0.26·min(w,h)) over the zoomed-out scenery.
-        if (game.world.active.landed) return;
+        // round 20: the ring is ALWAYS visible (landed included). INACTIVE
+        // (SteeringIO.ringActive == false): a dim semi-transparent gray ring
+        // with just the white current-heading tick — no green target marker,
+        // no error arc, no velocity vector. ACTIVE: the full steering style.
+        boolean steering = SteeringIO.ringActive;
         float w = Gdx.graphics.getWidth(), h = Gdx.graphics.getHeight();
         ringX = w / 2f;
         ringY = h / 2f;
@@ -1402,6 +1473,24 @@ public class SandboxScreen extends ScreenAdapter {
 
         double cur = game.world.currentHeading();
         double tgt = game.world.getTargetHeading();
+
+        if (!steering) {
+            // inactive: gray ring + white current-heading tick only
+            game.shapes.begin(ShapeRenderer.ShapeType.Line);
+            game.shapes.setColor(0.7f, 0.7f, 0.72f, 0.22f);
+            game.shapes.circle(ringX, ringY, ringR, 72);
+            game.shapes.setColor(1f, 1f, 1f, 0.55f);
+            game.shapes.line(ringX + (ringPtX(cur) - ringX) * 0.82f, ringY + (ringPtY(cur) - ringY) * 0.82f,
+                    ringPtX(cur), ringPtY(cur));
+            game.shapes.end();
+            game.shapes.begin(ShapeRenderer.ShapeType.Filled);
+            game.shapes.setColor(1f, 1f, 1f, 0.30f);
+            game.shapes.circle(ringX, ringY, 2.5f, 12);
+            game.shapes.setColor(1f, 1f, 1f, 0.6f);
+            game.shapes.circle(ringPtX(cur), ringPtY(cur), 4f, 12);
+            game.shapes.end();
+            return;
+        }
 
         // item 3: ship velocity vector on the ring — planet-relative wind
         // frame (same as the telemetry SPD), marker at the velocity heading

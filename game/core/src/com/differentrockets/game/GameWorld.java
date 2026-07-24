@@ -370,6 +370,14 @@ public class GameWorld {
         active = s;
         reanchorToActive();
         updateRailsFlags();
+        // round 20 item 6 (switch ship): the steering target and the
+        // super-warp trajectory belong to the PREVIOUS ship. Drop both:
+        // steerPrimed=false re-primes the target to the new ship's own
+        // heading next frame, the ring falls back to inactive (gray), and
+        // wtCount=0 forces a fresh trajectory for the new active ship.
+        steerPrimed = false;
+        wtCount = 0;
+        SteeringIO.ringActive = false;
     }
 
     /** Change the universe position assigned to the physics origin; bodies do NOT move. */
@@ -406,6 +414,14 @@ public class GameWorld {
         double ny = target.pos.y + Math.sin(ang) * r;
         active.origin.x += nx - u.x;
         active.origin.y += ny - u.y;
+        // round 20 (probe-found): the WORLD origin must move with the active
+        // ship — applyEnvironmentForces samples gravity/density/altitude at
+        // `origin + bodyPos`, which is only the ship's universe position when
+        // world.origin == active frame origin. Teleporting without it left
+        // environment sampling behind at the old site (surface g + sea-level
+        // density at orbital altitude = mega-drag that killed the orbit).
+        origin.x += nx - u.x;
+        origin.y += ny - u.y;
         // Velocity: re-express the ship's planet-relative velocity in the NEW
         // local frame — keep the radial/tangential components, swap the
         // radial direction (else "ascending straight up" over the old planet
@@ -1000,6 +1016,18 @@ public class GameWorld {
             if (!f.exists()) return false;
             FlameFx.reset(); // drop exhaust particles from whatever ran before
             Json.JObj root = Json.parse(f.readString());
+            // round 20 item 5: REPLACE the live world, never append to it —
+            // Continue Sandbox used to add the saved ships on top of whatever
+            // was already flying (launch -> Menu -> Continue duplicated the
+            // ship in place). Destroy every existing ship (bodies + joints)
+            // and reset per-ship run state before restoring.
+            for (Ship s : new ArrayList<>(ships)) s.destroy();
+            ships.clear();
+            active = null;
+            wtCount = 0;
+            wtImpact = false;
+            steerPrimed = false;
+            saveTimer = 0;
             time = root.getNum("time", 0);
             // restore the floating origin BEFORE ships: body positions are
             // frame-relative, and every environment query resolves universe

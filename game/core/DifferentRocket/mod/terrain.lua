@@ -1,4 +1,4 @@
--- v2026.07.24.2
+-- v2026.07.24.3
 -- ============================================================================
 -- terrain.lua — planet terrain generation (PLAYER-EDITABLE)
 -- ============================================================================
@@ -171,6 +171,26 @@ local function baseTerrainHeight(planetName, angleRad)
   local rough = math.min(2.5, 0.25 + info.noise * 0.28)
   local shaped = n01 ^ rough
 
+  -- micro-scale roughness (round 20): the octave stack's finest features are
+  -- ~9 km wide, so ground inside the walking/driving view (45-200 m) was
+  -- glass smooth (probe: RMS residual 0.0002 m at 8 m scale, 0.01 m at
+  -- 128 m). Add three seam-free ABSOLUTE micro octaves (~256 m / ~64 m /
+  -- ~24 m wavelengths, +/- 5 m / 1.5 m / 0.6 m) so the surface has visible
+  -- texture; max slope stays ~5 deg, safe for landing and driving. Needs
+  -- the planet radius to place the lattice on a meter scale; planets
+  -- missing from padRadii skip this.
+  local micro = 0.0
+  local Rm = padRadii[planetName]
+  if Rm ~= nil and Rm > 0 then
+    local cf = 2 * math.pi * Rm
+    local f1 = math.floor(cf / 256.0 + 0.5)
+    local f2 = math.floor(cf / 64.0 + 0.5)
+    local f3 = math.floor(cf / 24.0 + 0.5)
+    micro = 5.0 * noise.value1(deg / 360.0 * f1, f1, seed + 511.3)
+          + 1.5 * noise.value1(deg / 360.0 * f2, f2, seed + 917.9)
+          + 0.6 * noise.value1(deg / 360.0 * f3, f3, seed + 1377.1)
+  end
+
   local function bandHeight(lo, hi)
     local span = hi - lo
     if span <= 0.0001 then return lo end
@@ -196,10 +216,10 @@ local function baseTerrainHeight(planetName, angleRad)
       local t = bestSD / rim * 0.5 + 0.5
       t = t * t * (3 - 2 * t)
       local hM, hP = bandHeight(loM, hiM), bandHeight(loP, hiP)
-      return hM + (hP - hM) * t
+      return hM + (hP - hM) * t + micro
     end
   end
-  return bandHeight(lo, hi)
+  return bandHeight(lo, hi) + micro
 end
 
 function terrainHeight(planetName, angleRad)

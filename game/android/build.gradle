@@ -1,5 +1,22 @@
 plugins { id 'com.android.application' }
 
+// Build version stamp: current time as yyyymmddhhmm (e.g. 202607242047).
+// Generated into build/generated/assets/version.txt (a BUILD directory — the
+// git working tree stays clean, no .gitignore entry needed) and merged into
+// the APK assets via the extra assets.srcDir below. Core reads it through
+// Res.asset("version.txt"); desktop runs fall back to "dev".
+def buildVersion = new Date().format('yyyyMMddHHmm')
+def generatedAssetsDir = layout.buildDirectory.dir('generated/assets')
+
+tasks.register('generateVersionTxt') {
+    def outFile = generatedAssetsDir.get().file('version.txt').asFile
+    outputs.file(outFile)
+    doLast {
+        outFile.parentFile.mkdirs()
+        outFile.text = buildVersion + '\n'
+    }
+}
+
 android {
     namespace 'com.differentrockets'
     compileSdk 34
@@ -11,8 +28,8 @@ android {
         // (requestLegacyExternalStorage honored), and plain WRITE_EXTERNAL_STORAGE
         // suffices on Android <= 10. MANAGE_EXTERNAL_STORAGE covers Android 12+.
         targetSdk 29
-        versionCode 1
-        versionName '1.0'
+        versionCode 1 // keep incrementing manually; yyyymmddhhmm overflows int32
+        versionName buildVersion
     }
 
     buildTypes {
@@ -33,7 +50,7 @@ android {
     sourceSets {
         main {
             java.srcDirs = ['src']
-            assets.srcDirs = ['../core/assets']
+            assets.srcDirs = ['../core/assets', 'build/generated/assets']
             res.srcDirs = ['res']
             manifest.srcFile 'AndroidManifest.xml'
             jniLibs.srcDir 'libs'
@@ -71,6 +88,7 @@ tasks.register('copyAndroidNatives') {
     }
 }
 preBuild.dependsOn 'copyAndroidNatives'
+preBuild.dependsOn 'generateVersionTxt'
 
 dependencies {
     implementation project(':core')

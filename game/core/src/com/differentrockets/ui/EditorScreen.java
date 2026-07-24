@@ -249,6 +249,8 @@ public class EditorScreen extends ScreenAdapter {
         mux.addProcessor(stage);
         mux.addProcessor(editorInput);
         Gdx.input.setInputProcessor(mux);
+        // catch the Android BACK key so keyDown sees it (same layers as ESC)
+        Gdx.input.setCatchKey(Input.Keys.BACK, true);
     }
 
     private final DragOutInterceptor dragOutInterceptor = new DragOutInterceptor();
@@ -1287,7 +1289,7 @@ public class EditorScreen extends ScreenAdapter {
         @Override
         public boolean keyDown(int keycode) {
             if (keycode == Input.Keys.R) { rotateGhost(); return true; }
-            if (keycode == Input.Keys.ESCAPE) {
+            if (keycode == Input.Keys.ESCAPE || keycode == Input.Keys.BACK) {
                 if (overlay != null) closeOverlay();
                 else if (placing != null) placing = null;
                 else if (openDrawer != 0) closeDrawers();
@@ -1593,6 +1595,7 @@ public class EditorScreen extends ScreenAdapter {
     @Override
     public void hide() {
         autosave(); // C6: persist the in-progress build on exit
+        Gdx.input.setCatchKey(Input.Keys.BACK, false);
         dragOutInterceptor.reset();
         dragOutType = null;
         placing = null;

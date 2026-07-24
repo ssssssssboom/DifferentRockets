@@ -16,13 +16,16 @@ Dependencies: numpy, matplotlib
 
 import argparse
 import json
+import os
 import sys
+import tempfile
 
 import numpy as np
 import matplotlib
 import matplotlib.pyplot as plt
 from matplotlib.colors import LinearSegmentedColormap
 from matplotlib.colors import PowerNorm
+from matplotlib.animation import FuncAnimation, PillowWriter
 
 matplotlib.rcParams['font.family'] = 'monospace'
 
@@ -117,12 +120,10 @@ def calc_plume(thrust, density, exit_diameter=None, expansion_ratio=None,
 
     if NPR >= 1.0:
         plume_type = "+ expanded"
-        pm_angle = np.degrees(np.arcsin(1 / Me)) if Me > 1 else 0
-        plume_angle = min(pm_angle * (NPR ** 0.32), 78)
+        plume_angle = min(4.0 * (NPR - 1.0) ** 0.45, 78)
     else:
         plume_type = "- contracted"
-        pm_angle = np.degrees(np.arcsin(1 / Me)) if Me > 1 else 0
-        plume_angle = -min(pm_angle * (NPR ** -0.25), 35)
+        plume_angle = -min(4.0 * (1.0 / max(NPR, 0.01) - 1.0) ** 0.45, 45)
 
     mach_disk_dist = De * 0.65 * np.sqrt(max(abs(NPR), 0.08))
     diamond_spacing = De * 0.87 * np.sqrt(max(abs(NPR), 0.05))
@@ -145,30 +146,52 @@ def calc_plume(thrust, density, exit_diameter=None, expansion_ratio=None,
     }
 
 
-def gen_grid(p, resolution=400):
+def _smooth_noise(n, scale, seed):
+    rng = np.random.RandomState(seed)
+    coarse = rng.randn(n // 8 + 2) * scale
+    fine = np.interp(np.linspace(0, 1, n),
+                     np.linspace(0, 1, len(coarse)), coarse)
+    kernel = np.ones(12) / 12
+    return np.convolve(fine, kernel, mode='same')
+
+
+def gen_grid(p, resolution=400, seed=None):
     De = p['De']
     L = p['plume_length']
     ds = p['diamond_spacing']
     NPR = p['NPR']
     angle_deg = p['plume_angle_deg']
 
+    if seed is not None:
+        rng = np.random.RandomState(seed)
+        ds_jitter = ds * (1 + rng.uniform(-0.04, 0.04))
+        angle_jitter = angle_deg + rng.uniform(-0.6, 0.6)
+    else:
+        ds_jitter = ds
+        angle_jitter = angle_deg
+
     nz, nr = resolution, max(resolution // 3, 80)
     z = np.linspace(0, L, nz)
-    max_r = L * np.tan(np.radians(max(abs(angle_deg), 8))) + De * 0.5
+    max_r = L * np.tan(np.radians(max(abs(angle_jitter), 8))) + De * 0.5
     max_r = max(max_r, De * 1.2)
     r = np.linspace(0, max_r, nr)
 
     ZZ, RR = np.meshgrid(z, r)
 
-    arad = np.radians(angle_deg)
+    arad = np.radians(angle_jitter)
     envelope = De * 0.5 + z * np.tan(arad)
 
-    if ds > 0 and NPR > 0.01:
-        wave = De * 0.13 * np.sin(2 * np.pi * z / ds) * np.exp(-z / (3.5 * ds))
+    if ds_jitter > 0 and NPR > 0.01:
+        wave = De * 0.38 * np.sin(2 * np.pi * z / ds_jitter) * np.exp(-z / (5.0 * ds_jitter))
         if NPR < 1:
-            wave = wave * 1.5
+            wave = wave * 1.8
         envelope = envelope + wave
-    envelope = np.maximum(envelope, De * 0.18)
+
+    if seed is not None:
+        env_noise = _smooth_noise(nz, De * 0.09, seed)
+        envelope = envelope + env_noise
+
+    envelope = np.maximum(envelope, De * 0.22)
 
     rel = RR / np.maximum(envelope, 1e-9)
     radial = np.exp(-2.8 * np.clip(rel, 0, 5) ** 2)
@@ -176,12 +199,17 @@ def gen_grid(p, resolution=400):
     ax_decay = np.exp(-z / (L * 0.55))
 
     diamond = np.zeros(nz)
-    if ds > 0 and NPR > 0.01:
-        dwave = (np.sin(2 * np.pi * z / ds + np.pi * 0.5) + 1) * 0.5
-        ddecay = np.exp(-z / (2.8 * ds))
-        diamond = 0.35 * dwave * ddecay
+    if ds_jitter > 0 and NPR > 0.01:
+        phase = 0 if seed is None else np.random.RandomState(seed + 1000).uniform(-0.15, 0.15)
+        dwave = (np.sin(2 * np.pi * z / ds_jitter + np.pi * 0.5 + phase) + 1) * 0.5
+        ddecay = np.exp(-z / (3.0 * ds_jitter))
+        diamond = 0.70 * dwave * ddecay
 
-    intensity = radial * ax_decay * (1 + diamond)
+    if seed is not None:
+        flicker = 1 + _smooth_noise(nz, 0.12, seed + 2000)
+        intensity = radial * ax_decay * flicker * (1 + diamond)
+    else:
+        intensity = radial * ax_decay * (1 + diamond)
 
     mask = RR > envelope * 1.03
     intensity[mask] = 0
@@ -189,6 +217,7 @@ def gen_grid(p, resolution=400):
     return {
         'z': z, 'r': r, 'ZZ': ZZ, 'RR': RR,
         'intensity': intensity, 'envelope': envelope,
+        'seed': seed,
     }
 
 
@@ -309,6 +338,65 @@ def visualize(g, p, out_path=None):
                     edgecolor='none')
         print(f"  -> saved: {out_path}")
     return fig
+
+
+def _draw_frame(g, p, ax, cmap, norm):
+    z = g['z']
+    r = g['r']
+    I = g['intensity']
+    env = g['envelope']
+    De = p['De']
+    L = p['plume_length']
+
+    ax.clear()
+    ax.set_facecolor('#080810')
+    ax.pcolormesh(z, r, I, cmap=cmap, norm=norm, shading='auto', rasterized=True)
+    ax.pcolormesh(z, -r[::-1], I[::-1], cmap=cmap, norm=norm, shading='auto', rasterized=True)
+    ax.plot(z, env, 'w--', lw=0.6, alpha=0.45)
+    ax.plot(z, -env, 'w--', lw=0.6, alpha=0.45)
+    ax.set_xlim(-0.25, L * 1.02)
+    max_env = max(np.max(env) * 1.15, De * 0.7)
+    ax.set_ylim(-max_env, max_env)
+    ax.set_aspect('equal')
+    ax.axis('off')
+
+    rect_w = De * 0.25
+    ax.add_patch(plt.Rectangle((-rect_w, -De * 0.5), rect_w, De,
+                                fc='#4a4a4a', ec='#777777', lw=1.2, alpha=0.92))
+
+
+def animate_plume(p, frames=40, output='plume_anim.gif', resolution=250, fps=12):
+    cmap = LinearSegmentedColormap.from_list('plume_fire', BURN_COLORS, N=256)
+    norm = PowerNorm(gamma=0.38, vmin=0, vmax=1)
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+    fig.patch.set_facecolor('#080810')
+
+    grids = [gen_grid(p, resolution=resolution, seed=i * 173 + 7) for i in range(frames)]
+
+    def update(i):
+        _draw_frame(grids[i], p, ax, cmap, norm)
+        return []
+
+    ani = FuncAnimation(fig, update, frames=frames, interval=1000 // fps,
+                        blit=True, repeat=True)
+
+    try:
+        writer = PillowWriter(fps=fps)
+        ani.save(output, writer=writer, dpi=120, savefig_kwargs={
+            'facecolor': '#080810', 'bbox_inches': 'tight', 'pad_inches': 0.1,
+        })
+        print(f"  -> GIF saved: {output}  ({frames} frames @ {fps} fps)")
+    except Exception:
+        tmpdir = tempfile.mkdtemp()
+        print(f"  -> Pillow not available, saving {frames} PNGs to {tmpdir}")
+        for i, g in enumerate(grids):
+            _draw_frame(g, p, ax, cmap, norm)
+            fig.savefig(os.path.join(tmpdir, f'frame_{i:04d}.png'),
+                        dpi=120, facecolor='#080810', bbox_inches='tight')
+        print(f"  -> convert with: ffmpeg -framerate {fps} -i frame_%04d.png out.gif")
+
+    plt.close(fig)
 
 
 def export_json(p, g, filepath):
@@ -596,6 +684,25 @@ def main():
             args.exit_diameter = de
         if args.output is None:
             args.output = f"plume_{args.preset}.png"
+
+    if args.sweep:
+        if args.thrust is None:
+            parser.error("--thrust is required for --sweep")
+        if args.output is None:
+            args.output = "plume_sweep.png"
+        fig = run_sweep(
+            thrust=args.thrust,
+            exit_diameter=args.exit_diameter,
+            expansion_ratio=args.expansion_ratio,
+            chamber_pressure=args.chamber_pressure,
+            output=args.output,
+            resolution=args.resolution,
+        )
+        if not args.no_show:
+            plt.show()
+        else:
+            plt.close('all')
+        return
 
     if args.thrust is None or args.density is None:
         parser.error("--thrust and --density are required (or use --preset)")

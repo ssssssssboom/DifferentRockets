@@ -170,7 +170,17 @@ public class SandboxScreen extends ScreenAdapter {
         mux.addProcessor(stage);
         mux.addProcessor(new GameInput());
         Gdx.input.setInputProcessor(mux);
+        // fix (back-key interception): Android does NOT deliver the BACK key to
+        // the game unless it is explicitly caught — without this the keyDown
+        // below never fires and the app just backgrounds to the launcher
+        Gdx.input.setCatchKey(Input.Keys.BACK, true);
         resize(Gdx.graphics.getWidth(), Gdx.graphics.getHeight());
+    }
+
+    @Override
+    public void hide() {
+        // release the BACK key for the screens we switch to
+        Gdx.input.setCatchKey(Input.Keys.BACK, false);
     }
 
     // ---------------------------------------------------------------- HUD
@@ -435,7 +445,7 @@ public class SandboxScreen extends ScreenAdapter {
         public boolean keyDown(int keycode) {
             switch (keycode) {
                 case Input.Keys.SPACE: doStage(); return true;
-                case Input.Keys.BACK: case Input.Keys.ESCAPE: toggleBackDialog(); return true;
+                case Input.Keys.BACK: case Input.Keys.ESCAPE: onBackKey(); return true;
                 case Input.Keys.TAB: toggleMap(); return true;
                 case Input.Keys.P: game.world.paused = !game.world.paused; return true;
                 case Input.Keys.Z: setThrottleLevel(throttleLevel() + 1); return true;
@@ -829,6 +839,22 @@ public class SandboxScreen extends ScreenAdapter {
     }
 
     /**
+     * BACK key consumption layers (innermost UI first):
+     *   1. the back-confirmation dialog is open → dismiss it (acts as NO);
+     *   2. the MENU drawer is open → slide it closed;
+     *   3. otherwise → open the return-to-editor confirmation (task D2).
+     */
+    private void onBackKey() {
+        if (backDialog != null) {
+            toggleBackDialog();
+        } else if (menuDrawer != null) {
+            toggleMenuDrawer();
+        } else {
+            toggleBackDialog();
+        }
+    }
+
+    /**
      * Back-key confirmation (task D2): the phone back key opens a modal ask —
      * "Return to the editor?" — YES saves the world and goes straight to the
      * build editor (EditorScreen), NO (or back again) dismisses.
@@ -1091,6 +1117,9 @@ public class SandboxScreen extends ScreenAdapter {
         }
         menuDrawer = new Table();
         menuDrawer.setBackground(game.ui.tinted(new Color(0.10f, 0.11f, 0.16f, 0.92f)));
+        Label ver = new Label("v" + game.version, game.ui.skin);
+        ver.setColor(new Color(0.55f, 0.60f, 0.72f, 1f));
+        menuDrawer.add(ver).pad(4).row();
         Label header = new Label("SWITCH SHIP", game.ui.skin);
         menuDrawer.add(header).pad(6).row();
         final java.util.List<Ship> others = new java.util.ArrayList<>();

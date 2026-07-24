@@ -65,6 +65,13 @@ public class MenuScreen extends ScreenAdapter {
         root.add(build).width(560).height(120).pad(16).row();
         root.add(cont).width(560).height(120).pad(16).row();
         root.add(reset).width(560).height(120).pad(16).row();
+
+        // build version stamp (yyyymmddhhmm from assets/version.txt, "dev" otherwise)
+        Label ver = new Label("v" + game.version, game.ui.skin);
+        ver.setFontScale(0.55f);
+        ver.setColor(new Color(0.5f, 0.55f, 0.68f, 1f));
+        ver.setPosition(10, 8);
+        stage.addActor(ver);
     }
 
     @Override

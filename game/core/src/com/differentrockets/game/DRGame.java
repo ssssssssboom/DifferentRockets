@@ -33,9 +33,24 @@ public class DRGame extends Game {
 
     public GameWorld world;
 
+    /**
+     * Build version string (yyyymmddhhmm), generated into assets/version.txt
+     * by android/build.gradle at build time. Read chain: player-external copy
+     * → APK/internal asset → "dev" (desktop runs without the generated file).
+     */
+    public String version = "dev";
+
     @Override
     public void create() {
         Res.init(); // player-editable resource root (copies defaults on first run)
+        // build version: assets/version.txt (Android build stamps it; absent on desktop)
+        try {
+            com.badlogic.gdx.files.FileHandle vf = Res.asset("version.txt");
+            if (vf.exists()) {
+                String v = vf.readString("UTF-8").trim();
+                if (!v.isEmpty()) version = v;
+            }
+        } catch (Throwable ignored) { /* stay on "dev" */ }
 
         batch = new SpriteBatch();
         shapes = new ShapeRenderer();

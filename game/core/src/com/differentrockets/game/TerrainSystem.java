@@ -297,9 +297,31 @@ public class TerrainSystem implements Disposable {
             if (c.body != null) {
                 double tx = px + c.cx, ty = py + c.cy;
                 if (c.hasLast && simDt > 1e-9) {
-                    c.body.setLinearVelocity(
-                            (float) ((tx - c.lastBX) / simDt),
-                            (float) ((ty - c.lastBY) / simDt));
+                    double mvx = tx - c.lastBX, mvy = ty - c.lastBY;
+                    // round 19 fix (probe-verified): Box2D clamps EVERY body,
+                    // kinematic included, to b2_maxTranslation = 2 m per
+                    // substep. A purely velocity-driven chunk body whose
+                    // per-substep demand exceeds that (ship moving faster
+                    // than ~120 m/s relative to the ground) silently LAGS —
+                    // the collision shell drifted >1.3 km behind the rendered
+                    // terrain at 800 m/s in the probe. Beyond the clamp
+                    // threshold, snap the body to its target (teleport) while
+                    // STILL reporting the true average velocity, so the
+                    // contact solver keeps seeing the real ground speed.
+                    double perSubstep = Math.hypot(mvx, mvy) * (GameWorld.PHYS_DT / simDt);
+                    if (perSubstep > 1.8) {
+                        // snap exactly onto the target and STAND STILL until
+                        // the next drive: setting the true (huge) velocity
+                        // here would let the clamp advance the body 2 m PAST
+                        // the target every substep, oscillating around it.
+                        // Friction fidelity is moot at >120 m/s ground speed.
+                        c.body.setTransform((float) tx, (float) ty, 0);
+                        c.body.setLinearVelocity(0, 0);
+                    } else {
+                        c.body.setLinearVelocity(
+                                (float) (mvx / simDt),
+                                (float) (mvy / simDt));
+                    }
                 } else {
                     c.body.setTransform((float) tx, (float) ty, 0);
                     c.body.setLinearVelocity(0, 0);

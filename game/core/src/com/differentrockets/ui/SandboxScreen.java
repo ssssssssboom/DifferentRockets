@@ -1498,7 +1498,7 @@ public class SandboxScreen extends ScreenAdapter {
                 if (sel) game.batch.setColor(0.60f, 0.85f, 1f, 1f);
                 game.batch.draw(r, pos.x - p.type.width / 2f, pos.y - p.type.height / 2f,
                         p.type.width / 2f, p.type.height / 2f, p.type.width, p.type.height,
-                        1f, 1f, angleDeg);
+                        p.flippedX ? -1f : 1f, p.flippedY ? -1f : 1f, angleDeg);
                 if (sel) game.batch.setColor(Color.WHITE);
             }
             // engine flames are drawn procedurally in drawFlames() after batch.end()
@@ -1508,7 +1508,8 @@ public class SandboxScreen extends ScreenAdapter {
                 if (cr != null) {
                     Vector2 top = p.body.getWorldPoint(tmp2.set(0, p.type.height / 2f));
                     float w = 22f, h = 22f;
-                    game.batch.draw(cr, top.x - w / 2f, top.y, w / 2f, 0, w, h, 1f, 1f, angleDeg);
+                    game.batch.draw(cr, top.x - w / 2f, top.y, w / 2f, 0, w, h,
+                            p.flippedX ? -1f : 1f, p.flippedY ? -1f : 1f, angleDeg);
                 }
             }
         }

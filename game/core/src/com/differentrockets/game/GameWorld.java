@@ -4,11 +4,16 @@ import com.badlogic.gdx.Gdx;
 import com.badlogic.gdx.files.FileHandle;
 import com.badlogic.gdx.math.Vector2;
 import com.badlogic.gdx.physics.box2d.World;
+import com.badlogic.gdx.utils.XmlReader;
 import com.differentrockets.util.Json;
+import com.differentrockets.util.Res;
 import com.differentrockets.util.Vec2d;
 
 import java.util.ArrayList;
+import java.util.IdentityHashMap;
 import java.util.List;
+import java.util.Locale;
+import java.util.Map;
 
 /**
  * The simulation: Box2D world (zero ambient gravity; N-body gravity applied
@@ -782,7 +787,18 @@ public class GameWorld {
     private void substep(float h) {
         time += h;
         sun.updateRails(time);
-        if (active != null) applyEnvironmentForces(active, h);
+        // round 26 (debris-acceleration fix): environment forces for EVERY
+        // in-physics ship, not just the active one. Ships within
+        // RAILS_DISTANCE are stepped by boxWorld too, but used to get NO
+        // gravity/drag — a freshly detached stage kept a perfectly straight
+        // inertial velocity while the active ship fell through curved
+        // gravity, so relative to the ship (and the planet) the debris
+        // appeared to pick up a phantom acceleration ("跟着有加速度").
+        // Rails ships are unaffected: they integrate gravity in
+        // integrateRails/warpRailsShip instead.
+        for (Ship s : ships) {
+            if (!s.onRails) applyEnvironmentForces(s, h);
+        }
         boxWorld.step(h, VEL_ITER, POS_ITER);
         // advance the inertial frame: the physics origin moves with frameVel
         double fx = frameVel.x * h, fy = frameVel.y * h;
@@ -948,84 +964,462 @@ public class GameWorld {
         return a;
     }
 
-    // ---------------------------------------------------------------- save/load
+    // ---------------------------------------------------------------- save/load (Show_sandbox XML, round 26)
 
+    /**
+     * Sandbox save file: Show_sandbox-compatible XML at
+     * <resource root>/Sandboxs/world.xml (see Res.sandboxDir). The legacy
+     * JSON save (save/world.json, app-local) is no longer WRITTEN but is
+     * still READ as a one-time fallback when no XML save exists.
+     */
     private FileHandle saveFile() {
+        return Res.sandboxDir().child("world.xml");
+    }
+
+    private FileHandle legacySaveFile() {
         return Gdx.files.local("save/world.json");
     }
 
+    private static String f6(double v) {
+        return String.format(Locale.US, "%.6f", v);
+    }
+
+    /**
+     * trueAnomaly needs more digits than the %.6f convention: 5e-7 rad of
+     * rounding at a 1e10 m orbital radius is a 5 km position error on load.
+     */
+    private static String f9(double v) {
+        return String.format(Locale.US, "%.9f", v);
+    }
+
+    /** XML-attribute escaping for names that may contain & < > ". */
+    private static String esc(String s) {
+        if (s == null) return "";
+        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                .replace("\"", "&quot;");
+    }
+
+    // ---- trueAnomaly <-> Kepler rail state (PlanetNode) ----
+
+    private static double keplerE(double M, double e) {
+        M = (M + Math.PI) % (2 * Math.PI);
+        if (M < 0) M += 2 * Math.PI;
+        M -= Math.PI;
+        double E = M + e * Math.sin(M);
+        for (int k = 0; k < 12; k++) {
+            E = E - (E - e * Math.sin(E) - M) / (1 - e * Math.cos(E));
+        }
+        return E;
+    }
+
+    /**
+     * True anomaly (rad, wrapped to [-pi, pi]) of a planet on its Kepler rail
+     * at absolute time t — mirrors Planet.localPosVel's M = n·t + v0 rule
+     * (negated for retrograde orbits). NaN for parentless/invalid planets.
+     */
+    public static double planetTrueAnomaly(Planet p, double t) {
+        if (p == null || p.parent == null || p.a <= 0) return Double.NaN;
+        double n = Math.sqrt(p.parent.mu() / (p.a * p.a * p.a));
+        double M = n * t + p.v0;
+        if (!p.prograde) M = -M;
+        double E = keplerE(M, p.e);
+        double nu = 2 * Math.atan2(Math.sqrt(1 + p.e) * Math.sin(E / 2),
+                Math.sqrt(1 - p.e) * Math.cos(E / 2));
+        return wrapPi(nu);
+    }
+
+    /**
+     * Inverse of planetTrueAnomaly: set p.v0 so the planet sits at true
+     * anomaly nu at time t (prograde: M = n·t + v0; retrograde: M = -(n·t + v0)).
+     */
+    private static void planetSetV0FromTrueAnomaly(Planet p, double nu, double t) {
+        if (p == null || p.parent == null || p.a <= 0 || Double.isNaN(nu)) return;
+        double n = Math.sqrt(p.parent.mu() / (p.a * p.a * p.a));
+        double E = 2 * Math.atan2(Math.sqrt(1 - p.e) * Math.sin(nu / 2),
+                Math.sqrt(1 + p.e) * Math.cos(nu / 2));
+        double M = E - p.e * Math.sin(E); // mean anomaly equivalent (mod 2pi)
+        p.v0 = wrapPi(p.prograde ? M - n * t : -M - n * t);
+    }
+
+    /**
+     * Save the world as a Show_sandbox-compatible XML record:
+     *   <Runtime time firstStageActivated solarSystem shipId podId><Nodes>
+     *     <PlanetNode name trueAnomaly/> ...
+     *     <ShipNode id planet planetRadius x y vx vy><Ship version liftedOff
+     *       touchingGround><Parts><Part ...>[Tank/Engine/Pod...]</Part></Parts>
+     *       <Connections>...</Connections></Ship></ShipNode> ...
+     *   </Nodes></Runtime>
+     * Ship/part coordinates are PLANET-RELATIVE (position and velocity), the
+     * same convention as the reference Show_sandbox sample; part ids are
+     * assigned per ship with the pod = 1.
+     */
     public void save() {
         try {
-            Json.Writer w = new Json.Writer();
-            w.obj();
-            w.set("time", time);
-            w.set("originX", origin.x);   // floating-origin universe position —
-            w.set("originY", origin.y);   // WITHOUT this, restored ships evaluate
-            w.set("frameVelX", frameVel.x); // gravity/altitude/planet distance
-            w.set("frameVelY", frameVel.y); // offset by the whole frame origin
-            w.set("active", active != null ? ships.indexOf(active) : -1);
-            w.key("ships"); w.arr();
+            // per-ship part ids (pod = 1, then 2..N in parts order)
+            Map<Ship, Map<Part, Integer>> shipIds = new IdentityHashMap<>();
             for (Ship s : ships) {
-                w.obj();
-                w.set("name", s.name);
-                w.set("originX", s.origin.x);
-                w.set("originY", s.origin.y);
-                w.set("velX", s.originVel.x);
-                w.set("velY", s.originVel.y);
-                w.set("stage", s.currentStage);
-                w.set("rails", s.onRails);
-                w.key("parts"); w.arr();
-                for (Part p : s.parts) {
-                    w.obj();
-                    w.set("t", p.type.id);
-                    if (p.body != null) {
-                        w.set("x", (double) p.body.getPosition().x);
-                        w.set("y", (double) p.body.getPosition().y);
-                        w.set("a", (double) p.body.getAngle());
-                        Vector2 v = p.body.getLinearVelocity();
-                        w.set("vx", (double) v.x);
-                        w.set("vy", (double) v.y);
-                        w.set("va", (double) p.body.getAngularVelocity());
-                    }
-                    w.set("fuel", p.fuel);
-                    w.set("dep", p.deployed);
-                    if (p.group > 0) w.set("grp", p.group);
-                    w.endObj();
-                }
-                w.endArr();
-                w.key("links"); w.arr();
-                for (Ship.Link l : s.links) {
-                    int ia = s.parts.indexOf(l.a), ib = s.parts.indexOf(l.b);
-                    if (ia < 0 || ib < 0) continue;
-                    w.obj();
-                    w.set("a", ia);
-                    w.set("b", ib);
-                    w.endObj();
-                }
-                w.endArr();
-                w.key("stages"); w.arr();
-                for (List<Integer> st : s.stages) {
-                    w.arr();
-                    for (int idx : st) w.val(idx);
-                    w.endArr();
-                }
-                w.endArr();
-                w.endObj();
+                Map<Part, Integer> m = new IdentityHashMap<>();
+                Part pod = s.controlPart();
+                int n = 1;
+                if (pod != null && s.parts.contains(pod)) m.put(pod, n++);
+                for (Part p : s.parts) if (!m.containsKey(p)) m.put(p, n++);
+                shipIds.put(s, m);
             }
-            w.endArr();
-            w.endObj();
+            int podId = 0;
+            if (active != null && active.controlPart() != null) {
+                Integer pi = shipIds.get(active).get(active.controlPart());
+                podId = pi != null ? pi : 0;
+            }
+            // ship -> nearest planet (its ShipNode frame body)
+            Map<Ship, Planet> shipPlanet = new IdentityHashMap<>();
+            for (Ship s : ships) {
+                Vec2d u = s.getUniversePos();
+                shipPlanet.put(s, nearestPlanetTo(u.x, u.y));
+            }
+
+            StringBuilder sb = new StringBuilder(1 << 16);
+            sb.append("<Runtime time=\"").append(f6(time))
+              .append("\" firstStageActivated=\"")
+              .append(active != null && active.currentStage > 0 ? 1 : 0)
+              .append("\" solarSystem=\"SmolarSystem.xml\"")
+              .append(" shipId=\"").append(active != null ? active.getId() : 0)
+              .append("\" podId=\"").append(podId).append("\">");
+            sb.append("<Nodes>");
+            List<Ship> orphans = new ArrayList<>();
+            for (Planet p : planets) {
+                sb.append("<PlanetNode name=\"").append(esc(p.name)).append("\"");
+                double nu = planetTrueAnomaly(p, time);
+                if (!Double.isNaN(nu)) sb.append(" trueAnomaly=\"").append(f9(nu)).append("\"");
+                sb.append("/>");
+                for (Ship s : ships) {
+                    if (shipPlanet.get(s) == p) writeShipNode(sb, s, p, shipIds.get(s));
+                }
+            }
+            for (Ship s : ships) {
+                if (shipPlanet.get(s) == null) orphans.add(s);
+            }
+            for (Ship s : orphans) {
+                writeShipNode(sb, s, planets.isEmpty() ? null : planets.get(0), shipIds.get(s));
+            }
+            sb.append("</Nodes></Runtime>");
             FileHandle f = saveFile();
             f.parent().mkdirs();
-            f.writeString(w.toString(), false);
+            f.writeString(sb.toString(), false, "UTF-8");
         } catch (Exception e) {
             Gdx.app.error("save", "failed to save world", e);
         }
     }
 
-    /** Load persisted world; returns true if anything was loaded. */
+    /** One ship's <ShipNode> subtree; positions/velocities planet-relative. */
+    private void writeShipNode(StringBuilder sb, Ship s, Planet pl, Map<Part, Integer> ids) {
+        if (pl == null) return;
+        Vec2d u = s.getUniversePos();
+        Vec2d v = s.getUniverseVel();
+        sb.append("<ShipNode id=\"").append(s.getId())
+          .append("\" planet=\"").append(esc(pl.name))
+          .append("\" planetRadius=\"").append(f6(pl.radius))
+          .append("\" x=\"").append(f6(u.x - pl.pos.x))
+          .append("\" y=\"").append(f6(u.y - pl.pos.y))
+          .append("\" vx=\"").append(f6(v.x - pl.vel.x))
+          .append("\" vy=\"").append(f6(v.y - pl.vel.y)).append("\">");
+        sb.append("<Ship version=\"1\" liftedOff=\"").append(s.landed ? 0 : 1)
+          .append("\" touchingGround=\"").append(s.landed ? 1 : 0).append("\">");
+        sb.append("<Parts>");
+        for (Part p : s.parts) {
+            Integer pid = ids.get(p);
+            if (pid == null || p.body == null) continue;
+            double pux = origin.x + p.body.getPosition().x;
+            double puy = origin.y + p.body.getPosition().y;
+            sb.append("<Part partType=\"").append(esc(p.type.id))
+              .append("\" id=\"").append(pid)
+              .append("\" x=\"").append(f6(pux - pl.pos.x))
+              .append("\" y=\"").append(f6(puy - pl.pos.y))
+              .append("\" angle=\"").append(f6(p.body.getAngle()))
+              .append("\" angleV=\"").append(f6(p.body.getAngularVelocity()))
+              .append("\" editorAngle=\"").append(p.design.rot).append("\"");
+            boolean activated = p.deployed || (p.group > 0 && s.currentStage >= p.group);
+            sb.append(" activated=\"").append(activated ? 1 : 0)
+              .append("\" exploded=\"0\"")
+              .append(" flippedX=\"").append(p.flippedX ? 1 : 0)
+              .append("\" flippedY=\"").append(p.flippedY ? 1 : 0).append("\"");
+            if (p.deployed) sb.append(" extension=\"1.000000\"");
+            StringBuilder kids = new StringBuilder();
+            if (p.type.tank != null) {
+                kids.append("<Tank fuel=\"").append(f6(p.fuel)).append("\"/>");
+            }
+            if (p.type.engine != null) {
+                kids.append("<Engine fuel=\"").append(f6(p.type.tank != null ? p.fuel : 0)).append("\"/>");
+            }
+            if ("pod".equals(p.type.type)) {
+                kids.append("<Pod throttle=\"").append(f6(s == active ? inputThrottle : 0))
+                    .append("\" name=\"").append(esc(s.name)).append("\">");
+                kids.append("<Staging currentStage=\"").append(s.currentStage).append("\">");
+                List<Integer> groups = new ArrayList<>();
+                for (Part q : s.parts) {
+                    if (q.group > 0 && !groups.contains(q.group)) groups.add(q.group);
+                }
+                groups.sort(null);
+                for (int g : groups) {
+                    kids.append("<Step>");
+                    for (Part q : s.parts) {
+                        if (q.group == g && ids.get(q) != null) {
+                            kids.append("<Activate Id=\"").append(ids.get(q)).append("\" moved=\"1\"/>");
+                        }
+                    }
+                    kids.append("</Step>");
+                }
+                kids.append("</Staging></Pod>");
+            }
+            if (kids.length() == 0) sb.append("/>");
+            else sb.append(">").append(kids).append("</Part>");
+        }
+        sb.append("</Parts>");
+        sb.append("<Connections>");
+        for (Ship.Link l : s.links) {
+            Integer ia = ids.get(l.a), ib = ids.get(l.b);
+            if (ia == null || ib == null) continue;
+            sb.append("<Connection parentAttachPoint=\"").append(Math.max(1, l.attachIndexA + 1))
+              .append("\" childAttachPoint=\"").append(Math.max(1, l.attachIndexB + 1))
+              .append("\" parentPart=\"").append(ia)
+              .append("\" childPart=\"").append(ib).append("\"/>");
+        }
+        sb.append("</Connections></Ship></ShipNode>");
+    }
+
+    /**
+     * Load the sandbox save (Show_sandbox-compatible XML). Reads everything
+     * this game writes, and tolerates reference-format files: any missing
+     * attribute falls back to a default (unknown planet names keep their
+     * rail state, missing trueAnomaly skips the orbit restore, ships without
+     * Connections are re-welded by attach-point overlap). When no XML save
+     * exists, the legacy JSON save (save/world.json) is read once as a
+     * migration path. Returns true if anything was loaded.
+     */
     public boolean load() {
+        FileHandle f = saveFile();
+        if (!f.exists()) return loadLegacyJson();
         try {
-            FileHandle f = saveFile();
+            FlameFx.reset(); // drop exhaust particles from whatever ran before
+            String text = f.readString("UTF-8");
+            if (!text.isEmpty() && text.charAt(0) == '﻿') text = text.substring(1);
+            XmlReader.Element root = new XmlReader().parse(text);
+            if (!"Runtime".equals(root.getName())) return loadLegacyJson();
+
+            // reset the live world (same discipline as the JSON loader)
+            for (Ship s : new ArrayList<>(ships)) s.destroy();
+            ships.clear();
+            active = null;
+            wtCount = 0;
+            wtImpact = false;
+            steerPrimed = false;
+            saveTimer = 0;
+
+            time = getNumAttr(root, "time", 0);
+            // planet rail states from trueAnomaly (parentless / nan / unknown
+            // names are skipped; empty-name nodes from modded files too)
+            XmlReader.Element nodes = root.getChildByName("Nodes");
+            List<XmlReader.Element> shipNodes = new ArrayList<>();
+            if (nodes != null) {
+                for (int i = 0; i < nodes.getChildCount(); i++) {
+                    XmlReader.Element n = nodes.getChild(i);
+                    if ("PlanetNode".equals(n.getName())) {
+                        String nm = n.getAttribute("name", "");
+                        double nu = getNumAttr(n, "trueAnomaly", Double.NaN);
+                        Planet p = findPlanet(nm);
+                        if (p != null && !Double.isNaN(nu)) {
+                            planetSetV0FromTrueAnomaly(p, nu, time);
+                        }
+                    } else if ("ShipNode".equals(n.getName())) {
+                        shipNodes.add(n);
+                    }
+                }
+            }
+            sun.updateRails(time);
+
+            // first pass: parse ships into records (universe frame resolved
+            // per ship against its node planet)
+            class RPart {
+                String typeId; int id; double x, y, angle, angleV; int rot;
+                boolean deployed; double fuel = -1; int group;
+                boolean fx, fy;
+            }
+            class RShip {
+                int id; Planet planet; String name = "Ship"; int currentStage;
+                double x, y, vx, vy; double throttle;
+                List<RPart> parts = new ArrayList<>();
+                List<int[]> conns = new ArrayList<>(); // {parentId, childId}
+            }
+            List<RShip> records = new ArrayList<>();
+            for (XmlReader.Element sn : shipNodes) {
+                RShip rs = new RShip();
+                rs.id = (int) getNumAttr(sn, "id", 0);
+                rs.planet = findPlanet(sn.getAttribute("planet", ""));
+                if (rs.planet == null) rs.planet = nearestPlanetTo(origin.x, origin.y);
+                if (rs.planet == null && !planets.isEmpty()) rs.planet = planets.get(0);
+                rs.x = getNumAttr(sn, "x", 0);
+                rs.y = getNumAttr(sn, "y", rs.planet != null ? rs.planet.radius + 10 : 0);
+                rs.vx = getNumAttr(sn, "vx", 0);
+                rs.vy = getNumAttr(sn, "vy", 0);
+                XmlReader.Element sh = sn.getChildByName("Ship");
+                XmlReader.Element partsEl = sh != null ? sh.getChildByName("Parts") : null;
+                if (partsEl == null) { records.add(rs); continue; }
+                // staging: step index (1-based) -> part ids, per Pod element
+                Map<Integer, Integer> stageOf = new java.util.HashMap<>();
+                for (int i = 0; i < partsEl.getChildCount(); i++) {
+                    XmlReader.Element pe = partsEl.getChild(i);
+                    if (!"Part".equals(pe.getName())) continue;
+                    RPart rp = new RPart();
+                    rp.typeId = pe.getAttribute("partType", "");
+                    rp.id = (int) getNumAttr(pe, "id", 0);
+                    rp.x = getNumAttr(pe, "x", rs.x);
+                    rp.y = getNumAttr(pe, "y", rs.y);
+                    rp.angle = getNumAttr(pe, "angle", 0);
+                    rp.angleV = getNumAttr(pe, "angleV", 0);
+                    rp.rot = (int) getNumAttr(pe, "editorAngle", 0);
+                    boolean act = getNumAttr(pe, "activated", 0) > 0.5;
+                    boolean ext = pe.getAttribute("extension", null) != null
+                            && getNumAttr(pe, "extension", 0) > 0;
+                    rp.deployed = act || ext;
+                    rp.fx = getNumAttr(pe, "flippedX", 0) != 0;
+                    rp.fy = getNumAttr(pe, "flippedY", 0) != 0;
+                    XmlReader.Element tank = pe.getChildByName("Tank");
+                    XmlReader.Element eng = pe.getChildByName("Engine");
+                    if (tank != null) rp.fuel = getNumAttr(tank, "fuel", -1);
+                    else if (eng != null) rp.fuel = getNumAttr(eng, "fuel", -1);
+                    XmlReader.Element pod = pe.getChildByName("Pod");
+                    if (pod != null) {
+                        rs.name = pod.getAttribute("name", rs.name);
+                        if (rs.name.isEmpty()) rs.name = "Ship";
+                        rs.throttle = getNumAttr(pod, "throttle", 0);
+                        XmlReader.Element stg = pod.getChildByName("Staging");
+                        if (stg != null) {
+                            rs.currentStage = Math.max(rs.currentStage,
+                                    (int) getNumAttr(stg, "currentStage", 0));
+                            for (int si = 0; si < stg.getChildCount(); si++) {
+                                XmlReader.Element step = stg.getChild(si);
+                                if (!"Step".equals(step.getName())) continue;
+                                for (int ai = 0; ai < step.getChildCount(); ai++) {
+                                    XmlReader.Element av = step.getChild(ai);
+                                    if (!"Activate".equals(av.getName())) continue;
+                                    stageOf.put((int) getNumAttr(av, "Id", 0), si + 1);
+                                }
+                            }
+                        }
+                    }
+                    rs.parts.add(rp);
+                }
+                for (RPart rp : rs.parts) {
+                    Integer g = stageOf.get(rp.id);
+                    if (g != null) rp.group = g;
+                }
+                XmlReader.Element connsEl = sh.getChildByName("Connections");
+                if (connsEl != null) {
+                    for (int i = 0; i < connsEl.getChildCount(); i++) {
+                        XmlReader.Element ce = connsEl.getChild(i);
+                        if (!"Connection".equals(ce.getName())) continue;
+                        rs.conns.add(new int[] {
+                                (int) getNumAttr(ce, "parentPart", -1),
+                                (int) getNumAttr(ce, "childPart", -1) });
+                    }
+                }
+                records.add(rs);
+            }
+
+            // frame: anchor origin on the active ship's node position and let
+            // frameVel carry its universe velocity (planet-relative + planet)
+            int activeId = (int) getNumAttr(root, "shipId", -1);
+            RShip activeRec = null;
+            for (RShip rs : records) if (rs.id == activeId) { activeRec = rs; break; }
+            if (activeRec == null && !records.isEmpty()) activeRec = records.get(0);
+            if (activeRec != null && activeRec.planet != null) {
+                origin.set(activeRec.planet.pos.x + activeRec.x,
+                        activeRec.planet.pos.y + activeRec.y);
+                frameVel.set(activeRec.planet.vel.x + activeRec.vx,
+                        activeRec.planet.vel.y + activeRec.vy);
+            } else {
+                origin.set(0, 0);
+                frameVel.set(0, 0);
+            }
+
+            // second pass: instantiate ships/parts/joints
+            for (RShip rs : records) {
+                if (rs.planet == null) continue;
+                Ship s = new Ship(this);
+                s.name = rs.name;
+                s.currentStage = rs.currentStage;
+                s.origin.set(origin);
+                double uvx = rs.planet.vel.x + rs.vx;
+                double uvy = rs.planet.vel.y + rs.vy;
+                Map<Integer, Part> byId = new java.util.HashMap<>();
+                for (RPart rp : rs.parts) {
+                    PartType t = PartList.get(rp.typeId);
+                    if (t == null) continue;
+                    ShipDesign.DesignPart dp = new ShipDesign.DesignPart(t.id, 0, 0, rp.rot);
+                    dp.flippedX = rp.fx;   // Part ctor copies these; collider
+                    dp.flippedY = rp.fy;   // verts + attach defs mirror off them
+                    Part p = new Part(t, s, dp);
+                    double ux = rs.planet.pos.x + rp.x;
+                    double uy = rs.planet.pos.y + rp.y;
+                    p.createBody((float) (ux - origin.x), (float) (uy - origin.y), 0);
+                    p.body.setTransform(p.body.getPosition(), (float) rp.angle);
+                    p.body.setLinearVelocity((float) (uvx - frameVel.x), (float) (uvy - frameVel.y));
+                    p.body.setAngularVelocity((float) rp.angleV);
+                    if (rp.fuel >= 0) p.setFuel(rp.fuel);
+                    p.deployed = rp.deployed;
+                    p.group = rp.group;
+                    p.updateMass();
+                    s.parts.add(p);
+                    byId.put(rp.id, p);
+                }
+                // onLoad BEFORE welding (per-part joint overrides must resolve first)
+                for (Part p : s.parts) p.callOnLoad();
+                if (!rs.conns.isEmpty()) {
+                    for (int[] c : rs.conns) {
+                        Part a = byId.get(c[0]), b = byId.get(c[1]);
+                        if (a != null && b != null && a != b) s.weldLoaded(a, b);
+                    }
+                } else if (s.parts.size() > 1) {
+                    s.connectOverlaps(); // no Connections in file: re-weld by overlap
+                }
+                ships.add(s);
+                if (rs == activeRec) {
+                    active = s;
+                    inputThrottle = Math.max(0, Math.min(1, rs.throttle));
+                }
+            }
+            if (active == null && !ships.isEmpty()) active = ships.get(0);
+            if (active != null) setActive(active);
+            return !ships.isEmpty();
+        } catch (Exception e) {
+            Gdx.app.error("save", "failed to load world", e);
+            return false;
+        }
+    }
+
+    private static double getNumAttr(XmlReader.Element e, String name, double def) {
+        try {
+            String v = e.getAttribute(name, null);
+            if (v == null) return def;
+            double d = Double.parseDouble(v.trim());
+            return d;
+        } catch (Throwable t) {
+            return def;
+        }
+    }
+
+    /** First planet with this exact name (null/empty-safe). */
+    private Planet findPlanet(String name) {
+        if (name == null || name.isEmpty()) return null;
+        for (Planet p : planets) {
+            if (name.equals(p.name)) return p;
+        }
+        return null;
+    }
+
+    /** Legacy JSON save (pre-round-26); read-only migration fallback. */
+    private boolean loadLegacyJson() {
+        try {
+            FileHandle f = legacySaveFile();
             if (!f.exists()) return false;
             FlameFx.reset(); // drop exhaust particles from whatever ran before
             Json.JObj root = Json.parse(f.readString());
@@ -1072,6 +1466,10 @@ public class GameWorld {
     public void clearSave() {
         try {
             FileHandle f = saveFile();
+            if (f.exists()) f.delete();
+        } catch (Exception ignored) {}
+        try {
+            FileHandle f = legacySaveFile();
             if (f.exists()) f.delete();
         } catch (Exception ignored) {}
     }

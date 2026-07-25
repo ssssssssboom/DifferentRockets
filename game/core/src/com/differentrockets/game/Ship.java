@@ -90,9 +90,14 @@ public class Ship {
         connectAttachPoints();
     }
 
+    /**
+     * Public wrapper for connectAttachPoints: re-weld by attach-point overlap
+     * (sandbox XML loader fallback for saves without a Connections list).
+     */
+    public void connectOverlaps() { connectAttachPoints(); }
+
     /** Connect overlapping attach points with spring-damper weld joints. */
-    private void connectAttachPoints() {
-        float threshold = 0.35f;
+    private void connectAttachPoints() {        float threshold = 0.35f;
         Vector2 a1 = new Vector2(), a2 = new Vector2();
         Vector2 b1 = new Vector2(), b2 = new Vector2();
         Vector2 cA = new Vector2(), cB = new Vector2();
@@ -588,6 +593,21 @@ public class Ship {
         return (designIndex >= 0 && designIndex < parts.size()) ? parts.get(designIndex) : null;
     }
 
+    /** Runtime id of this ship (session-unique; written as ShipNode id in sandbox saves). */
+    public int getId() { return id; }
+
+    /**
+     * Re-weld two parts restored from a save file: anchor at the midpoint of
+     * their nearest attach points and resolve the weld params from those
+     * attach defs (same rule as the JSON loader used).
+     */
+    public void weldLoaded(Part a, Part b) {
+        Vector2 anchor = bestAnchor(a, b);
+        if (anchor != null) {
+            weld(a, b, anchor, nearestAttach(a, anchor), nearestAttach(b, anchor));
+        }
+    }
+
     // ---------------------------------------------------------------- update
 
     public void updateScripts(double dt) {
@@ -742,6 +762,8 @@ public class Ship {
             w.set("fuel", p.fuel);
             w.set("dep", p.deployed);
             if (p.group > 0) w.set("grp", p.group);
+            if (p.flippedX) w.set("fx", 1);
+            if (p.flippedY) w.set("fy", 1);
             w.endObj();
         }
         w.endArr();
@@ -782,6 +804,10 @@ public class Ship {
                 if (t == null) continue;
                 ShipDesign.DesignPart dp = new ShipDesign.DesignPart(t.id, 0, 0, 0);
                 Part p = new Part(t, s, dp);
+                // mirror flags BEFORE createBody: collider verts and attach
+                // defs mirror off these (round 27)
+                p.flippedX = po.getInt("fx", 0) != 0;
+                p.flippedY = po.getInt("fy", 0) != 0;
                 p.createBody((float) po.getNum("x", 0), (float) po.getNum("y", 0),
                         (float) po.getNum("a", 0));
                 p.body.setTransform(p.body.getPosition(), (float) po.getNum("a", 0));

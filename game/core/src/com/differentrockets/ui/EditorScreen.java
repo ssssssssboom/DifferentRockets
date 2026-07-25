@@ -92,6 +92,7 @@ public class EditorScreen extends ScreenAdapter {
     private int dragIndex = -1;       // existing part being dragged
     private float dragX, dragY;       // current ghost position (world)
     private int dragRot;              // rotation of ghost
+    private boolean dragFlipX, dragFlipY; // mirror state of ghost (XML flippedX/flippedY)
     private boolean panning;
     private float panLastX, panLastY;
     // two-finger gesture state (item 2): A = first finger, B = second finger
@@ -119,12 +120,16 @@ public class EditorScreen extends ScreenAdapter {
 
     // ------------------------------------------------------------ autosave (C6)
 
+    /** Autosave file: Ships/_autosave.xml in the same Show_Rocket XML format. */
+    private com.badlogic.gdx.files.FileHandle autosaveFile() {
+        com.badlogic.gdx.files.FileHandle dir = com.differentrockets.util.Res.shipsDir();
+        dir.mkdirs();
+        return dir.child("_autosave.xml");
+    }
+
     private void autosave() {
         try {
-            com.badlogic.gdx.files.FileHandle dir = Gdx.files.local("save");
-            dir.mkdirs();
-            dir.child("editor_autosave.json").writeString(design.toJson(), false);
-            dir.child("editor_autosave.name").writeString(shipName, false);
+            autosaveFile().writeString(design.toXml(shipName), false);
         } catch (Exception e) {
             Gdx.app.log("editor", "autosave failed: " + e.getMessage());
         }
@@ -132,16 +137,12 @@ public class EditorScreen extends ScreenAdapter {
 
     private void restoreAutosave() {
         try {
-            com.badlogic.gdx.files.FileHandle f = Gdx.files.local("save/editor_autosave.json");
+            com.badlogic.gdx.files.FileHandle f = autosaveFile();
             if (!f.exists()) return;
-            ShipDesign d = ShipDesign.fromJson(f.readString());
+            ShipDesign d = ShipDesign.fromXml(f.readString());
             if (d.parts.isEmpty()) return;
             this.design.copyFrom(d);
-            com.badlogic.gdx.files.FileHandle n = Gdx.files.local("save/editor_autosave.name");
-            if (n.exists()) {
-                String nm = n.readString().trim();
-                if (!nm.isEmpty()) this.shipName = nm;
-            }
+            if (d.loadedName != null && !d.loadedName.isEmpty()) this.shipName = d.loadedName;
         } catch (Exception e) {
             Gdx.app.log("editor", "autosave restore failed: " + e.getMessage());
         }
@@ -443,11 +444,19 @@ public class EditorScreen extends ScreenAdapter {
             stage.addActor(d);
         }
 
-        // --- top bar: ship name / Rotate / LAUNCH ---
+        // --- top bar: ship name / Rotate / Flip X / Flip Y / LAUNCH ---
         nameLabel = new Label(shipName, game.ui.skin);
         TextButton rotate = new TextButton("Rotate (R)", game.ui.skin);
         rotate.addListener(new ClickListener() {
             @Override public void clicked(InputEvent e, float x, float y) { rotateGhost(); }
+        });
+        TextButton flipX = new TextButton("Flip X", game.ui.skin);
+        flipX.addListener(new ClickListener() {
+            @Override public void clicked(InputEvent e, float x, float y) { flipGhostOrSelected(true); }
+        });
+        TextButton flipY = new TextButton("Flip Y", game.ui.skin);
+        flipY.addListener(new ClickListener() {
+            @Override public void clicked(InputEvent e, float x, float y) { flipGhostOrSelected(false); }
         });
         TextButton launch = new TextButton("LAUNCH >>", game.ui.skin);
         launch.addListener(new ClickListener() {
@@ -456,8 +465,10 @@ public class EditorScreen extends ScreenAdapter {
         Table bar = new Table();
         bar.setBackground(game.ui.tinted(new Color(0.09f, 0.1f, 0.15f, 0.95f)));
         bar.add(nameLabel).expandX().left().padLeft(16).height(TOP_H);
-        bar.add(rotate).width(230).height(TOP_H - 14).pad(7);
-        bar.add(launch).width(240).height(TOP_H - 14).pad(7);
+        bar.add(rotate).width(180).height(TOP_H - 14).pad(5);
+        bar.add(flipX).width(120).height(TOP_H - 14).pad(5);
+        bar.add(flipY).width(120).height(TOP_H - 14).pad(5);
+        bar.add(launch).width(200).height(TOP_H - 14).pad(5);
         Table top = new Table();
         top.setFillParent(true);
         top.top();
@@ -601,30 +612,66 @@ public class EditorScreen extends ScreenAdapter {
         content.add(b).fillX().height(ROW_H).pad(5).row();
     }
 
-    /** Saved-ship buttons inside the menu drawer (replaces the old Load dialog). */
+    /** Saved-ship buttons inside the menu drawer: Ships/*.xml (Show_Rocket
+     *  format), plus a legacy section for old JSON saves (migrates on save). */
     private void rebuildMenuList() {
         if (menuShipList == null) return;
         menuShipList.clear();
-        com.badlogic.gdx.files.FileHandle dir = Gdx.files.local("save/ships");
         boolean any = false;
+        com.badlogic.gdx.files.FileHandle dir = com.differentrockets.util.Res.shipsDir();
         if (dir.exists()) {
-            for (final com.badlogic.gdx.files.FileHandle f : dir.list(".json")) {
+            java.util.List<com.badlogic.gdx.files.FileHandle> files =
+                    new java.util.ArrayList<>();
+            for (com.badlogic.gdx.files.FileHandle f : dir.list(".xml")) {
+                if (f.nameWithoutExtension().startsWith("_")) continue; // _autosave etc.
+                files.add(f);
+            }
+            files.sort(new java.util.Comparator<com.badlogic.gdx.files.FileHandle>() {
+                public int compare(com.badlogic.gdx.files.FileHandle a,
+                                   com.badlogic.gdx.files.FileHandle b) {
+                    return a.name().compareToIgnoreCase(b.name());
+                }
+            });
+            for (final com.badlogic.gdx.files.FileHandle f : files) {
                 any = true;
-                TextButton b = new TextButton(f.nameWithoutExtension(), game.ui.skin);
+                TextButton b = new TextButton(fitText(f.nameWithoutExtension(), drawerW - 40),
+                        game.ui.skin);
                 b.addListener(new ClickListener() {
                     @Override public void clicked(InputEvent e, float x, float y) { loadShip(f); }
                 });
                 menuShipList.add(b).fillX().height(ROW_H).pad(4).row();
             }
         }
-        if (!any) menuShipList.add(new Label("(no saved ships)", game.ui.skin)).pad(8).row();
+        // legacy JSON ships (pre-XML saves): still loadable, re-saved as XML
+        com.badlogic.gdx.files.FileHandle legacy = Gdx.files.local("save/ships");
+        boolean anyLegacy = false;
+        if (legacy.exists()) {
+            for (final com.badlogic.gdx.files.FileHandle f : legacy.list(".json")) {
+                if (!anyLegacy) {
+                    menuShipList.add(new Label("LEGACY (json):", game.ui.skin)).pad(6).row();
+                    anyLegacy = true;
+                }
+                TextButton b = new TextButton(fitText(f.nameWithoutExtension(), drawerW - 40),
+                        game.ui.skin);
+                b.addListener(new ClickListener() {
+                    @Override public void clicked(InputEvent e, float x, float y) { loadShip(f); }
+                });
+                menuShipList.add(b).fillX().height(ROW_H).pad(4).row();
+            }
+        }
+        if (!any && !anyLegacy) menuShipList.add(new Label("(no saved ships)", game.ui.skin)).pad(8).row();
     }
 
     private void loadShip(com.badlogic.gdx.files.FileHandle f) {
         try {
+            String text = f.readString();
+            ShipDesign d = f.extension().equalsIgnoreCase("xml")
+                    ? ShipDesign.fromXml(text) : ShipDesign.fromJson(text);
+            if (d.parts.isEmpty()) { status("Load failed: no parts in " + f.name()); return; }
             pushHistory();
-            design.copyFrom(ShipDesign.fromJson(f.readString()));
-            shipName = f.nameWithoutExtension();
+            design.copyFrom(d);
+            shipName = d.loadedName != null && !d.loadedName.isEmpty()
+                    ? d.loadedName : f.nameWithoutExtension();
             if (nameField != null) nameField.setText(shipName);
             if (nameLabel != null) nameLabel.setText(shipName);
             selected.clear();
@@ -760,10 +807,15 @@ public class EditorScreen extends ScreenAdapter {
      */
     private Table partStageRow(final int idx) {
         PartType t = PartList.get(design.parts.get(idx).typeId);
+        ShipDesign.DesignPart dpp = design.parts.get(idx);
         final Table row = new Table();
         row.setBackground(game.ui.tinted(new Color(0.18f, 0.2f, 0.28f, 1f)));
-        Label name = new Label(fitText(t != null ? t.name : "?", stageRowWidth() - 14 - 20),
-                game.ui.skin);
+        // state display follows the XML field semantics: editorAngle / flippedX / flippedY
+        String label = t != null ? t.name : "?";
+        if (dpp.rot != 0) label += " (a" + (dpp.rot * 90) + ")";
+        if (dpp.flippedX) label += " [FX]";
+        if (dpp.flippedY) label += " [FY]";
+        Label name = new Label(fitText(label, stageRowWidth() - 14 - 20), game.ui.skin);
         row.add(name).expandX().left().padLeft(10);
         row.addListener(new InputListener() {
             private float downX, downY;
@@ -898,14 +950,55 @@ public class EditorScreen extends ScreenAdapter {
     }
 
     private void saveShip() {
+        final com.badlogic.gdx.files.FileHandle f = shipFile(shipName);
+        if (f.exists()) {
+            showOverwriteConfirm(f);
+            return;
+        }
+        writeShipXml(f);
+    }
+
+    /** Ships/<sanitized name>.xml in the resource root. */
+    private com.badlogic.gdx.files.FileHandle shipFile(String name) {
+        com.badlogic.gdx.files.FileHandle dir = com.differentrockets.util.Res.shipsDir();
+        dir.mkdirs();
+        return dir.child(name.replaceAll("[^a-zA-Z0-9_ -]", "_") + ".xml");
+    }
+
+    private void writeShipXml(com.badlogic.gdx.files.FileHandle f) {
         try {
-            com.badlogic.gdx.files.FileHandle dir = Gdx.files.local("save/ships");
-            dir.mkdirs();
-            dir.child(shipName.replaceAll("[^a-zA-Z0-9_ -]", "_") + ".json").writeString(design.toJson(), false);
-            status("Saved " + shipName);
+            f.writeString(design.toXml(shipName), false);
+            status("Saved " + f.name() + " to Ships/");
+            rebuildMenuList();
         } catch (Exception e) {
             status("Save failed: " + e.getMessage());
         }
+    }
+
+    /** Modal "file exists — overwrite?" confirmation. */
+    private void showOverwriteConfirm(final com.badlogic.gdx.files.FileHandle f) {
+        closeOverlay();
+        overlay = newOverlay();
+        Table box = new Table();
+        box.setBackground(game.ui.tinted(new Color(0.12f, 0.14f, 0.2f, 1f)));
+        box.pad(24);
+        box.add(new Label(f.name() + " already exists.", game.ui.skin)).pad(10).row();
+        box.add(new Label("Overwrite it?", game.ui.skin)).pad(6).row();
+        TextButton yes = new TextButton("Overwrite", game.ui.skin);
+        yes.addListener(new ClickListener() {
+            @Override public void clicked(InputEvent e, float x, float y) {
+                closeOverlay();
+                writeShipXml(f);
+            }
+        });
+        TextButton no = new TextButton("Cancel", game.ui.skin);
+        no.addListener(new ClickListener() {
+            @Override public void clicked(InputEvent e, float x, float y) { closeOverlay(); }
+        });
+        box.add(yes).width(300).height(64).pad(8).row();
+        box.add(no).width(300).height(56).pad(6).row();
+        overlay.add(box);
+        stage.addActor(overlay);
     }
 
     private void status(String s) {
@@ -1058,8 +1151,43 @@ public class EditorScreen extends ScreenAdapter {
         }
     }
 
+    /** Create a placed part from the current ghost state (rot + flips). */
+    private ShipDesign.DesignPart newPart(PartType t, float x, float y) {
+        ShipDesign.DesignPart dp = new ShipDesign.DesignPart(t.id, x, y, dragRot);
+        dp.flippedX = dragFlipX;
+        dp.flippedY = dragFlipY;
+        return dp;
+    }
+
     /** Diagnostic: ghost/drag rotation steps (smoke tests). */
     public int dragRotForTest() { return dragRot; }
+
+    /**
+     * Flip (XML flippedX/flippedY): with an armed placement ghost, flip the
+     * ghost; otherwise flip every selected placed part (undoable). Flips are
+     * visual mirrors — attach/snapping is unaffected (same as the sample's
+     * flipped struts/ports which connect identically).
+     */
+    private void flipGhostOrSelected(boolean xAxis) {
+        if (placing != null) {
+            if (xAxis) dragFlipX = !dragFlipX; else dragFlipY = !dragFlipY;
+            status("Ghost flip: X=" + (dragFlipX ? 1 : 0) + " Y=" + (dragFlipY ? 1 : 0));
+            return;
+        }
+        if (selected.isEmpty()) {
+            status("Nothing to flip — arm a part or select placed parts");
+            return;
+        }
+        pushHistory();
+        int n = 0;
+        for (int idx : selected) {
+            if (idx < 0 || idx >= design.parts.size()) continue;
+            ShipDesign.DesignPart dp = design.parts.get(idx);
+            if (xAxis) dp.flippedX = !dp.flippedX; else dp.flippedY = !dp.flippedY;
+            n++;
+        }
+        status("Flipped " + (xAxis ? "X" : "Y") + " on " + n + " part(s)");
+    }
 
     private class EditorInput extends InputAdapter {
         @Override
@@ -1112,7 +1240,7 @@ public class EditorScreen extends ScreenAdapter {
             if (placing != null) {
                 pushHistory();
                 Vector2 snapped = snap(w.x, w.y, dragRot, placing, -1);
-                design.parts.add(new ShipDesign.DesignPart(placing.id, snapped.x, snapped.y, dragRot));
+                design.parts.add(newPart(placing, snapped.x, snapped.y));
                 selected.clear();
                 updateDelButton();
                 design.autoStage();
@@ -1307,6 +1435,8 @@ public class EditorScreen extends ScreenAdapter {
     public void selectPart(PartType t) {
         placing = t;
         dragRot = 0;
+        dragFlipX = false;
+        dragFlipY = false;
         closeDrawers(); // free the canvas for placement
         status("Placing: " + t.name + " (R = rotate, right-click = cancel, shift = keep placing)");
     }
@@ -1332,6 +1462,8 @@ public class EditorScreen extends ScreenAdapter {
         stage.cancelTouchFocus();
         placing = t;
         dragRot = 0;
+        dragFlipX = false;
+        dragFlipY = false;
         dragOutType = t;
         dragScrX = screenX;
         dragScrY = screenY;
@@ -1377,7 +1509,7 @@ public class EditorScreen extends ScreenAdapter {
             pushHistory();
             Vector2 w = screenToWorld(screenX, screenY);
             Vector2 snapped = snap(w.x, w.y, dragRot, placing, -1);
-            design.parts.add(new ShipDesign.DesignPart(placing.id, snapped.x, snapped.y, dragRot));
+            design.parts.add(newPart(placing, snapped.x, snapped.y));
             selected.clear();
             updateDelButton();
             design.autoStage();
@@ -1467,13 +1599,13 @@ public class EditorScreen extends ScreenAdapter {
         game.batch.setProjectionMatrix(cam.combined);
         game.batch.begin();
         for (ShipDesign.DesignPart dp : design.parts) {
-            drawPart(dp.typeId, dp.x, dp.y, dp.rot, 1f);
+            drawPart(dp.typeId, dp.x, dp.y, dp.rot, dp.flippedX, dp.flippedY, 1f);
         }
         // ghost
         if (placing != null) {
             Vector2 w = screenToWorld(Gdx.input.getX(), Gdx.input.getY());
             Vector2 snapped = snap(w.x, w.y, dragRot, placing, -1);
-            drawPart(placing.id, snapped.x, snapped.y, dragRot, 0.6f);
+            drawPart(placing.id, snapped.x, snapped.y, dragRot, dragFlipX, dragFlipY, 0.6f);
             // attach markers
             game.batch.end();
             game.shapes.begin(com.badlogic.gdx.graphics.glutils.ShapeRenderer.ShapeType.Filled);
@@ -1543,7 +1675,8 @@ public class EditorScreen extends ScreenAdapter {
         return false;
     }
 
-    private void drawPart(String typeId, float x, float y, int rot, float alpha) {
+    private void drawPart(String typeId, float x, float y, int rot,
+                          boolean flipX, boolean flipY, float alpha) {
         PartType t = PartList.get(typeId);
         if (t == null) return;
         TextureRegion r = game.shipSprites.find(t.sprite);
@@ -1551,7 +1684,7 @@ public class EditorScreen extends ScreenAdapter {
         if (r != null) {
             game.batch.draw(r, x - t.width / 2f, y - t.height / 2f,
                     t.width / 2f, t.height / 2f, t.width, t.height,
-                    1f, 1f, rot * 90f);
+                    flipX ? -1f : 1f, flipY ? -1f : 1f, rot * 90f);
         } else {
             game.batch.end();
             game.shapes.begin(com.badlogic.gdx.graphics.glutils.ShapeRenderer.ShapeType.Line);

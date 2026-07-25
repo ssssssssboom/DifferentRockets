@@ -588,4 +588,33 @@ public final class Res {
         }
         return Gdx.files.internal("mods/" + name);
     }
+
+    /**
+     * The player ships directory (<root>/Ships/) holding Show_Rocket-compatible
+     * XML ship files. Falls back to the app-local "Ships" dir when the shared
+     * root is not usable yet. Created on demand by callers (mkdirs).
+     */
+    public static FileHandle shipsDir() {
+        if (external) return root.child("Ships");
+        return Gdx.files.local("Ships");
+    }
+
+    /**
+     * The player sandbox saves directory (<root>/Sandboxs/) holding
+     * Show_sandbox-compatible XML world saves. Falls back to the app-local
+     * "Sandboxs" dir when the shared root is not usable yet. Created here on
+     * demand (mkdirs, mirroring probeWritable's dir handling).
+     */
+    public static FileHandle sandboxDir() {
+        if (external) {
+            try {
+                FileHandle d = root.child("Sandboxs");
+                d.mkdirs();
+                if (d.exists() && d.isDirectory()) return d;
+            } catch (Throwable ignored) {}
+        }
+        FileHandle d = Gdx.files.local("Sandboxs");
+        try { d.mkdirs(); } catch (Throwable ignored) {}
+        return d;
+    }
 }

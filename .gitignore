@@ -31,3 +31,7 @@ bin/
 # ---- 运行时存档（桌面运行会改写，不入库） ----
 game/core/assets/save/
 /world.json
+
+# ---- 参考格式样例（版权素材，不入库） ----
+/Show_Rocket
+/Show_sandbox

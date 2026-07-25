@@ -58,6 +58,22 @@ public class Part {
     /** activation group 0 = none, 1..8 (item 6); ACTIVATE fires the whole group. */
     public int group;
 
+    /**
+     * XML flippedX / flippedY mirror flags (editor Flip X/Y, round 27).
+     * Copied from DesignPart at construction. Effects on this side:
+     *  - RENDER: SandboxScreen.drawShip mirrors the sprite via negative
+     *    batch.draw scale (reads these fields);
+     *  - PHYSICS: createBody mirrors custom ShapeDef polygons (winding
+     *    restored) so the collider matches the mirrored sprite;
+     *  - ATTACH: attachDefs() returns per-part mirrored attach points
+     *    (EDGE_LEFT<->EDGE_RIGHT / EDGE_TOP<->EDGE_BOTTOM swapped) so welds
+     *    land on the mirrored geometry.
+     */
+    public boolean flippedX, flippedY;
+
+    /** Per-part mirrored attach defs, built lazily when flipped. */
+    private List<AttachPoint> mirroredAttach;
+
     // flame fx for this frame (set via Lua emitFlame)
     public float flameLevel;         // 0 = none, ~1 = full
     public float flameGimbalDeg;
@@ -78,6 +94,8 @@ public class Part {
         this.ship = ship;
         this.design = design;
         this.api = new ModApi(this);
+        this.flippedX = design.flippedX;
+        this.flippedY = design.flippedY;
         if (type.tank != null) this.fuel = type.tank.fuel;
     }
 
@@ -112,8 +130,13 @@ public class Part {
         for (PartType.ShapeDef sd : shapes) {
             int n = Math.min(sd.verts.size(), 8);
             Vector2[] vs = new Vector2[n];
+            // flippedX/flippedY mirror the polygon (round 27): negate the
+            // mirrored axis. A single-axis mirror flips the winding, so the
+            // vertex order is reversed in that case to keep CCW for Box2D.
+            boolean rev = flippedX ^ flippedY;
             for (int i = 0; i < n; i++) {
-                vs[i] = new Vector2(sd.verts.get(i).x, sd.verts.get(i).y);
+                PartType.Vertex sv = sd.verts.get(rev ? n - 1 - i : i);
+                vs[i] = new Vector2(flippedX ? -sv.x : sv.x, flippedY ? -sv.y : sv.y);
             }
             PolygonShape ps = new PolygonShape();
             ps.set(vs);
@@ -243,10 +266,46 @@ public class Part {
 
     /** World-space attach segment (item 5): endpoints of the attach edge. */
     public void attachWorldSegment(int index, Vector2 outA, Vector2 outB) {
-        Attach.localSegment(type, type.attach.get(index), outA, outB);
+        Attach.localSegment(type, attachDefs().get(index), outA, outB);
         outA.set(body.getWorldPoint(outA));
         outB.set(body.getWorldPoint(outB));
     }
 
-    public List<AttachPoint> attachDefs() { return type.attach; }
+    /**
+     * Attach definitions of this part. Normally the shared type list; when
+     * flippedX/flippedY is set (round 27) a per-part MIRRORED copy is built
+     * once: point coordinates negated on the mirrored axis and edge locations
+     * swapped (EDGE_LEFT<->EDGE_RIGHT for flipX, EDGE_TOP<->EDGE_BOTTOM for
+     * flipY), so welding follows the mirrored sprite/collider.
+     */
+    public List<AttachPoint> attachDefs() {
+        if (!flippedX && !flippedY) return type.attach;
+        if (mirroredAttach == null) {
+            mirroredAttach = new ArrayList<>(type.attach.size());
+            for (AttachPoint ap : type.attach) {
+                AttachPoint m = new AttachPoint();
+                m.x = flippedX ? -ap.x : ap.x;
+                m.y = flippedY ? -ap.y : ap.y;
+                m.fuelLine = ap.fuelLine;
+                m.breakAngle = ap.breakAngle;
+                m.breakForce = ap.breakForce;
+                m.group = ap.group;
+                m.flipX = ap.flipX;
+                m.order = ap.order;
+                m.edge = mirrorEdge(ap.edge);
+                mirroredAttach.add(m);
+            }
+        }
+        return mirroredAttach;
+    }
+
+    private int mirrorEdge(int edge) {
+        switch (edge) {
+            case AttachPoint.EDGE_LEFT:   return flippedX ? AttachPoint.EDGE_RIGHT : edge;
+            case AttachPoint.EDGE_RIGHT:  return flippedX ? AttachPoint.EDGE_LEFT : edge;
+            case AttachPoint.EDGE_TOP:    return flippedY ? AttachPoint.EDGE_BOTTOM : edge;
+            case AttachPoint.EDGE_BOTTOM: return flippedY ? AttachPoint.EDGE_TOP : edge;
+            default: return edge;
+        }
+    }
 }

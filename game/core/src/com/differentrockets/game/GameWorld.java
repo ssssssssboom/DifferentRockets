@@ -84,6 +84,23 @@ public class GameWorld {
     public int warp = 1;          // 1, 2, 4
     public boolean paused;
 
+    /**
+     * Sandbox-entry state reset (user request): every time the sandbox screen
+     * is ENTERED (launch, continue/load — NOT on in-sandbox ship switches,
+     * which use setActive) the sim starts clean: warp back to 1x and any
+     * pre-computed super-warp trajectory dropped (wtCount=0 forces a fresh
+     * compute from the live state if the player warps again), throttle 0,
+     * steering ring inactive with no held turn button. Called from
+     * SandboxScreen.show().
+     */
+    public void resetEntryState() {
+        warp = 1;
+        wtCount = 0;             // super-warp trajectory invalidated
+        inputThrottle = 0;
+        SteeringIO.ringActive = false;
+        SteeringIO.buttonTurn = 0;
+    }
+
     // steering ring (item 4): PI heading controller
     /** Target ship heading in body-angle convention (radians, CCW from "up"). */
     public double targetHeading;
@@ -390,6 +407,9 @@ public class GameWorld {
     /** Make a ship the active one: re-anchor the floating origin on it. */
     public void setActive(Ship s) {
         if (s == null) return;
+        // leaving a ship freezes its throttle where it is (same semantics as
+        // a stage split): its engines keep that setting until we switch back
+        if (active != null && active != s) active.latchedThrottle = inputThrottle;
         active = s;
         reanchorToActive();
         updateRailsFlags();

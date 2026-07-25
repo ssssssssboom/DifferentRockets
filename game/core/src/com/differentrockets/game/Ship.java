@@ -42,6 +42,14 @@ public class Ship {
     public final List<Part> parts = new ArrayList<>();
     public final List<Link> links = new ArrayList<>();
     /**
+     * Throttle frozen at the moment this ship was cut loose (round 27):
+     * a detached stage keeps burning at the throttle it had at separation;
+     * later player throttle moves only affect the ACTIVE ship. -1 = follow
+     * the live player throttle (initial value; latched on split / ship
+     * switch). Read by ModApi.getThrottle.
+     */
+    public double latchedThrottle = -1;
+    /**
      * Legacy design stage list (design-part indices). Still loaded/saved for
      * backward compatibility, but STAGE activation is group-number based now
      * (see activateStage); this no longer drives anything.
@@ -331,6 +339,8 @@ public class Ship {
             Ship ns = new Ship(world);
             ns.origin.set(this.origin);
             ns.originVel.set(this.originVel);
+            // freeze the fragment's throttle at the separation instant
+            ns.latchedThrottle = world.inputThrottle;
             List<Part> moving = new ArrayList<>();
             for (Part p : parts) if (comp.get(p) == c) moving.add(p);
             for (Part p : moving) {
@@ -623,10 +633,13 @@ public class Ship {
         // snapshot targets BEFORE firing: a detacher's onStage defers joint
         // destruction + ship split, which mutates `parts` after we return —
         // resolving the group to references first keeps every member reachable.
-        // Order within the stage (round 26): DETACHERS FIRE LAST. The parts
-        // being dropped (engines, tanks...) must complete their onStage
-        // first, so a staged-away engine is already burning at the instant
-        // the cut happens instead of waking up dead.
+        // QUEUE semantics (round 27, owner ruling): the stage opens a queue and
+        // every part's full response is activated one by one — DETACHERS ALWAYS
+        // LAST. Non-detacher parts not only get onStage here: when the stage
+        // also contains a detacher, they get one full script frame
+        // (updateScripts) BEFORE the cut, so a staged-away engine is already
+        // RUNNING (thrust applied, flameLevel lit) at the separation instant
+        // instead of waking up dead on the dropped stage.
         List<Part> targets = new ArrayList<>();
         List<Part> detachers = new ArrayList<>();
         for (Part p : parts) {
@@ -635,8 +648,14 @@ public class Ship {
                 else targets.add(p);
             }
         }
-        targets.addAll(detachers);
         for (Part p : targets) {
+            if (p.body == null || p.ship == null || !p.ship.parts.contains(p)) continue;
+            p.callOnStage();
+        }
+        if (!targets.isEmpty() && !detachers.isEmpty()) {
+            updateScripts(GameWorld.PHYS_DT); // complete their response pre-cut
+        }
+        for (Part p : detachers) {
             if (p.body == null || p.ship == null || !p.ship.parts.contains(p)) continue;
             p.callOnStage();
         }

@@ -82,8 +82,19 @@ public class ModApi {
     // ---------- input ----------
     /** -1 = turn left, 0, +1 = turn right. This is the steering turn command. */
     public double getTurn() { return world().inputTurn; }
-    /** 0..1 throttle. */
-    public double getThrottle() { return world().inputThrottle; }
+    /**
+     * 0..1 throttle. Only the ACTIVE ship sees the live player throttle
+     * (round 27): a ship that was split off (or left via ship-switch) reads
+     * its latched value — the throttle frozen at the moment it was cut
+     * loose — so detached stages keep their separation-instant burn and
+     * later throttle moves no longer reach them.
+     */
+    public double getThrottle() {
+        GameWorld w = world();
+        if (part.ship == null || part.ship == w.active) return w.inputThrottle;
+        double l = part.ship.latchedThrottle;
+        return l >= 0 ? l : w.inputThrottle;
+    }
     /** true only on the frame a stage was activated. */
     public boolean isStageActivated() { return part.stageActivatedThisFrame; }
     /** current stage index the ship is on. */
@@ -108,9 +119,14 @@ public class ModApi {
      * angle errors must be wrapped to [-pi, pi] (see control.lua).
      */
     public org.luaj.vm2.LuaTable getSteering() {
+        // Player input only reaches the ACTIVE ship (round 27): non-active
+        // ships' engines keep running (at their latched throttle) but see
+        // "no input" here, so their gimbals center instead of following the
+        // player's buttons/ring.
+        boolean ownShip = part.ship == null || part.ship == world().active;
         org.luaj.vm2.LuaTable t = new org.luaj.vm2.LuaTable();
-        t.set("active", org.luaj.vm2.LuaValue.valueOf(SteeringIO.ringActive));
-        t.set("buttonTurn", SteeringIO.buttonTurn);
+        t.set("active", org.luaj.vm2.LuaValue.valueOf(ownShip && SteeringIO.ringActive));
+        t.set("buttonTurn", ownShip ? SteeringIO.buttonTurn : 0);
         t.set("targetRad", SteeringIO.targetHeadingRad);
         return t;
     }

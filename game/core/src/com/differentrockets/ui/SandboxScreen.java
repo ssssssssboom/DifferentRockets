@@ -164,6 +164,13 @@ public class SandboxScreen extends ScreenAdapter {
 
     @Override
     public void show() {
+        // sandbox-entry reset (user request): warp 1x (+ stale super-warp
+        // trajectory dropped), throttle 0, steering ring inactive — on EVERY
+        // entry path (launch, continue/load); in-sandbox ship switches don't
+        // come through here and keep the current state
+        game.world.resetEntryState();
+        slewDir = 0;
+        ringDrag = false;
         stage = new Stage(new ScreenViewport());
         buildHud();
         InputMultiplexer mux = new InputMultiplexer();

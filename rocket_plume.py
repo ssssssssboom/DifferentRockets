@@ -1,86 +1,62 @@
 """
 火箭发动机排气形态二维可视化工具
 =====================================
-输入: 推力(kN) + 大气密度(kg/m³) + 喷管参数
-输出: 排气羽流GIF动画
-
 物理模型:
-  1. 通过推力方程迭代求解室压 P_c 和出口压力 P_e
-  2. 基于 P_e / P_a 判断欠膨胀/过膨胀/完美膨胀
-  3. 使用激波单元模型构建波系结构（激波钻石 / Mach diamonds）
-  4. 密度场 → 亮度映射（gamma校正 + 阈值截断）
-  5. 添加动态效应：剪切层不稳定性、湍流混合、激波振荡
-  6. 输出二维GIF动画
+  1. 推力方程 → 迭代求解室压 P_c、出口马赫数 M_e、出口压力 P_e
+  2. P_e/P_a 判断膨胀状态，Prandtl-Meyer 计算羽流边界扩张角
+  3. 连续高斯径向密度场 + 轴向 sawtooth 激波调制（激波=陡升，膨胀=渐变）
+  4. 密度² → 亮度，黑体辐射色温 → RGB 颜色映射
+  5. 剪切层湍流、下游耗散、Mach 盘增强
+  6. 80 帧动画，阈值截断确保尾焰在视窗内
 """
 
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib.colors import LinearSegmentedColormap
 from PIL import Image
 from scipy.ndimage import gaussian_filter
 
-# ============================================================
-# 物理常数与默认参数
-# ============================================================
-GAMMA = 1.3          # 燃气比热比
-R_AIR = 287.058      # 空气气体常数 J/(kg·K)
-T_AMBIENT = 288.15   # 环境标准温度 K
+GAMMA = 1.3
+R_AIR = 287.058
+T_AMBIENT = 288.15
 
 
 # ============================================================
-#  一、 喷管理论：室压与出口条件求解
+# 一、喷管理论求解
 # ============================================================
 
 def solve_exit_mach(epsilon, gamma=GAMMA):
-    """
-    通过面积比 epsilon = A_e/A_t 反推出口马赫数 M_e（超音速分支）
-    等熵面积比公式: ε = 1/M * [2/(γ+1) * (1+(γ-1)/2·M²)]^((γ+1)/2(γ-1))
-    使用二分法迭代
-    """
     if epsilon <= 1.0:
         return 1.0
     lo, hi = 1.0, 15.0
     for _ in range(120):
-        mid = (lo + hi) / 2
-        f = (2.0 / (gamma + 1) * (1 + (gamma - 1) / 2 * mid**2)) ** ((gamma + 1) / (2 * (gamma - 1)))
-        eps_calc = f / mid
-        if eps_calc < epsilon:
+        mid = (lo + hi) / 2.0
+        f = (2 / (gamma + 1) * (1 + (gamma - 1) / 2 * mid**2)) ** ((gamma + 1) / (2 * (gamma - 1)))
+        if f / mid < epsilon:
             lo = mid
         else:
             hi = mid
-    return (lo + hi) / 2
+    return (lo + hi) / 2.0
 
 
 def exit_pressure_ratio(M_e, gamma=GAMMA):
-    """P_e / P_c 等熵关系"""
     return (1 + (gamma - 1) / 2 * M_e**2) ** (-gamma / (gamma - 1))
 
 
 def thrust_coeff(M_e, Pe_Pc, Pa_Pc, epsilon, gamma=GAMMA):
-    """推力系数 C_F = 速度项 + 压力项"""
-    speed_term = np.sqrt(
-        2 * gamma**2 / (gamma - 1)
-        * (2 / (gamma + 1)) ** ((gamma + 1) / (gamma - 1))
-        * (1 - Pe_Pc ** ((gamma - 1) / gamma))
-    )
-    pressure_term = (Pe_Pc - Pa_Pc) * epsilon
-    return speed_term + pressure_term
+    speed = np.sqrt(2 * gamma**2 / (gamma - 1)
+                    * (2 / (gamma + 1)) ** ((gamma + 1) / (gamma - 1))
+                    * (1 - Pe_Pc ** ((gamma - 1) / gamma)))
+    pressure = (Pe_Pc - Pa_Pc) * epsilon
+    return speed + pressure
 
 
 def solve_chamber(thrust_N, A_t, epsilon, P_a, gamma=GAMMA):
-    """
-    迭代求解室压 P_c、出口马赫数 M_e、出口压力比 P_e/P_c
-    关系: F = C_F · P_c · A_t
-    """
     M_e = solve_exit_mach(epsilon, gamma)
     Pe_Pc = exit_pressure_ratio(M_e, gamma)
-
-    # 真空近似初始值
     Cf_vac = thrust_coeff(M_e, Pe_Pc, 0.0, epsilon, gamma)
     P_c = thrust_N / (Cf_vac * A_t)
-
     for _ in range(200):
         Pa_Pc = P_a / P_c
         Cf = thrust_coeff(M_e, Pe_Pc, Pa_Pc, epsilon, gamma)
@@ -92,11 +68,10 @@ def solve_chamber(thrust_N, A_t, epsilon, P_a, gamma=GAMMA):
 
 
 # ============================================================
-#  二、 Prandtl-Meyer 函数与膨胀波计算
+# 二、Prandtl-Meyer 膨胀
 # ============================================================
 
 def prandtl_meyer_deg(M, gamma=GAMMA):
-    """Prandtl-Meyer 函数（度）"""
     if M <= 1.0:
         return 0.0
     c = np.sqrt((gamma + 1) / (gamma - 1))
@@ -105,173 +80,216 @@ def prandtl_meyer_deg(M, gamma=GAMMA):
 
 
 def expansion_mach(P1, P2, M1, gamma=GAMMA):
-    """已知 M1 和压力 P1→P2，等熵膨胀求 M2"""
     P0_P1 = (1 + (gamma - 1) / 2 * M1**2) ** (gamma / (gamma - 1))
     P0_P2 = P0_P1 * P1 / P2
     if P0_P2 <= 1.0:
         return 10.0
-    M2_sq = ((P0_P2 ** ((gamma - 1) / gamma)) - 1) * 2 / (gamma - 1)
+    M2_sq = (P0_P2 ** ((gamma - 1) / gamma) - 1) * 2 / (gamma - 1)
     return np.sqrt(max(M2_sq, 1.001))
 
 
 # ============================================================
-#  三、 羽流密度场：激波钻石结构
+# 三、羽流密度/温度/亮度场 —— 核心模型
 # ============================================================
 
 def generate_plume_field(P_e, P_a, M_e, r_exit, gamma=GAMMA,
-                         nx=400, ny=900, L_factor=32.0):
+                          nx=500, ny=1100, L_factor=35.0):
     """
-    构建二维羽流密度场（解析激波单元模型）
+    构建连续密度场 ρ(x, r) 和温度场 T(x, r)
 
-    返回: X, Y, field, cell_length
-      - field: [nx, ny] 归一化伪密度，0~1
-      - cell_length: 激波单元间距
+    关键改进:
+      - 径向: 高斯分布，宽度 σ(x) 随下游线性增长
+      - 轴向基态: 幂律衰减
+      - 激波调制: sawtooth（压缩=陡升，膨胀=缓降），震荡幅度按 e^(-αx) 衰减
+      - 沿轴线 Mach 盘: 窄而强的高密度尖峰
+      - 剪切层: 径向梯度区标记
+
+    返回: X, Y, density, temperature, cell_length
     """
     L = r_exit * L_factor
-    half = r_exit * 4.0
-
+    half = r_exit * 4.5
     x = np.linspace(0, L, ny)
     y = np.linspace(-half, half, nx)
     X, Y = np.meshgrid(x, y)
-    field = np.zeros_like(X)
+    R = np.abs(Y)
 
     D_j = 2 * r_exit
-    PR = P_e / P_a  # 压力比
+    PR = P_e / P_a
 
-    # ---------- 激波单元长度 ----------
-    if abs(PR - 1.0) < 0.02:
-        cell_length = L * 10  # 无显著激波
-    elif PR > 1.0:
-        cell_length = D_j * 0.68 * np.sqrt(PR - 1)
-        cell_length = max(cell_length, D_j * 0.25)
-    else:
-        cell_length = D_j * 0.68 * np.sqrt(1.0 / PR - 1)
-        cell_length = max(cell_length, D_j * 0.25)
-
-    # ---------- 激波强度因子 ----------
-    if M_e > 1.0:
-        rho_ratio = (gamma + 1) * M_e**2 / (2 + (gamma - 1) * M_e**2)
-    else:
-        rho_ratio = 1.0
-    shock_strength = (rho_ratio - 1) / (rho_ratio + 1)  # 0~1
-
-    # 膨胀转向角 (欠膨胀)
+    # ---- 羽流边界扩张角 (Prandtl-Meyer) ----
     if PR > 1.05:
         M_match = expansion_mach(P_e, P_a, M_e, gamma)
-        turn_angle = max(np.radians(prandtl_meyer_deg(M_match, gamma) -
-                                    prandtl_meyer_deg(M_e, gamma)), 0.03)
+        turn_deg = prandtl_meyer_deg(M_match, gamma) - prandtl_meyer_deg(M_e, gamma)
+        theta_boundary = max(np.radians(turn_deg) * 0.65, 0.04)  # 半角约 0.65×PM 角
     elif PR < 0.95:
-        turn_angle = -0.04
+        theta_boundary = -0.03
     else:
-        turn_angle = 0.0
+        theta_boundary = 0.01
 
-    n_cells = int(L / cell_length) + 2
+    # ---- 激波单元长度 ----
+    if abs(PR - 1.0) < 0.02:
+        cell_length = L * 5.0
+    elif PR > 1.0:
+        cell_length = D_j * 0.72 * np.sqrt(PR - 1)
+        cell_length = max(cell_length, D_j * 0.2)
+    else:
+        cell_length = D_j * 0.72 * np.sqrt(1.0 / PR - 1)
+        cell_length = max(cell_length, D_j * 0.2)
 
-    for k in range(n_cells):
-        x0 = k * cell_length
-        if x0 > L:
-            break
+    # ---- 径向展宽 σ(x) ----
+    sigma_0 = r_exit * 0.42          # 初始高斯宽度
+    spread_rate = np.tan(theta_boundary + 0.04) * 0.7
+    sigma_x = sigma_0 + spread_rate * X
 
-        # 当前激波单元羽流半径（逐渐膨胀/收缩）
-        r_cur = r_exit * (1.0 + 0.25 * k * np.tan(abs(turn_angle) + 0.06))
-        decay = np.exp(-0.28 * k)  # 下游衰减
+    # ---- 轴向基态密度（无激波调制时） ----
+    # 中心线密度随距离衰减: ρ_axis ~ 1/(1 + x/L_decay)^0.7
+    L_decay = D_j * 8.0
+    rho_axis_base = 1.0 / (1.0 + X / L_decay) ** 0.7
 
-        # ---------- 膨胀区 (0 → ~55%) ----------
-        x_mid = x0 + cell_length * 0.55
-        m_exp = (X >= x0) & (X < x_mid)
+    # 径向高斯剖面
+    rho_base = rho_axis_base * np.exp(-R**2 / (2 * sigma_x**2 + 1e-9))
 
-        r_norm = np.clip(np.abs(Y) / max(r_cur, 1e-6), 0, 3)
-        radial = np.exp(-3.5 * r_norm**4)
+    # ---- 激波调制 (sawtooth) ----
+    # 相位: φ = (x / cell_len) mod 1
+    phi = (X / cell_length) % 1.0
+    # sawtooth: 0→1 急升（激波），1→0 缓降（膨胀）
+    saw = 1.0 - phi
+    # 振幅随下游指数衰减
+    amp_envelope = np.exp(-0.045 * X / D_j)
+    # 只在羽流核心区调制（不在远端环境）
+    sigma_amp = sigma_0 + spread_rate * 2.0 * X   # 调制作用范围比羽流本体窄
+    radial_mod_mask = np.exp(-R**2 / (2 * sigma_amp**2 + 1e-9))
+    # 峰值调制幅度（与压力比相关）
+    modulation_depth = np.clip(abs(PR - 1.0) * 0.35, 0.05, 0.55)
+    shock_mod = 1.0 + modulation_depth * saw * amp_envelope * radial_mod_mask
 
-        x_rel = np.clip((X - x0) / max(x_mid - x0, 1e-6), 0, 1)
-        dens_exp = (1.0 - 0.55 * x_rel) * radial
-        field[m_exp] += dens_exp[m_exp] * max(decay, 0.04)
+    # ---- Mach 盘增强（轴线上窄而强的高密度峰） ----
+    disk_width_ratio = 0.018
+    sigma_disk = cell_length * disk_width_ratio
+    # 每个激波单元的上升沿位置
+    x_shocks = (np.arange(0, L / cell_length + 1) + 0.02) * cell_length
+    x_shocks = x_shocks[x_shocks < L]
+    disk_enhance = np.zeros_like(X)
+    for xs in x_shocks:
+        disk_enhance += np.exp(-(X - xs)**2 / (2 * sigma_disk**2))
+    disk_radial = np.exp(-R**2 / (2 * (r_exit * 0.28)**2 + 1e-9))
+    disk_contrib = disk_enhance * disk_radial * modulation_depth * 2.5 * amp_envelope
 
-        # ---------- 斜激波/压缩区 ----------
-        sw = cell_length * 0.07
-        m_shock = (X >= x_mid - sw) & (X <= x_mid + sw * 3.5)
+    # ---- 合成密度场 ----
+    density = rho_base * shock_mod + disk_contrib
 
-        xs = (X - x_mid) / max(sw, 1e-6)
-        shock_prof = np.exp(-xs**2 / 0.4) * decay * (1.0 + shock_strength * 2.5)
+    # ---- 温度场（等熵关系：T ~ ρ^(γ-1)） ----
+    # 高密度区（激波后）温度更高
+    T_base = (1 + (gamma - 1) / 2 * M_e**2) ** (-1)  # 出口温度/总温
+    # 局部温度: T/T_total ≈ (ρ/ρ_total)^(γ-1)（近似）
+    temperature = T_base * density ** (gamma - 1)
+    # 环境低温
+    temperature = np.where(density < 1e-4, 0.001, temperature)
 
-        r_n_s = np.clip(np.abs(Y) / max(r_cur * 0.85, 1e-6), 0, 3)
-        radial_s = np.exp(-2.5 * r_n_s**3)
+    # ---- 归一化 ----
+    d_max = density.max()
+    if d_max > 0:
+        density = density / d_max
+    t_max = temperature.max()
+    if t_max > 0:
+        temperature = temperature / t_max
 
-        field[m_shock] += shock_prof[m_shock] * radial_s[m_shock]
-
-        # ---------- Mach 盘（轴线正激波） ----------
-        m_disk = (np.abs(X - x_mid) < cell_length * 0.018) & \
-                 (np.abs(Y) < r_cur * 0.32)
-
-        dy = np.abs(Y) / max(r_cur * 0.32, 1e-6)
-        dx = (X - x_mid) / max(cell_length * 0.018, 1e-6)
-        disk = np.exp(-dx**2) * np.exp(-dy**2)
-        field[m_disk] += disk[m_disk] * shock_strength * 3.5 * decay
-
-    # 环境基线
-    field = np.where(field < 1e-4, 2e-5, field)
-    fmax = field.max()
-    if fmax > 0:
-        field /= fmax
-
-    return X, Y, field, cell_length
+    return X, Y, density, temperature, cell_length, theta_boundary
 
 
 # ============================================================
-#  四、 亮度映射 — 密度场 → 视觉亮度
+# 四、亮度 → RGB 颜色（直接映射，无 alpha）
 # ============================================================
 
-def field_to_brightness(field, intensity=2.8, gamma_corr=0.55,
-                         threshold=0.005):
+def compute_rgb_image(density, temperature):
     """
-    密度场 → 亮度 [0, 1]
-    阈值截断确保尾焰可视化范围局限于绘制区域内。
+    density: [nx, ny] 归一化密度 0-1
+    temperature: [nx, ny] 归一化温度 0-1
+    返回 RGB [nx, ny, 3]，uint8 [0, 255]
+
+    步骤:
+      1. brightness = sqrt(density)  提升中低密度可见度
+      2. 5 段渐变: 黑 → 暗红 → 橙红 → 橙黄 → 白
+      3. 温度高 → 偏白/蓝白; 温度低 → 偏红
     """
-    visible = field > threshold
-    adj = np.where(visible, field, 0.0)
-    bright = np.power(adj, gamma_corr) * intensity
-    return np.clip(bright, 0, 1)
+    # 亮度曲线: 开方而非平方，让中低密度也可见
+    b = np.power(np.clip(density, 0, 1), 0.5)
+    t = np.clip(temperature, 0, 1)
+
+    # 分段颜色映射: b=0黑 → b≈0.3暗红 → b≈0.6橙 → b≈0.85黄 → b=1白
+    r = np.where(b < 0.25, b / 0.25 * 0.55,
+         np.where(b < 0.55, 0.55 + (b - 0.25) / 0.30 * 0.45,
+         np.where(b < 0.85, 1.0,
+         1.0)))
+    g = np.where(b < 0.25, (b / 0.25) ** 2 * 0.08,
+         np.where(b < 0.55, 0.08 + (b - 0.25) / 0.30 * 0.42,
+         np.where(b < 0.85, 0.50 + (b - 0.55) / 0.30 * 0.50,
+         1.0)))
+    bl = np.where(b < 0.25, 0.0,
+          np.where(b < 0.55, (b - 0.25) / 0.30 * 0.06,
+          np.where(b < 0.85, 0.06 + (b - 0.55) / 0.30 * 0.24,
+          np.where(b < 0.95, 0.30 + (b - 0.85) / 0.10 * 0.70,
+          1.0))))
+
+    # 温度修正: 高温增加蓝/绿成分（激波后更白更亮）
+    r = np.clip(r + 0.15 * t, 0, 1)
+    g = np.clip(g + 0.18 * t, 0, 1)
+    bl = np.clip(bl + 0.25 * t, 0, 1)
+
+    rgb = np.stack([r, g, bl], axis=-1)
+    rgb_uint8 = (rgb * 255).clip(0, 255).astype(np.uint8)
+    return rgb_uint8
 
 
 # ============================================================
-#  五、 动态效应
+# 五、动态效应
 # ============================================================
 
-def add_dynamics(field, X, Y, t, r_exit, cell_length, PR):
+def add_dynamics(density, X, Y, t, r_exit, cell_length, theta_boundary):
     """
-    添加时变效应：
-      - 剪切层 Kelvin-Helmholtz 波
-      - 下游湍流增长
-      - 随机扰动
+    时变效应:
+      - 剪切层 Kelvin-Helmholtz 行波
+      - 下游湍流强度递增
+      - 激波位置微幅振荡
     """
-    fd = field.copy()
-    two_pi_t = 2 * np.pi * t
-    nx, ny = field.shape
+    fd = density.copy()
+    nx, ny = fd.shape
+    phase = 2 * np.pi * t
+    D_j = 2 * r_exit
 
-    # 剪切层行波
+    # ---- 剪切层行波 ----
+    spread_rate = np.tan(theta_boundary + 0.04) * 0.7
+    sigma_x = r_exit * 0.42 + spread_rate * X
     for i in range(nx):
         yv = Y[i, 0]
-        rn = abs(yv) / max(r_exit * 1.4, 1e-6)
-        if rn < 0.55 or rn > 1.5:
+        rn = abs(yv) / max(sigma_x[i, :].mean(), 1e-9)
+        # 只扰动剪切层边界附近（rn≈2~4）
+        mask_row = (rn > 1.5) & (rn < 4.5)
+        if not mask_row.any():
             continue
-        kx = 3.5 * np.pi / max(cell_length, 1e-6)
-        phase = kx * X[i, :] - two_pi_t * 2.3
-        wave = 0.022 * np.sin(phase) * np.exp(-3.0 * (rn - 1.05) ** 2)
-        fd[i, :] += wave
+        k = 2.5 * np.pi / max(cell_length, 1e-6)
+        wave_phase = k * X[i, :] - phase * 2.5
+        wave = 0.018 * np.sin(wave_phase) * np.exp(-(rn - 2.5)**2 / 0.6)
+        fd[i, mask_row] += wave[mask_row]
 
-    # 下游湍流（越远越强）
-    seed = int(t * 12345) % (2**31 - 1)
+    # ---- 下游湍流 ----
+    seed = int(t * 13131) % (2**31 - 1)
     np.random.seed(seed)
-    noise = np.random.randn(nx, ny) * 0.006
-    noise = gaussian_filter(noise, sigma=1.8)
-
+    noise = np.random.randn(nx, ny) * 0.007
+    noise = gaussian_filter(noise, sigma=2.2)
     x_norm = X / max(X.max(), 1e-6)
-    downstream = np.sqrt(x_norm)
+    downstream_weight = np.sqrt(x_norm) * 2.0
+    mask = fd > 0.006
+    fd[mask] += noise[mask] * (1.0 + downstream_weight[mask])
 
-    mask = fd > 0.008
-    fd[mask] += noise[mask] * (1.0 + downstream[mask] * 2.5)
+    # ---- 激波位置微幅振荡 ----
+    # 通过相位偏移模拟
+    osc_amplitude = 0.012 * np.sin(phase * 1.3)
+    # 用 X 方向梯度近似
+    grad_x = np.gradient(fd, axis=1)
+    fd += osc_amplitude * grad_x * np.exp(-(X / (D_j * 15))**2)
+
     fd = np.clip(fd, 0, None)
-
     fmax = fd.max()
     if fmax > 0:
         fd /= fmax
@@ -279,151 +297,120 @@ def add_dynamics(field, X, Y, t, r_exit, cell_length, PR):
 
 
 # ============================================================
-#  六、 渲染：matplotlib → RGBA numpy
+# 六、渲染
 # ============================================================
 
-def _plume_cmap():
-    """暗黑 → 深红 → 橙 → 黄 → 白"""
-    nodes = [
-        (0.00, (0.02, 0.00, 0.02)),
-        (0.06, (0.18, 0.00, 0.06)),
-        (0.22, (0.65, 0.06, 0.00)),
-        (0.42, (0.92, 0.28, 0.02)),
-        (0.58, (1.00, 0.55, 0.08)),
-        (0.74, (1.00, 0.78, 0.15)),
-        (0.88, (1.00, 0.92, 0.50)),
-        (1.00, (1.00, 1.00, 0.98)),
-    ]
-    return LinearSegmentedColormap.from_list(
-        "rocket_plume", [(p, c) for p, c in nodes]
-    )
+def render_frame(rgb_uint8, extent, r_exit, target_w=540, target_h=900):
+    """
+    rgb_uint8: [nx, ny, 3] uint8 RGB (ny=轴向, nx=径向)
+    使用 PIL 缩放到目标尺寸，叠加喷管出口。
+    返回 uint8 RGB [target_h, target_w, 3]。
+    """
+    from PIL import Image, ImageDraw
 
+    nx, ny = rgb_uint8.shape[:2]
+    # rgb_uint8 shape: (nx_radial, ny_axial, 3)
+    # PIL expects (width, height) = (ny, nx)
+    pil_img = Image.fromarray(rgb_uint8.transpose(1, 0, 2))
+    pil_img = pil_img.resize((target_w, target_h), Image.BILINEAR)
 
-def render_frame(brightness, extent, r_exit,
-                 figsize=(6, 10), dpi=90):
-    """渲染单帧 → uint8 RGB [H, W, 3]"""
-    cmap = _plume_cmap()
+    # 喷管出口: 在底部中央画灰色矩形
+    draw = ImageDraw.Draw(pil_img)
+    # 像素坐标换算
+    x_range = extent[1] - extent[0]
+    y_range = extent[3] - extent[2]
+    nozzle_top_px = int((0 - extent[2]) / y_range * target_h)
+    nozzle_half_px = int(r_exit / y_range * target_h)
+    nozzle_width_px = max(8, target_w // 50)
 
-    fig, ax = plt.subplots(figsize=figsize, dpi=dpi,
-                           facecolor=(0, 0, 0))
-    ax.set_facecolor((0, 0, 0))
+    y0 = nozzle_top_px - nozzle_half_px
+    y1 = nozzle_top_px + nozzle_half_px
+    x0 = target_w - nozzle_width_px
+    x1 = target_w
 
-    ax.imshow(brightness, cmap=cmap, origin="lower",
-              aspect="auto", extent=extent,
-              interpolation="bilinear")
+    draw.rectangle([x0, y0, x1, y1], fill=(65, 65, 75), outline=(150, 150, 160), width=2)
+    draw.line([(x0, y0), (x0, y1)], fill=(200, 200, 210), width=3)
 
-    # 喷管出口示意
-    nozzle_x = -extent[1] * 0.015
-    rect = plt.Rectangle(
-        (nozzle_x, -r_exit), -nozzle_x, 2 * r_exit,
-        facecolor=(0.25, 0.25, 0.30),
-        edgecolor=(0.55, 0.55, 0.60), linewidth=2, zorder=10,
-    )
-    ax.add_patch(rect)
-    ax.plot([0, 0], [-r_exit, r_exit], color=(0.8, 0.8, 0.85),
-            linewidth=3, zorder=11)
-
-    ax.set_xlim(extent[0], extent[1])
-    ax.set_ylim(extent[2], extent[3])
-    ax.axis("off")
-    ax.set_aspect("equal")
-
-    fig.tight_layout(pad=0.3)
-    fig.canvas.draw()
-    w, h = fig.canvas.get_width_height()
-    img = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8).reshape(h, w, 3)
-    plt.close(fig)
-    return img
+    return np.array(pil_img)
 
 
 # ============================================================
-#  七、 主程序：交互输入 → 计算 → GIF
+# 七、主程序
 # ============================================================
 
 def main():
     print("=" * 60)
-    print("  火箭发动机排气形态二维可视化")
     print("  Rocket Engine Exhaust Plume 2D Visualization")
     print("=" * 60)
 
-    # ----- 输入 -----
-    thrust_str = input(
-        "\n推力 [kN] (默认 1000, 类似 Merlin 1D): "
-    ).strip()
-    thrust_N = float(thrust_str or 1000) * 1000.0
+    # 获取用户输入
+    try:
+        thrust_N = float(input("\nThrust [kN] (default 1000): ") or 1000) * 1000.0
+        rho_atm  = float(input("Atmospheric density [kg/m3] (default 1.225): ") or 1.225)
+        D_t      = float(input("Throat diameter [m] (default 0.5): ") or 0.5)
+        epsilon  = float(input("Expansion ratio Ae/At (default 40): ") or 40.0)
+    except (ValueError, EOFError):
+        print("Using defaults: 1000 kN, 1.225 kg/m3, Dt=0.5, eps=40")
+        thrust_N = 1e6
+        rho_atm  = 1.225
+        D_t      = 0.5
+        epsilon  = 40.0
 
-    dens_str = input(
-        "大气密度 [kg/m³] (默认 1.225 海平面): "
-    ).strip()
-    rho_atm = float(dens_str or 1.225)
+    # 参数计算
+    A_t    = np.pi * (D_t / 2) ** 2
+    r_exit = np.sqrt(epsilon) * D_t / 2
+    P_a    = rho_atm * R_AIR * T_AMBIENT
 
-    dt_str = input(
-        "喉部直径 [m] (默认 0.5): "
-    ).strip()
-    D_t = float(dt_str or 0.5)
+    print(f"\n{'─' * 50}")
+    print(f"Thrust:      {thrust_N/1e3:.1f} kN")
+    print(f"Density:     {rho_atm:.4f} kg/m3")
+    print(f"P_ambient:   {P_a/1e3:.2f} kPa")
+    print(f"Nozzle area ratio: {epsilon:.1f}")
+    print(f"Exit radius: {r_exit:.3f} m")
 
-    eps_str = input(
-        "扩张比 A_e/A_t (默认 40): "
-    ).strip()
-    epsilon = float(eps_str or 40.0)
-
-    # ----- 环境参数 -----
-    A_t = np.pi * (D_t / 2) ** 2
-    r_exit = np.sqrt(epsilon) * D_t / 2  # 出口半径
-    P_a = rho_atm * R_AIR * T_AMBIENT
-
-    print("\n" + "-" * 50)
-    print(f"推力       = {thrust_N / 1000:.1f} kN")
-    print(f"大气密度   = {rho_atm:.4f} kg/m³")
-    print(f"环境压力   = {P_a / 1000:.2f} kPa")
-    print(f"喉部面积   = {A_t:.4f} m²")
-    print(f"喷管扩张比 = {epsilon:.1f}")
-    print(f"出口半径   = {r_exit:.3f} m")
-
-    # ----- 求解室压 / 出口条件 -----
     P_c, M_e, Pe_Pc = solve_chamber(thrust_N, A_t, epsilon, P_a)
     P_e = Pe_Pc * P_c
 
-    print(f"\n室压  P_c   = {P_c / 1e6:.2f} MPa")
-    print(f"出口马赫数   = {M_e:.2f}")
-    print(f"出口压力 P_e = {P_e / 1000:.2f} kPa")
-    print(f"压力比       = {P_e / P_a:.3f}")
+    print(f"\nP_chamber:   {P_c/1e6:.2f} MPa")
+    print(f"Exit Mach:   {M_e:.2f}")
+    print(f"P_exit:      {P_e/1e3:.2f} kPa")
+    print(f"P_e / P_a:   {P_e/P_a:.3f}")
+    status = "Underexpanded" if P_e > P_a * 1.05 else ("Overexpanded" if P_e < P_a * 0.95 else "Nearly perfect")
+    print(f"Status:      {status}")
+    print(f"{'─' * 50}")
 
-    if P_e > P_a * 1.05:
-        print(">> 欠膨胀 (Underexpanded) — 羽流向外膨胀 <<")
-    elif P_e < P_a * 0.95:
-        print(">> 过膨胀 (Overexpanded) — 羽流被环境压缩 <<")
-    else:
-        print(">> 近似完美膨胀 (Nearly Perfect) <<")
-    print("-" * 50)
-
-    # ----- 羽流场 -----
-    print("\n计算羽流结构…")
-    X, Y, base_field, cell_len = generate_plume_field(
-        P_e, P_a, M_e, r_exit, nx=400, ny=900,
+    # 羽流场
+    print("\nComputing plume field...")
+    X, Y, rho, temp, cell_len, theta_b = generate_plume_field(
+        P_e, P_a, M_e, r_exit, nx=500, ny=1100,
     )
-    L = r_exit * 32.0
-    extent = [0, L, -r_exit * 4, r_exit * 4]
+    L = r_exit * 35.0
+    half_view = r_exit * 3.0
+    extent = [0, L, -half_view, half_view]
+    print(f"Plume display length: {L:.2f} m")
+    print(f"Shock cell spacing:   {cell_len:.3f} m")
 
-    print(f"羽流显示长度  = {L:.2f} m")
-    print(f"激波单元间距  = {cell_len:.3f} m")
-
-    # ----- 动画帧 -----
+    # 动画帧
     N = 80
     frames = []
-    print(f"\n渲染 {N} 帧…")
+    print(f"\nRendering {N} frames...")
 
     for i in range(N):
         t = i / N
-        fd = add_dynamics(base_field, X, Y, t, r_exit, cell_len, P_e / P_a)
-        br = field_to_brightness(fd, intensity=2.8, gamma_corr=0.55, threshold=0.005)
-        img = render_frame(br, extent, r_exit, dpi=90)
+        rho_dyn = add_dynamics(rho, X, Y, t, r_exit, cell_len, theta_b)
+        temp_dyn = temp * (1 + 0.3 * (rho_dyn - rho))
+        temp_dyn = np.clip(temp_dyn, 0, 1)
+        temp_dyn = temp_dyn / max(temp_dyn.max(), 1e-6)
+
+        rgb_img = compute_rgb_image(rho_dyn, temp_dyn)
+        img = render_frame(rgb_img, extent, r_exit)
         frames.append(img)
+
         if (i + 1) % 20 == 0:
             print(f"  {i + 1}/{N}")
 
-    # ----- 保存 -----
-    tag = f"F{thrust_N / 1000:.0f}kN_rho{rho_atm:.4f}_eps{epsilon:.0f}"
+    # 保存
+    tag = f"F{thrust_N/1e3:.0f}kN_rho{rho_atm:.4f}_eps{epsilon:.0f}"
     gif_path = f"plume_{tag}.gif"
     png_path = f"plume_{tag}_static.png"
 
@@ -432,13 +419,13 @@ def main():
         gif_path, save_all=True, append_images=pil_imgs[1:],
         duration=70, loop=0,
     )
-    print(f"\nGIF 动画  → {gif_path}")
+    print(f"\nGIF  → {gif_path}")
 
-    # 静态图
-    br_s = field_to_brightness(base_field, intensity=2.8, gamma_corr=0.55, threshold=0.005)
-    Image.fromarray(render_frame(br_s, extent, r_exit, dpi=120, figsize=(7, 11))).save(png_path)
-    print(f"静态预览 → {png_path}")
-    print("\n完成。")
+    rgb_s = compute_rgb_image(rho, temp)
+    img_s = render_frame(rgb_s, extent, r_exit, target_w=630, target_h=1050)
+    Image.fromarray(img_s).save(png_path)
+    print(f"PNG  → {png_path}")
+    print("Done.")
 
 
 if __name__ == "__main__":

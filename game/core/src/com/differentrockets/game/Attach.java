@@ -16,10 +16,10 @@ public final class Attach {
 
     /**
      * Slide quantization step (m) for edge-type attach snapping in the editor:
-     * a part sliding along an edge locks to multiples of this step (0.25 m).
+     * a part sliding along an edge locks to multiples of this step (0.5 m).
      * Center-type (point) contacts are never quantized.
      */
-    public static final float EDGE_SNAP_STEP = 0.25f;
+    public static final float EDGE_SNAP_STEP = 0.5f;
 
     /**
      * Quantize the free slide component of a snapped position (px,py) along the

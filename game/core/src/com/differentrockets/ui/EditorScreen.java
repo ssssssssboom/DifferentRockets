@@ -70,6 +70,9 @@ public class EditorScreen extends ScreenAdapter {
     private TextField nameField;      // rename field inside the menu drawer
     private Label nameLabel;          // ship name in the top bar
     private TextButton delButton;     // floating delete button (selection only)
+    private Table selOps;             // top-right selection ops (rotate/mirror/copy)
+    private Table trashWrap;          // top-right trash can (visible mid-drag)
+    private TextButton trashButton;
     // stage-drawer drag targets: header actors parallel to their stage numbers
     private final List<Actor> stageHeaders = new ArrayList<>();
     private final List<Integer> stageHeaderNums = new ArrayList<>();
@@ -490,7 +493,7 @@ public class EditorScreen extends ScreenAdapter {
         top.add(bar).fillX();
         stage.addActor(top);
 
-        // --- bottom-left drawer buttons (above the drawers in z-order) ---
+        // --- bottom-left drawer buttons: square, in one horizontal row ---
         Table btns = new Table();
         btns.setFillParent(true);
         btns.bottom().left();
@@ -507,9 +510,9 @@ public class EditorScreen extends ScreenAdapter {
         bStages.addListener(new ClickListener() {
             @Override public void clicked(InputEvent e, float x, float y) { toggleDrawer(3); }
         });
-        btns.add(bMenu).width(BTN_W).height(BTN_H).pad(6).row();
-        btns.add(bParts).width(BTN_W).height(BTN_H).pad(6).row();
-        btns.add(bStages).width(BTN_W).height(BTN_H).pad(6).padBottom(130).row();
+        btns.add(bMenu).width(BTN_W).height(BTN_W).pad(6).padBottom(130);
+        btns.add(bParts).width(BTN_W).height(BTN_W).pad(6).padBottom(130);
+        btns.add(bStages).width(BTN_W).height(BTN_W).pad(6).padBottom(130);
         stage.addActor(btns);
 
         // --- floating delete button (bottom-right, visible with a selection) ---
@@ -523,6 +526,45 @@ public class EditorScreen extends ScreenAdapter {
         delWrap.setTouchable(Touchable.childrenOnly);
         delWrap.add(delButton).width(BTN_W).height(BTN_H).pad(10).padBottom(130);
         stage.addActor(delWrap);
+
+        // --- top-right selection ops (task 5): visible only with a selection;
+        //     mutually exclusive with the trash can (mid-drag, task 6) ---
+        selOps = new Table();
+        selOps.setFillParent(true);
+        selOps.top().right();
+        selOps.setTouchable(Touchable.childrenOnly);
+        Table opsRow = new Table();
+        opsRow.setBackground(game.ui.tinted(new Color(0.09f, 0.1f, 0.15f, 0.95f)));
+        String[] labels = {"Rot L", "Rot R", "Mir H", "Mir V", "Copy"};
+        for (int k = 0; k < labels.length; k++) {
+            final int op = k; // 0=CCW 1=CW 2=mirrorH 3=mirrorV 4=copy
+            TextButton b = new TextButton(labels[k], game.ui.skin);
+            b.addListener(new ClickListener() {
+                @Override public void clicked(InputEvent e, float x, float y) {
+                    if (op == 0) rotateSelectedBlocks(true);
+                    else if (op == 1) rotateSelectedBlocks(false);
+                    else if (op == 2) mirrorSelectedBlocks(true);
+                    else if (op == 3) mirrorSelectedBlocks(false);
+                    else copySelectedBlocks();
+                }
+            });
+            opsRow.add(b).width(110).height(64).pad(4);
+        }
+        selOps.add(opsRow).padTop(TOP_H + 8).padRight(8);
+        stage.addActor(selOps);
+
+        // --- top-right trash can (task 6): only while a part/block is dragged ---
+        trashButton = new TextButton("TRASH", game.ui.skin);
+        trashButton.setColor(1f, 0.45f, 0.45f, 1f);
+        trashWrap = new Table();
+        trashWrap.setFillParent(true);
+        trashWrap.top().right();
+        trashWrap.setTouchable(Touchable.childrenOnly);
+        Table trashRow = new Table();
+        trashRow.setBackground(game.ui.tinted(new Color(0.3f, 0.08f, 0.08f, 0.95f)));
+        trashRow.add(trashButton).width(150).height(90).pad(6);
+        trashWrap.add(trashRow).padTop(TOP_H + 8).padRight(8);
+        stage.addActor(trashWrap);
 
         // --- bottom status bar ---
         statusLabel = new Label("Tap [Add Part] for parts. Tap part = select; drag = move; DEL deletes.",
@@ -919,11 +961,145 @@ public class EditorScreen extends ScreenAdapter {
         status("Deleted " + victims.size() + " parts");
     }
 
-    /** Show/hide the floating DEL button with the selection state. */
+    /** Show/hide the floating DEL button, the selection-ops cluster and the
+     *  trash can. Trash (mid-drag) and selection ops are mutually exclusive. */
     private void updateDelButton() {
         if (delButton == null) return;
         delButton.setVisible(!selected.isEmpty());
         delButton.setText("DEL (" + selected.size() + ")");
+        if (selOps != null) selOps.setVisible(!selected.isEmpty() && !dragMoved);
+        if (trashWrap != null) trashWrap.setVisible(dragMoved && dragIndex >= 0);
+    }
+
+    /** Screen-space hit test against the trash button (drop-to-delete). */
+    private boolean overTrash(float screenX, float screenY) {
+        if (trashWrap == null || !trashWrap.isVisible() || trashButton == null) return false;
+        int[] c = actorScreenPos(trashButton);
+        return c != null
+                && Math.abs(screenX - c[0]) <= trashButton.getWidth() / 2f
+                && Math.abs(screenY - c[1]) <= trashButton.getHeight() / 2f;
+    }
+
+    /** The block an operation acts on: the part plus all its children — the
+     *  weld subtree for main-ship parts, the whole component for floaters. */
+    private List<Integer> blockOf(int i) {
+        return (i < rootConnected.length && rootConnected[i])
+                ? design.subtreeOf(i) : collectComponent(i);
+    }
+
+    /** The selection expanded to whole blocks, split into connected sub-blocks
+     *  (each gets its own pivot for rotate/mirror). */
+    private List<List<Integer>> selectedBlocks() {
+        Set<Integer> all = new java.util.LinkedHashSet<>();
+        for (int i : selected) {
+            if (i >= 0 && i < design.parts.size()) all.addAll(blockOf(i));
+        }
+        List<List<Integer>> comps = new ArrayList<>();
+        Set<Integer> seen = new HashSet<>();
+        for (int start : all) {
+            if (seen.contains(start)) continue;
+            List<Integer> comp = new ArrayList<>();
+            List<Integer> q = new ArrayList<>();
+            seen.add(start);
+            q.add(start);
+            while (!q.isEmpty()) {
+                int cur = q.remove(q.size() - 1);
+                comp.add(cur);
+                for (ShipDesign.Connection c : design.connections) {
+                    int o = c.partA == cur ? c.partB : c.partB == cur ? c.partA : -1;
+                    if (o >= 0 && all.contains(o) && !seen.contains(o)) {
+                        seen.add(o);
+                        q.add(o);
+                    }
+                }
+            }
+            comps.add(comp);
+        }
+        return comps;
+    }
+
+    /** Rotate every selected block 90 deg around its own centroid (task 5).
+     *  A rigid isometry: internal welds stay geometrically consistent. */
+    private void rotateSelectedBlocks(boolean ccw) {
+        if (selected.isEmpty()) { status("Nothing selected"); return; }
+        pushHistory();
+        for (List<Integer> comp : selectedBlocks()) {
+            float cx = 0, cy = 0;
+            for (int i : comp) { cx += design.parts.get(i).x; cy += design.parts.get(i).y; }
+            cx /= comp.size(); cy /= comp.size();
+            for (int i : comp) {
+                ShipDesign.DesignPart p = design.parts.get(i);
+                float dx = p.x - cx, dy = p.y - cy;
+                if (ccw) { p.x = cx - dy; p.y = cy + dx; p.rot = (p.rot + 1) & 3; }
+                else     { p.x = cx + dy; p.y = cy - dx; p.rot = (p.rot + 3) & 3; }
+            }
+        }
+        status("Rotated " + (ccw ? "CCW" : "CW") + " 90 deg");
+    }
+
+    /** Mirror-copy every selected block about its centroid axis (task 5).
+     *  horizontal=true mirrors about the vertical axis x=avgX (toggle flippedX,
+     *  rot -> 180deg-rot); horizontal=false about y=avgY (toggle flippedY,
+     *  rot -> -rot). Attach geometry is flip-invariant (Attach.localSegment),
+     *  so the rigid isometry keeps every internal weld contact consistent. */
+    private void mirrorSelectedBlocks(boolean horizontal) {
+        duplicateSelectedBlocks(horizontal ? 1 : 2);
+        status(horizontal ? "Mirrored copy (about avg X)" : "Mirrored copy (about avg Y)");
+    }
+
+    /** In-place duplicate of every selected block, offset by (0.5, 0.5). */
+    private void copySelectedBlocks() {
+        duplicateSelectedBlocks(0);
+        status("Copied at +0.5, +0.5");
+    }
+
+    /** mode 0 = copy (+0.5,+0.5); 1 = mirror about avg X; 2 = mirror about avg Y.
+     *  Internal connections are duplicated; copies are NOT welded to the
+     *  original parent (they spawn as floating blocks, ready to drag on). */
+    private void duplicateSelectedBlocks(int mode) {
+        if (selected.isEmpty()) { status("Nothing selected"); return; }
+        pushHistory();
+        List<List<Integer>> comps = selectedBlocks();
+        selected.clear();
+        for (List<Integer> comp : comps) {
+            float cx = 0, cy = 0;
+            for (int i : comp) { cx += design.parts.get(i).x; cy += design.parts.get(i).y; }
+            cx /= comp.size(); cy /= comp.size();
+            java.util.Map<Integer, Integer> map = new java.util.HashMap<>();
+            for (int i : comp) {
+                ShipDesign.DesignPart p = design.parts.get(i);
+                ShipDesign.DesignPart np = new ShipDesign.DesignPart(p.typeId, p.x, p.y, p.rot);
+                np.group = p.group;
+                np.flippedX = p.flippedX;
+                np.flippedY = p.flippedY;
+                if (mode == 1) {
+                    np.x = 2 * cx - p.x;
+                    np.rot = (2 - p.rot + 4) & 3;
+                    np.flippedX = !np.flippedX;
+                } else if (mode == 2) {
+                    np.y = 2 * cy - p.y;
+                    np.rot = (4 - p.rot) & 3;
+                    np.flippedY = !np.flippedY;
+                } else {
+                    np.x = p.x + 0.5f;
+                    np.y = p.y + 0.5f;
+                }
+                map.put(i, design.parts.size());
+                design.parts.add(np);
+            }
+            List<ShipDesign.Connection> dup = new ArrayList<>();
+            for (ShipDesign.Connection c : design.connections) {
+                if (map.containsKey(c.partA) && map.containsKey(c.partB)) {
+                    dup.add(new ShipDesign.Connection(
+                            map.get(c.partA), map.get(c.partB), c.attachA, c.attachB));
+                }
+            }
+            design.connections.addAll(dup);
+            selected.addAll(map.values());
+        }
+        afterTopologyChange();
+        rebuildStageList();
+        updateDelButton();
     }
 
     /** Modal overlay that swallows taps so they never leak to the canvas below. */
@@ -1438,6 +1614,7 @@ public class EditorScreen extends ScreenAdapter {
                 dragBlock.clear();
                 dragWholeBlock = false;
                 dragBlockRoot = -1;
+                updateDelButton();
                 return true;
             }
             // Canvas-or-chrome decision via the stage itself (no coordinate
@@ -1478,7 +1655,9 @@ public class EditorScreen extends ScreenAdapter {
                 inferConnectionFor(design.parts.size() - 1,
                         java.util.Collections.<Integer>emptySet());
                 afterTopologyChange();
+                // keep the just-placed part selected (round 6 task 3)
                 selected.clear();
+                selected.add(design.parts.size() - 1);
                 updateDelButton();
                 design.autoStage();
                 rebuildStageList();
@@ -1573,6 +1752,7 @@ public class EditorScreen extends ScreenAdapter {
                     dragBlock.clear();
                     dragBlock.addAll(design.subtreeOf(dragIndex));
                 }
+                updateDelButton(); // show the trash can while dragging (task 6)
             }
             if (dragMoved && dragIndex >= 0) {
                 Vector2 w = screenToWorld(screenX, screenY);
@@ -1649,6 +1829,7 @@ public class EditorScreen extends ScreenAdapter {
                 dragBlock.clear();
                 dragWholeBlock = false;
                 dragBlockRoot = -1;
+                updateDelButton();
                 return true;
             }
             touchPtrA = -1;
@@ -1659,6 +1840,15 @@ public class EditorScreen extends ScreenAdapter {
                     status(selected.isEmpty() ? "Tap [Add Part] for parts. Tap part = select; drag = move; DEL deletes."
                             : selected.size() + " selected — open [Stages] to assign a group");
                     updateDelButton();
+                } else if (overTrash(screenX, screenY)) {
+                    // dropped into the trash can: delete the dragged part/block.
+                    // Undoable — pushHistory ran when the drag was promoted.
+                    int n = dragBlock.size();
+                    design.removeParts(new ArrayList<>(dragBlock));
+                    selected.clear();
+                    afterTopologyChange();
+                    rebuildStageList();
+                    status("Trashed " + n + " part(s)");
                 } else if (dragWholeBlock) {
                     // block drop: internal welds stay; only the block ROOT may
                     // weld onto the main ship from this drag's own snap
@@ -1685,6 +1875,7 @@ public class EditorScreen extends ScreenAdapter {
                 dragBlock.clear();
                 dragWholeBlock = false;
                 dragBlockRoot = -1;
+                updateDelButton(); // hide the trash can (task 6)
                 return true;
             }
             if (panning) {
@@ -1719,6 +1910,7 @@ public class EditorScreen extends ScreenAdapter {
             dragBlock.clear();
             dragWholeBlock = false;
             dragBlockRoot = -1;
+            updateDelButton();
             return false;
         }
 
@@ -1822,7 +2014,9 @@ public class EditorScreen extends ScreenAdapter {
             inferConnectionFor(design.parts.size() - 1,
                     java.util.Collections.<Integer>emptySet());
             afterTopologyChange();
+            // keep the just-placed part selected (round 6 task 3)
             selected.clear();
+            selected.add(design.parts.size() - 1);
             updateDelButton();
             design.autoStage();
             rebuildStageList();
@@ -1907,13 +2101,17 @@ public class EditorScreen extends ScreenAdapter {
         }
         game.shapes.end();
 
-        // parts (task 2: blocks not welded to the root/pod render translucent)
+        // parts (task 2: blocks not welded to the root/pod render translucent;
+        // task 4: every member of the dragged block/subtree renders translucent
+        // while the drag is live)
         game.batch.setProjectionMatrix(cam.combined);
         game.batch.begin();
         for (int i = 0; i < design.parts.size(); i++) {
             ShipDesign.DesignPart dp = design.parts.get(i);
             boolean welded = i < rootConnected.length && rootConnected[i];
-            drawPart(dp.typeId, dp.x, dp.y, dp.rot, dp.flippedX, dp.flippedY, welded ? 1f : 0.4f);
+            float alpha = welded ? 1f : 0.4f;
+            if (dragMoved && dragBlock.contains(i)) alpha = 0.5f;
+            drawPart(dp.typeId, dp.x, dp.y, dp.rot, dp.flippedX, dp.flippedY, alpha);
         }
         // ghost (placement or, for the attach preview, a moved part)
         PartType markerType = null;
@@ -2056,6 +2254,7 @@ public class EditorScreen extends ScreenAdapter {
         dragBlock.clear();
         dragWholeBlock = false;
         dragBlockRoot = -1;
+        updateDelButton();
         if (stage != null) stage.cancelTouchFocus();
     }
 }

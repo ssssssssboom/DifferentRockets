@@ -5,15 +5,17 @@ import com.badlogic.gdx.files.FileHandle;
 import com.differentrockets.game.LuaScript;
 
 /**
- * Player-facing resource root.
- * Android: prefers the SHARED root /storage/emulated/0/DifferentRocket/
+ * Player-facing resource root — THE ONLY storage location this app touches.
+ * Android: the SHARED root /storage/emulated/0/DifferentRocket/
  *          (resolved via Environment.getExternalStorageDirectory() — NOT
  *          Gdx.files.getExternalStoragePath(), which since libGDX 1.9.10
- *          returns the app-private Android/data/<pkg>/files/ dir). When the
- *          shared root is not writable (permission not granted yet) it falls
- *          back to the app-private external dir and retries shared on every
- *          resume; on the first successful switch the private files are
- *          migrated over (missing files only, player edits never overwritten).
+ *          returns the app-private Android/data/<pkg>/files/ dir).
+ *          Storage-path cleanup (round 28): the app-private fallback root
+ *          was REMOVED — nothing is ever read from or written to
+ *          /sdcard/Android/data/... or any app-private files dir. When the
+ *          shared root is not writable yet (permission pending), resources
+ *          fall back to the READ-ONLY built-in internal assets and the
+ *          shared root is retried on every resume.
  * Desktop: DifferentRocket/ in the project dir (parent of core/assets, so the
  *          player copy never leaks into the Android assets tree).
  * On first run all default resources are copied there:
@@ -24,14 +26,13 @@ import com.differentrockets.game.LuaScript;
  * when the bundled defaults change, player edits are always kept. A built-in
  * set of known legacy factory SHA-1s migrates installs from before this
  * mechanism existed.
- * If no directory is writable, every lookup gracefully falls back to the
- * built-in internal assets.
+ * If the shared root is not writable, every lookup gracefully falls back to
+ * the built-in internal assets (read-only).
  */
 public final class Res {
 
     private static FileHandle root;
-    private static FileHandle sharedRoot;    // /sdcard/DifferentRocket (target)
-    private static FileHandle privateRoot;   // Android/data/<pkg>/files/DifferentRocket (fallback)
+    private static FileHandle sharedRoot;    // /sdcard/DifferentRocket (the ONLY root)
     private static boolean external;   // true when the player root is usable
 
     /**
@@ -113,27 +114,19 @@ public final class Res {
     public static void init() {
         if (root != null) return;
         if (Gdx.app.getType() == com.badlogic.gdx.Application.ApplicationType.Android) {
-            // Dual root (item 1): the SHARED root comes from
+            // Single root (storage-path cleanup, round 28): ONLY the shared
+            // /storage/emulated/0/DifferentRocket/ — from
             // Environment.getExternalStorageDirectory() (via reflection — the
-            // core module has no android.jar), never from
-            // Gdx.files.getExternalStoragePath(), which on libGDX >= 1.9.10 is
-            // the app-private getExternalFilesDir(). That private dir is only
-            // the pre-permission fallback.
+            // core module has no android.jar). The app-private
+            // Android/data/<pkg>/files fallback was REMOVED: no file is ever
+            // read from or written to any private storage dir.
             sharedRoot = Gdx.files.absolute(sharedBase() + "DifferentRocket/");
-            String priv = Gdx.files.getExternalStoragePath();
-            if (priv != null && !priv.isEmpty()) {
-                if (!priv.endsWith("/")) priv += "/";
-                privateRoot = Gdx.files.absolute(priv + "DifferentRocket/");
-            }
-            Gdx.app.log("res", "shared root candidate:  "
+            Gdx.app.log("res", "shared root: "
                     + sharedRoot.file().getAbsolutePath());
-            Gdx.app.log("res", "private root candidate: "
-                    + (privateRoot != null ? privateRoot.file().getAbsolutePath() : "(none)"));
         } else {
             // parent of the working dir (core/assets) so the player copy never
             // lands inside the Android assets tree and leaks into the APK
             sharedRoot = Gdx.files.local("../DifferentRocket/");
-            privateRoot = sharedRoot;
         }
         populate();
     }
@@ -180,35 +173,21 @@ public final class Res {
     }
 
     /**
-     * Pick the best writable root (shared preferred, app-private fallback) and
-     * populate defaults. Sets `external`. Retried on every resume, so a root
-     * that was not writable before gets another chance.
+     * Populate the shared root when writable. Sets `external`. There is NO
+     * private fallback (round 28): when the shared root is not writable the
+     * app runs on read-only built-in assets and retries on every resume.
      */
     private static void populate() {
-        FileHandle target = null;
-        boolean shared = false;
-        if (probeWritable(sharedRoot)) {
-            target = sharedRoot;
-            shared = true;
-        } else if (privateRoot != null && privateRoot != sharedRoot && probeWritable(privateRoot)) {
-            target = privateRoot;
-            Gdx.app.log("res", "WARNING: shared storage root not writable (storage "
-                    + "permission not granted?) — falling back to app-private "
-                    + privateRoot.file().getAbsolutePath()
-                    + "; will retry the shared root on every resume");
-        }
-        if (target == null) {
+        if (!probeWritable(sharedRoot)) {
             external = false;
-            Gdx.app.log("res", "WARNING: no writable player resource root — using "
-                    + "built-in assets. Grant storage access to enable "
-                    + "player-editable resources.");
+            Gdx.app.log("res", "WARNING: shared storage root not writable "
+                    + "(storage permission not granted?) — using built-in "
+                    + "assets; will retry on every resume");
             return;
         }
-        if (root != target) {
-            root = target;
-            if (shared && privateRoot != null && privateRoot != sharedRoot) migrateToShared();
-            Gdx.app.log("res", "resource root: " + root.file().getAbsolutePath()
-                    + (shared ? " (shared /sdcard root)" : " (app-private)"));
+        if (root != sharedRoot) {
+            root = sharedRoot;
+            Gdx.app.log("res", "resource root: " + root.file().getAbsolutePath());
         }
         external = true;
         copyDefaults();
@@ -226,40 +205,6 @@ public final class Res {
             return ok;
         } catch (Throwable t) {
             return false;
-        }
-    }
-
-    /**
-     * First switch to the shared root: bring over everything the player already
-     * had in the app-private root. Missing files only — player edits in the
-     * shared root are never overwritten, and the private copies are left in
-     * place (Android still allows the app to read its own private dir).
-     */
-    private static void migrateToShared() {
-        if (privateRoot == null || !privateRoot.exists()) return;
-        try {
-            int[] n = {0};
-            copyMissing(privateRoot, sharedRoot, n);
-            if (n[0] > 0) {
-                Gdx.app.log("res", "migrated " + n[0]
-                        + " player files from the app-private root to the shared root");
-            }
-        } catch (Throwable t) {
-            Gdx.app.error("res", "migration from app-private root failed (continuing)", t);
-        }
-    }
-
-    private static void copyMissing(FileHandle from, FileHandle to, int[] n) {
-        if (!from.exists()) return;
-        if (from.isDirectory()) {
-            for (FileHandle c : from.list()) copyMissing(c, to.child(c.name()), n);
-        } else if (!to.exists()) {
-            try {
-                from.copyTo(to);
-                n[0]++;
-            } catch (Throwable t) {
-                Gdx.app.error("res", "failed to migrate " + from.path(), t);
-            }
         }
     }
 
@@ -591,19 +536,20 @@ public final class Res {
 
     /**
      * The player ships directory (<root>/Ships/) holding Show_Rocket-compatible
-     * XML ship files. Falls back to the app-local "Ships" dir when the shared
-     * root is not usable yet. Created on demand by callers (mkdirs).
+     * XML ship files. Round 28: no app-local fallback — when the shared root
+     * is not writable yet the handle still points at the shared tree (writes
+     * simply fail until the permission lands; callers tolerate that).
      */
     public static FileHandle shipsDir() {
         if (external) return root.child("Ships");
-        return Gdx.files.local("Ships");
+        return sharedRoot.child("Ships");
     }
 
     /**
      * The player sandbox saves directory (<root>/Sandboxs/) holding
-     * Show_sandbox-compatible XML world saves. Falls back to the app-local
-     * "Sandboxs" dir when the shared root is not usable yet. Created here on
-     * demand (mkdirs, mirroring probeWritable's dir handling).
+     * Show_sandbox-compatible XML world saves. Round 28: no app-local
+     * fallback (same rule as shipsDir). Created here on demand (mkdirs,
+     * mirroring probeWritable's dir handling).
      */
     public static FileHandle sandboxDir() {
         if (external) {
@@ -613,7 +559,19 @@ public final class Res {
                 if (d.exists() && d.isDirectory()) return d;
             } catch (Throwable ignored) {}
         }
-        FileHandle d = Gdx.files.local("Sandboxs");
+        FileHandle d = sharedRoot.child("Sandboxs");
+        try { d.mkdirs(); } catch (Throwable ignored) {}
+        return d;
+    }
+
+    /**
+     * Legacy-save directory (<root>/save/) — the pre-XML JSON world save and
+     * pre-XML JSON ship files used to live in the APP-LOCAL save/ tree
+     * (Gdx.files.local); round 28 moved the one-time read fallback under the
+     * shared root so nothing is ever read from app-private storage.
+     */
+    public static FileHandle saveDir() {
+        FileHandle d = (external ? root : sharedRoot).child("save");
         try { d.mkdirs(); } catch (Throwable ignored) {}
         return d;
     }

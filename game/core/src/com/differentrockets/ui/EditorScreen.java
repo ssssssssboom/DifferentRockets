@@ -91,6 +91,8 @@ public class EditorScreen extends ScreenAdapter {
     private PartType placing;         // palette part being placed
     private int dragIndex = -1;       // existing part being dragged
     private float dragX, dragY;       // current ghost position (world)
+    // task 1: the dragged part's whole child block moves with it
+    private final List<Integer> dragBlock = new ArrayList<>();
     private int dragRot;              // rotation of ghost
     private boolean dragFlipX, dragFlipY; // mirror state of ghost (XML flippedX/flippedY)
     private boolean panning;
@@ -237,7 +239,8 @@ public class EditorScreen extends ScreenAdapter {
 
         stage = new Stage(new ScreenViewport());
         buildChrome();
-        reinferOrphans(); // restored/legacy designs may lack weld records
+        // task 3: no auto-weld here — restored designs use their stored
+        // connections verbatim; anything unwelded shows translucent
         afterTopologyChange();
         rebuildStageList();
 
@@ -645,8 +648,10 @@ public class EditorScreen extends ScreenAdapter {
                 menuShipList.add(b).fillX().height(ROW_H).pad(4).row();
             }
         }
-        // legacy JSON ships (pre-XML saves): still loadable, re-saved as XML
-        com.badlogic.gdx.files.FileHandle legacy = Gdx.files.local("save/ships");
+        // legacy JSON ships (pre-XML saves): still loadable, re-saved as XML.
+        // Round 28: the legacy dir moved from the app-local save/ships to
+        // <resource root>/save/ships — nothing reads app-private storage.
+        com.badlogic.gdx.files.FileHandle legacy = com.differentrockets.util.Res.saveDir().child("ships");
         boolean anyLegacy = false;
         if (legacy.exists()) {
             for (final com.badlogic.gdx.files.FileHandle f : legacy.list(".json")) {
@@ -678,7 +683,8 @@ public class EditorScreen extends ScreenAdapter {
             if (nameField != null) nameField.setText(shipName);
             if (nameLabel != null) nameLabel.setText(shipName);
             selected.clear();
-            reinferOrphans(); // legacy files may lack Connections; geometry fills in
+            // task 3: loading never creates welds — only the file's own
+            // Connections apply; parts without them show translucent
             afterTopologyChange();
             rebuildStageList();
             updateDelButton();
@@ -1122,6 +1128,93 @@ public class EditorScreen extends ScreenAdapter {
         return out;
     }
 
+    // ------------------------------------------------------------ attach markers (task 4)
+
+    /** Which attach pair wins the snap for a part dragged to (px,py,rot). */
+    private static class SnapWin {
+        int part = -1, apM = -1, apO = -1;
+    }
+
+    /** Same contact search as snap(), but reports the winning attach pair. */
+    private SnapWin findSnapWinner(float px, float py, int rot, PartType type, int ignoreIndex) {
+        SnapWin win = new SnapWin();
+        float bestD = 2.2f; // identical threshold to snap()
+        Vector2 ma = new Vector2(), mb = new Vector2();
+        Vector2 oa = new Vector2(), ob = new Vector2();
+        Vector2 cm = new Vector2(), co = new Vector2();
+        for (int i = 0; i < design.parts.size(); i++) {
+            if (i == ignoreIndex) continue;
+            ShipDesign.DesignPart dp = design.parts.get(i);
+            PartType t = PartList.get(dp.typeId);
+            if (t == null) continue;
+            for (int am = 0; am < type.attach.size(); am++) {
+                attachWorldSeg(type, px, py, rot, type.attach.get(am), ma, mb);
+                for (int ao = 0; ao < t.attach.size(); ao++) {
+                    attachWorldSeg(t, dp.x, dp.y, dp.rot, t.attach.get(ao), oa, ob);
+                    float d = Attach.closestBetweenSegments(ma, mb, oa, ob, cm, co);
+                    if (d < bestD) {
+                        bestD = d;
+                        win.part = i; win.apM = am; win.apO = ao;
+                    }
+                }
+            }
+        }
+        return win;
+    }
+
+    private void drawOneMarker(PartType t, float px, float py, int rot,
+                               PartType.AttachPoint ap, boolean hot) {
+        Vector2 a = new Vector2(), b = new Vector2();
+        attachWorldSeg(t, px, py, rot, ap, a, b);
+        if (hot) game.shapes.setColor(0.35f, 1f, 0.55f, 1f);
+        else game.shapes.setColor(0.35f, 0.5f, 0.65f, 0.75f);
+        if (ap.edge != PartType.AttachPoint.EDGE_NONE) {
+            // Side/edge type: draw the whole attachable side segment
+            game.shapes.line(a, b);
+            if (hot) { // cheap "thickness": offset copies
+                game.shapes.line(a.x + 0.06f, a.y + 0.06f, b.x + 0.06f, b.y + 0.06f);
+                game.shapes.line(a.x - 0.06f, a.y - 0.06f, b.x - 0.06f, b.y - 0.06f);
+            }
+        } else {
+            // Center type: a dot
+            game.shapes.circle(a.x, a.y, hot ? 0.28f : 0.12f, 10);
+        }
+    }
+
+    /**
+     * Persistent attach-point rendering (task 4): every placed part shows its
+     * attach points — edge/Side types as side segments, Center types as dots.
+     * While a part is being dragged/placed (dragType != null at px,py), the
+     * dragged part's own markers light up and the exact attach pair that would
+     * weld on drop is highlighted on BOTH parts.
+     */
+    private void drawAttachMarkers(PartType dragType, float px, float py, int rot, int ignoreIndex) {
+        game.shapes.setProjectionMatrix(cam.combined);
+        game.shapes.begin(com.badlogic.gdx.graphics.glutils.ShapeRenderer.ShapeType.Line);
+        for (int i = 0; i < design.parts.size(); i++) {
+            ShipDesign.DesignPart dp = design.parts.get(i);
+            PartType t = PartList.get(dp.typeId);
+            if (t == null) continue;
+            for (PartType.AttachPoint ap : t.attach) {
+                drawOneMarker(t, dp.x, dp.y, dp.rot, ap, false);
+            }
+        }
+        if (dragType != null) {
+            SnapWin win = findSnapWinner(px, py, rot, dragType, ignoreIndex);
+            for (int am = 0; am < dragType.attach.size(); am++) {
+                drawOneMarker(dragType, px, py, rot, dragType.attach.get(am), am == win.apM);
+            }
+            if (win.part >= 0) {
+                ShipDesign.DesignPart dp = design.parts.get(win.part);
+                PartType t = PartList.get(dp.typeId);
+                if (t != null && win.apO >= 0 && win.apO < t.attach.size()) {
+                    drawOneMarker(t, dp.x, dp.y, dp.rot, t.attach.get(win.apO), true);
+                }
+            }
+        }
+        game.shapes.end();
+    }
+
     private void rotateGhost() {
         if (placing != null && !placing.disableEditorRotation) {
             dragRot = (dragRot + 1) % 4;
@@ -1217,16 +1310,8 @@ public class EditorScreen extends ScreenAdapter {
         }
     }
 
-    /** Give every parentless non-root part a chance to (re)weld to a neighbor. */
-    private void reinferOrphans() {
-        for (int i = 1; i < design.parts.size(); i++) {
-            boolean hasParent = false;
-            for (ShipDesign.Connection c : design.connections) {
-                if (c.partB == i) { hasParent = true; break; }
-            }
-            if (!hasParent) inferConnectionFor(i);
-        }
-    }
+    /* task 3: connections may ONLY come from a player drag gesture — no
+     * reinferOrphans-style auto-welding on load/restore/move of other parts. */
 
     /** Diagnostic: ghost/drag rotation steps (smoke tests). */
     public int dragRotForTest() { return dragRot; }
@@ -1277,6 +1362,7 @@ public class EditorScreen extends ScreenAdapter {
                 gpbX = screenX; gpbY = screenY;
                 panning = false;
                 downIndex = -1; dragIndex = -1; dragMoved = false;
+                dragBlock.clear();
                 return true;
             }
             // Canvas-or-chrome decision via the stage itself (no coordinate
@@ -1394,6 +1480,9 @@ public class EditorScreen extends ScreenAdapter {
                 dragMoved = true;
                 dragIndex = downIndex;
                 dragRot = design.parts.get(dragIndex).rot;
+                // task 1: the whole child block of the grabbed part comes along
+                dragBlock.clear();
+                dragBlock.addAll(design.subtreeOf(dragIndex));
             }
             if (dragMoved && dragIndex >= 0) {
                 Vector2 w = screenToWorld(screenX, screenY);
@@ -1401,8 +1490,15 @@ public class EditorScreen extends ScreenAdapter {
                 Vector2 snapped = snap(w.x, w.y, dragRot, t, dragIndex);
                 dragX = snapped.x;
                 dragY = snapped.y;
-                design.parts.get(dragIndex).x = dragX;
-                design.parts.get(dragIndex).y = dragY;
+                // translate by the snap-corrected delta so the block keeps formation
+                float dx = dragX - design.parts.get(dragIndex).x;
+                float dy = dragY - design.parts.get(dragIndex).y;
+                for (int bi : dragBlock) {
+                    if (bi >= 0 && bi < design.parts.size()) {
+                        design.parts.get(bi).x += dx;
+                        design.parts.get(bi).y += dy;
+                    }
+                }
                 design.parts.get(dragIndex).rot = dragRot;
                 return true;
             }
@@ -1437,6 +1533,7 @@ public class EditorScreen extends ScreenAdapter {
                 gpaY = gpbY;
                 panLastX = gpaX; panLastY = gpaY;
                 panning = false; downIndex = -1; dragIndex = -1; dragMoved = false;
+                dragBlock.clear();
                 return true;
             }
             touchPtrA = -1;
@@ -1448,13 +1545,13 @@ public class EditorScreen extends ScreenAdapter {
                             : selected.size() + " selected — open [Stages] to assign a group");
                     updateDelButton();
                 } else {
-                    // task 1: a moved part's welds break; rewire it and any
-                    // orphans (its former children) by geometry
+                    // a moved part's welds break; only the MOVED part itself may
+                    // re-weld (that is this player drag's own snap). Former
+                    // children are deliberately NOT auto-rewelded (task 3).
                     if (dragIndex >= 0 && dragIndex < design.parts.size()) {
                         final int moved = dragIndex;
                         design.connections.removeIf(c -> c.partA == moved || c.partB == moved);
                         inferConnectionFor(moved);
-                        reinferOrphans();
                     }
                     afterTopologyChange();
                     design.autoStage();
@@ -1463,6 +1560,7 @@ public class EditorScreen extends ScreenAdapter {
                 downIndex = -1;
                 dragIndex = -1;
                 dragMoved = false;
+                dragBlock.clear();
                 return true;
             }
             if (panning) {
@@ -1494,6 +1592,7 @@ public class EditorScreen extends ScreenAdapter {
             downIndex = -1;
             dragIndex = -1;
             dragMoved = false;
+            dragBlock.clear();
             return false;
         }
 
@@ -1688,29 +1787,27 @@ public class EditorScreen extends ScreenAdapter {
             boolean welded = i < rootConnected.length && rootConnected[i];
             drawPart(dp.typeId, dp.x, dp.y, dp.rot, dp.flippedX, dp.flippedY, welded ? 1f : 0.4f);
         }
-        // ghost
+        // ghost (placement or, for the attach preview, a moved part)
+        PartType markerType = null;
+        float markerX = 0, markerY = 0;
+        int markerRot = 0, markerIgnore = -1;
         if (placing != null) {
             Vector2 w = screenToWorld(Gdx.input.getX(), Gdx.input.getY());
             Vector2 snapped = snap(w.x, w.y, dragRot, placing, -1);
             drawPart(placing.id, snapped.x, snapped.y, dragRot, dragFlipX, dragFlipY, 0.6f);
-            // attach markers
-            game.batch.end();
-            game.shapes.begin(com.badlogic.gdx.graphics.glutils.ShapeRenderer.ShapeType.Filled);
-            game.shapes.setColor(0.3f, 0.9f, 0.4f, 0.9f);
-            for (Vector2 p : attachWorld(placing, snapped.x, snapped.y, dragRot)) {
-                game.shapes.circle(p.x, p.y, 0.25f, 8);
-            }
-            for (ShipDesign.DesignPart dp : design.parts) {
-                PartType t = PartList.get(dp.typeId);
-                if (t == null) continue;
-                for (Vector2 p : attachWorld(t, dp.x, dp.y, dp.rot)) {
-                    game.shapes.circle(p.x, p.y, 0.18f, 8);
-                }
-            }
-            game.shapes.end();
-            game.batch.begin();
+            markerType = placing;
+            markerX = snapped.x; markerY = snapped.y; markerRot = dragRot;
+        } else if (dragMoved && dragIndex >= 0 && dragIndex < design.parts.size()) {
+            ShipDesign.DesignPart dp = design.parts.get(dragIndex);
+            markerType = PartList.get(dp.typeId);
+            markerX = dp.x; markerY = dp.y; markerRot = dragRot;
+            markerIgnore = dragIndex;
         }
         game.batch.end();
+
+        // task 4: persistent attach-point markers + live highlight of the pair
+        // that WILL weld if the player drops right now
+        drawAttachMarkers(markerType, markerX, markerY, markerRot, markerIgnore);
 
         // selection outlines + activation-group badges (item 6a)
         if (!selected.isEmpty() || hasAnyGroup()) {
@@ -1825,6 +1922,7 @@ public class EditorScreen extends ScreenAdapter {
         downIndex = -1;
         dragIndex = -1;
         dragMoved = false;
+        dragBlock.clear();
         if (stage != null) stage.cancelTouchFocus();
     }
 }

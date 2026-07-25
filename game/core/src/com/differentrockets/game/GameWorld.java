@@ -969,15 +969,16 @@ public class GameWorld {
     /**
      * Sandbox save file: Show_sandbox-compatible XML at
      * <resource root>/Sandboxs/world.xml (see Res.sandboxDir). The legacy
-     * JSON save (save/world.json, app-local) is no longer WRITTEN but is
-     * still READ as a one-time fallback when no XML save exists.
+     * JSON save (<resource root>/save/world.json — moved under the shared
+     * root in round 28) is no longer WRITTEN but is still READ as a one-time
+     * fallback when no XML save exists.
      */
     private FileHandle saveFile() {
         return Res.sandboxDir().child("world.xml");
     }
 
     private FileHandle legacySaveFile() {
-        return Gdx.files.local("save/world.json");
+        return Res.saveDir().child("world.json");
     }
 
     private static String f6(double v) {

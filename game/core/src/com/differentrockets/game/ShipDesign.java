@@ -191,21 +191,84 @@ public class ShipDesign {
      *   Part[partType,id,x,y,angle,angleV,editorAngle] plus, for non-tank/non-pod
      *   parts, [activated,exploded,flippedX,flippedY] (and solar: extension).
      *   Type children: Tank[fuel], Engine[fuel], Pod[throttle,name] > Staging.
-     * Editor activation groups are written as the sample's staging: group g
-     * becomes Step #g (1-based) of every Pod's Staging element; the ship name
-     * rides in the first Pod's name attribute. Weld records (connections list)
-     * map to Connections with 1-based attach numbering; empty when none.
+     * The root-connected weld tree (component of part 0) is the main ship
+     * (Parts + Connections); every OTHER undirected component becomes one
+     * <DisconnectedPart> block with its own Parts + Connections — exactly the
+     * sample's structure. Editor activation groups are written as the sample's
+     * staging: group g becomes Step #g (1-based) of every Pod's Staging
+     * element, scoped to the pod's own component; the ship name rides in the
+     * first main Pod's name attribute. Attach numbering is 1-based (sample).
      */
     public String toXml(String shipName) {
-        String[] ids = new String[parts.size()];
-        for (int i = 0; i < parts.size(); i++) ids[i] = i == 0 ? "1" : String.valueOf(100000000 + i);
+        int n = parts.size();
+        String[] ids = new String[n];
+        for (int i = 0; i < n; i++) ids[i] = i == 0 ? "1" : String.valueOf(100000000 + i);
+
+        boolean[] rootMask = componentFromRoot();
+        List<Integer> mainIdx = new ArrayList<>();
+        for (int i = 0; i < n; i++) if (rootMask[i]) mainIdx.add(i);
+        List<List<Integer>> blocks = disconnectedComponents(rootMask);
 
         StringBuilder sb = new StringBuilder();
         sb.append("<?xml version=\"1.0\" encoding=\"UTF-8\"?><Ship version=\"1\" liftedOff=\"0\" touchingGround=\"0\">\n");
-        sb.append("<DisconnectedParts/>\n");
-        sb.append("<Parts>\n");
-        boolean named = false;
+        if (blocks.isEmpty()) {
+            sb.append("<DisconnectedParts/>\n");
+        } else {
+            sb.append("<DisconnectedParts>\n");
+            for (List<Integer> comp : blocks) {
+                boolean[] mask = maskOf(comp);
+                sb.append("<DisconnectedPart>\n");
+                appendPartsBlock(sb, comp, mask, ids, null);
+                appendConnectionsBlock(sb, mask, ids);
+                sb.append("</DisconnectedPart>\n");
+            }
+            sb.append("</DisconnectedParts>\n");
+        }
+        appendPartsBlock(sb, mainIdx, rootMask, ids, shipName);
+        appendConnectionsBlock(sb, rootMask, ids);
+        sb.append("</Ship>");
+        return sb.toString();
+    }
+
+    /** Undirected components among parts NOT in the root component. */
+    private List<List<Integer>> disconnectedComponents(boolean[] rootMask) {
+        List<List<Integer>> out = new ArrayList<>();
+        boolean[] seen = new boolean[parts.size()];
         for (int i = 0; i < parts.size(); i++) {
+            if (rootMask[i] || seen[i]) continue;
+            List<Integer> comp = new ArrayList<>();
+            List<Integer> queue = new ArrayList<>();
+            seen[i] = true;
+            queue.add(i);
+            while (!queue.isEmpty()) {
+                int cur = queue.remove(queue.size() - 1);
+                comp.add(cur);
+                for (Connection c : connections) {
+                    int other = c.partA == cur ? c.partB : c.partB == cur ? c.partA : -1;
+                    if (other >= 0 && other < parts.size() && !rootMask[other] && !seen[other]) {
+                        seen[other] = true;
+                        queue.add(other);
+                    }
+                }
+            }
+            java.util.Collections.sort(comp);
+            out.add(comp);
+        }
+        return out;
+    }
+
+    private boolean[] maskOf(List<Integer> idxs) {
+        boolean[] m = new boolean[parts.size()];
+        for (int i : idxs) m[i] = true;
+        return m;
+    }
+
+    /** One <Parts> block for the given component (shipName only on its first pod). */
+    private void appendPartsBlock(StringBuilder sb, List<Integer> idxs, boolean[] mask,
+                                  String[] ids, String shipName) {
+        sb.append("<Parts>\n");
+        boolean named = shipName == null; // disconnected blocks carry no ship name
+        for (int i : idxs) {
             DesignPart p = parts.get(i);
             PartType t = PartList.get(p.typeId);
             boolean isTank = t != null && t.tank != null;
@@ -228,7 +291,7 @@ public class ShipDesign {
                 sb.append("<Pod throttle=\"0.000000\" name=\"")
                         .append(named ? "" : esc(shipName)).append("\">\n");
                 named = true;
-                appendStagingXml(sb, ids);
+                appendStagingXml(sb, ids, mask);
                 sb.append("</Pod>\n</Part>\n");
             } else if (child != null) {
                 sb.append(">\n").append(child).append("\n</Part>\n");
@@ -237,32 +300,32 @@ public class ShipDesign {
             }
         }
         sb.append("</Parts>\n");
-        if (connections.isEmpty()) {
-            sb.append("<Connections/>\n");
-        } else {
-            sb.append("<Connections>\n");
-            for (Connection c : connections) {
-                if (c.partA < 0 || c.partA >= parts.size() || c.partB < 0 || c.partB >= parts.size())
-                    continue;
-                // XML attach numbering is 1-based (sample: values 1..4)
-                sb.append("<Connection parentAttachPoint=\"").append(c.attachA + 1)
-                        .append("\" childAttachPoint=\"").append(c.attachB + 1)
-                        .append("\" parentPart=\"").append(ids[c.partA])
-                        .append("\" childPart=\"").append(ids[c.partB]).append("\"/>\n");
-            }
-            sb.append("</Connections>\n");
-        }
-        sb.append("</Ship>");
-        return sb.toString();
     }
 
-    /** group g -> Step g (1-based), parts as Activate Id refs (sample semantics). */
-    private void appendStagingXml(StringBuilder sb, String[] ids) {
+    /** One <Connections> block (welds whose both ends are inside mask). */
+    private void appendConnectionsBlock(StringBuilder sb, boolean[] mask, String[] ids) {
+        StringBuilder body = new StringBuilder();
+        for (Connection c : connections) {
+            if (c.partA < 0 || c.partA >= parts.size() || c.partB < 0 || c.partB >= parts.size())
+                continue;
+            if (!mask[c.partA] || !mask[c.partB]) continue;
+            // XML attach numbering is 1-based (sample: values 1..4)
+            body.append("<Connection parentAttachPoint=\"").append(c.attachA + 1)
+                    .append("\" childAttachPoint=\"").append(c.attachB + 1)
+                    .append("\" parentPart=\"").append(ids[c.partA])
+                    .append("\" childPart=\"").append(ids[c.partB]).append("\"/>\n");
+        }
+        if (body.length() == 0) sb.append("<Connections/>\n");
+        else sb.append("<Connections>\n").append(body).append("</Connections>\n");
+    }
+
+    /** group g -> Step g (1-based), Activate Id refs scoped to the component. */
+    private void appendStagingXml(StringBuilder sb, String[] ids, boolean[] mask) {
         sb.append("<Staging currentStage=\"0\">\n");
         for (int g = 1; g <= 8; g++) {
             StringBuilder step = new StringBuilder();
             for (int i = 0; i < parts.size(); i++) {
-                if (parts.get(i).group == g) {
+                if (mask[i] && parts.get(i).group == g) {
                     step.append("<Activate Id=\"").append(ids[i]).append("\" moved=\"0\"/>\n");
                 }
             }
@@ -273,11 +336,13 @@ public class ShipDesign {
     }
 
     /**
-     * Parse a Show_Rocket ship XML. Tolerant of missing fields (defaults):
-     * editorAngle falls back to round(angle / 90deg); flipped/activated absent
-     * -> false/0; activation groups come from the first Pod's Staging Steps
-     * (Step k -> group k+1). Only the main Parts list is loaded;
-     * DisconnectedParts are accepted but not merged into the editor design.
+     * Parse a Show_Rocket ship XML. Loads the main Parts AND every
+     * DisconnectedPart block (they become unwelded blocks in the editor, shown
+     * translucent until the player welds them on). Tolerant of missing fields
+     * (defaults): editorAngle falls back to round(angle / 90deg);
+     * flipped/activated absent -> false/0; activation groups come from the
+     * first main Pod's Staging Steps (Step k -> group k+1); part ids form one
+     * global namespace across all blocks, so cross-block references resolve.
      */
     public static ShipDesign fromXml(String xml) {
         if (!xml.isEmpty() && xml.charAt(0) == '﻿') xml = xml.substring(1);
@@ -292,37 +357,48 @@ public class ShipDesign {
         }
         ShipDesign d = new ShipDesign();
         List<String> ids = new ArrayList<>();
-        XmlReader.Element partsEl = null;
+        // ORDER MATTERS: the main Parts block must be parsed FIRST so part 0
+        // stays the root (pod) of the weld tree; DisconnectedParts append
+        // after. ids form one global namespace across all blocks.
+        XmlReader.Element mainParts = null;
         for (int i = 0; i < root.getChildCount(); i++) {
             XmlReader.Element ch = root.getChild(i);
-            if ("Parts".equals(ch.getName())) { partsEl = ch; break; }
-        }
-        if (partsEl != null) {
-            for (int i = 0; i < partsEl.getChildCount(); i++) {
-                XmlReader.Element pe = partsEl.getChild(i);
-                if (!"Part".equals(pe.getName())) continue;
-                DesignPart dp = new DesignPart();
-                dp.typeId = pe.getAttribute("partType", "pod-1");
-                dp.x = pe.getFloatAttribute("x", 0f);
-                dp.y = pe.getFloatAttribute("y", 0f);
-                int ea = pe.getIntAttribute("editorAngle", -1);
-                if (ea < 0) {
-                    double ang = Xml.getDouble(pe, "angle", 0);
-                    ea = (int) Math.round(ang / (Math.PI / 2));
-                }
-                dp.rot = ((ea % 4) + 4) % 4;
-                // the sample encodes booleans as 0/1, which Boolean.parseBoolean
-                // would misread (only "true" is true) — parse as ints instead
-                dp.flippedX = pe.getIntAttribute("flippedX", 0) != 0;
-                dp.flippedY = pe.getIntAttribute("flippedY", 0) != 0;
-                ids.add(pe.getAttribute("id", String.valueOf(i)));
-                d.parts.add(dp);
+            if ("Parts".equals(ch.getName())) {
+                if (mainParts == null) mainParts = ch;
+                parsePartsBlock(ch, d, ids);
             }
         }
-        // staging: first Pod that carries a Staging element wins
-        if (partsEl != null) {
-            for (int i = 0; i < partsEl.getChildCount(); i++) {
-                XmlReader.Element pe = partsEl.getChild(i);
+        for (int i = 0; i < root.getChildCount(); i++) {
+            XmlReader.Element ch = root.getChild(i);
+            if (!"DisconnectedParts".equals(ch.getName())) continue;
+            for (int k = 0; k < ch.getChildCount(); k++) {
+                XmlReader.Element dp = ch.getChild(k);
+                if (!"DisconnectedPart".equals(dp.getName())) continue;
+                for (int c = 0; c < dp.getChildCount(); c++) {
+                    XmlReader.Element sub = dp.getChild(c);
+                    if ("Parts".equals(sub.getName())) parsePartsBlock(sub, d, ids);
+                }
+            }
+        }
+        for (int i = 0; i < root.getChildCount(); i++) {
+            XmlReader.Element ch = root.getChild(i);
+            if ("Connections".equals(ch.getName())) {
+                parseConnectionsBlock(ch, d, ids);
+            } else if ("DisconnectedParts".equals(ch.getName())) {
+                for (int k = 0; k < ch.getChildCount(); k++) {
+                    XmlReader.Element dp = ch.getChild(k);
+                    if (!"DisconnectedPart".equals(dp.getName())) continue;
+                    for (int c = 0; c < dp.getChildCount(); c++) {
+                        XmlReader.Element sub = dp.getChild(c);
+                        if ("Connections".equals(sub.getName())) parseConnectionsBlock(sub, d, ids);
+                    }
+                }
+            }
+        }
+        // staging: first main-ship Pod that carries a Staging element wins
+        if (mainParts != null) {
+            for (int i = 0; i < mainParts.getChildCount(); i++) {
+                XmlReader.Element pe = mainParts.getChild(i);
                 if (!"Part".equals(pe.getName())) continue;
                 XmlReader.Element pod = null;
                 for (int c = 0; c < pe.getChildCount(); c++) {
@@ -353,24 +429,46 @@ public class ShipDesign {
                 break; // one pod's staging is enough
             }
         }
-        // connections: parentPart/childPart are id refs; attach numbering is 1-based
-        for (int i = 0; i < root.getChildCount(); i++) {
-            XmlReader.Element ch = root.getChild(i);
-            if (!"Connections".equals(ch.getName())) continue;
-            for (int c = 0; c < ch.getChildCount(); c++) {
-                XmlReader.Element ce = ch.getChild(c);
-                if (!"Connection".equals(ce.getName())) continue;
-                int pa = ids.indexOf(ce.getAttribute("parentPart", ""));
-                int pb = ids.indexOf(ce.getAttribute("childPart", ""));
-                if (pa < 0 || pb < 0) continue;
-                d.connections.add(new Connection(pa, pb,
-                        ce.getIntAttribute("parentAttachPoint", 1) - 1,
-                        ce.getIntAttribute("childAttachPoint", 1) - 1));
-            }
-            break;
-        }
         if (d.stages.isEmpty()) d.autoStage();
         return d;
+    }
+
+    /** Append one <Parts> block's parts to the design (global id namespace). */
+    private static void parsePartsBlock(XmlReader.Element partsEl, ShipDesign d, List<String> ids) {
+        for (int i = 0; i < partsEl.getChildCount(); i++) {
+            XmlReader.Element pe = partsEl.getChild(i);
+            if (!"Part".equals(pe.getName())) continue;
+            DesignPart dp = new DesignPart();
+            dp.typeId = pe.getAttribute("partType", "pod-1");
+            dp.x = pe.getFloatAttribute("x", 0f);
+            dp.y = pe.getFloatAttribute("y", 0f);
+            int ea = pe.getIntAttribute("editorAngle", -1);
+            if (ea < 0) {
+                double ang = Xml.getDouble(pe, "angle", 0);
+                ea = (int) Math.round(ang / (Math.PI / 2));
+            }
+            dp.rot = ((ea % 4) + 4) % 4;
+            // the sample encodes booleans as 0/1, which Boolean.parseBoolean
+            // would misread (only "true" is true) — parse as ints instead
+            dp.flippedX = pe.getIntAttribute("flippedX", 0) != 0;
+            dp.flippedY = pe.getIntAttribute("flippedY", 0) != 0;
+            ids.add(pe.getAttribute("id", String.valueOf(ids.size())));
+            d.parts.add(dp);
+        }
+    }
+
+    /** Append one <Connections> block (id refs; attach numbering is 1-based). */
+    private static void parseConnectionsBlock(XmlReader.Element connEl, ShipDesign d, List<String> ids) {
+        for (int c = 0; c < connEl.getChildCount(); c++) {
+            XmlReader.Element ce = connEl.getChild(c);
+            if (!"Connection".equals(ce.getName())) continue;
+            int pa = ids.indexOf(ce.getAttribute("parentPart", ""));
+            int pb = ids.indexOf(ce.getAttribute("childPart", ""));
+            if (pa < 0 || pb < 0) continue;
+            d.connections.add(new Connection(pa, pb,
+                    ce.getIntAttribute("parentAttachPoint", 1) - 1,
+                    ce.getIntAttribute("childAttachPoint", 1) - 1));
+        }
     }
 
     // ---------------- JSON (undo/redo snapshots only) ----------------

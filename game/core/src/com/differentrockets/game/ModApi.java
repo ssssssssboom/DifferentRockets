@@ -41,11 +41,24 @@ public class ModApi {
     public void applyForceAt(double fx, double fy, double localX, double localY) {
         if (part.body == null) return;
         Vector2 wp = part.body.getWorldPoint(new Vector2((float) localX, (float) localY));
-        part.body.applyForce((float) fx, (float) fy, wp.x, wp.y, true);
+        // register as a continuous frame force: GameWorld.substep re-applies
+        // it before EVERY physics step this frame, so thrust covers the full
+        // simulated time at any warp level (see Ship.FrameForce)
+        part.ship.addFrameForce(part.body, (float) fx, (float) fy, wp.x, wp.y);
     }
 
     public void applyTorque(double t) {
         if (part.body != null) part.body.applyTorque((float) t, true);
+    }
+
+    // ---------- wheel (round 27: wheel-*.lua) ----------
+    /** Lock/unlock the wheel tire (locked = held rigid by the motor). */
+    public void setWheelLocked(boolean locked) { part.setWheelLocked(locked); }
+    /** Signed drive fraction -1..1 (0 = free-spin); ignored while locked. */
+    public void setWheelDrive(double frac) { part.setWheelDrive(frac); }
+    /** Tire angular velocity (rad/s); negative = reverse. */
+    public double getWheelSpeed() {
+        return part.tireBody != null ? part.tireBody.getAngularVelocity() : 0;
     }
 
     // ---------- ship / world ----------

@@ -590,6 +590,10 @@ public class TerrainSystem implements Disposable {
             ps.set(v);
             FixtureDef fd = new FixtureDef();
             fd.shape = ps;
+            // own collision category (round 27 wheels): tires mask terrain in,
+            // parts out — without this split, tires would hit parts too
+            fd.filter.categoryBits = PartType.CAT_TERRAIN;
+            fd.filter.maskBits = -1;
             fd.friction = friction;
             fd.restitution = restitution;
             c.body.createFixture(fd);

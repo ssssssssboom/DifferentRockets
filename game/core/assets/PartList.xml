@@ -26,11 +26,13 @@
       </AttachPoints>
    </PartType>
    <PartType id="wheel-1" name="Old Wheel" description="Your turn buttons can control these wheels." sprite="Wheel.png" type="wheel" mass="0.25" width="4" height="4" ignoreEditorIntersections="true" hidden="true" disableEditorRotation="true">
+      <Wheel axleRadius="1.0" maxTorque="4000" maxSpeed="10" lockTorque="8000" />
       <AttachPoints>
          <AttachPoint x="0" y="0" breakAngle="180" />
       </AttachPoints>
    </PartType>
    <PartType id="wheel-2" name="Wheel" description="Your turn buttons can control these wheels." sprite="Wheel.png" type="wheel" mass="0.25" width="4" height="4" ignoreEditorIntersections="true" disableEditorRotation="true" buoyancy="1.0">
+      <Wheel axleRadius="1.0" maxTorque="4000" maxSpeed="10" lockTorque="8000" />
       <AttachPoints>
          <AttachPoint x="0" y="0" breakAngle="180" />
       </AttachPoints>

@@ -77,12 +77,32 @@ public class PartType {
         public float maxAngle, minLength, maxLength, angleSpeed, lengthSpeed, width;
     }
 
+    /**
+     * Wheel (round 27): the part body is a small AXLE circle (radius
+     * axleRadius, collides with other parts/terrain as usual); a second body,
+     * the TIRE (diameter = the part's width), hangs on a revolute joint with
+     * a motor and only collides with terrain and other tires — never with
+     * parts — so the chassis can sit between the wheels without contact
+     * fighting. Locked until staged (wheel-*.lua); once unlocked the motor
+     * torque follows the nav ring / turn buttons.
+     */
+    public static class WheelDef {
+        public float axleRadius = 1.0f;  // XML length units (0.5 m each)
+        public float maxTorque = 4000f;  // N*m at full drive
+        public float maxSpeed = 10f;     // motor target rad/s (tire peripheral = 20 m/s at r=2)
+        public float lockTorque = 8000f; // holding torque while locked/pre-stage
+    }
+
+    /** Box2D collision categories: parts/axles, terrain blocks, wheel tires. */
+    public static final short CAT_PART = 0x0001, CAT_TERRAIN = 0x0002, CAT_TIRE = 0x0004;
+
     public String id;
     public String name;
     public String sprite;
     public String type;
+    /** XML mass unit = 500 kg (owner calibration: pod mass=1.0 means 500 kg). */
     public double massTons;
-    public float width, height;       // meters
+    public float width, height;       // XML length unit = 0.5 m (strut width=16 is 8 m)
     public float buoyancy = 0f;
     public String category = "";
     public boolean hidden, sandboxOnly;
@@ -98,10 +118,12 @@ public class PartType {
     public RcsDef rcs;
     public SolarDef solar;
     public LanderDef lander;
+    public WheelDef wheel;
     public final List<ShapeDef> shapes = new ArrayList<>();
     public final List<AttachPoint> attach = new ArrayList<>();
 
-    public double massKg() { return massTons * 1000.0; }
+    /** kg = XML mass units * 500 (unit = 500 kg, owner calibration round 27). */
+    public double massKg() { return massTons * 500.0; }
 
     public boolean isEngine() { return engine != null; }
     public boolean isTank() { return tank != null; }
@@ -172,6 +194,13 @@ public class PartType {
                         d.lengthSpeed = ch.getFloatAttribute("lengthSpeed", 0.5f);
                         d.width = ch.getFloatAttribute("width", 0.5f);
                         t.lander = d;
+                    } else if ("Wheel".equals(cn)) {
+                        WheelDef d = new WheelDef();
+                        d.axleRadius = ch.getFloatAttribute("axleRadius", 1.0f);
+                        d.maxTorque = ch.getFloatAttribute("maxTorque", 4000f);
+                        d.maxSpeed = ch.getFloatAttribute("maxSpeed", 10f);
+                        d.lockTorque = ch.getFloatAttribute("lockTorque", 8000f);
+                        t.wheel = d;
                     } else if ("Shape".equals(cn)) {
                         ShapeDef sd = new ShapeDef();
                         sd.sensor = ch.getBooleanAttribute("sensor", false);

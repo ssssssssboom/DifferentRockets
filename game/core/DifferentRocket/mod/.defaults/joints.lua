@@ -1,4 +1,4 @@
--- v2026.07.21
+-- v2026.07.26
 -- ============================================================================
 -- joints.lua — 连接（焊接点）规则（玩家可改）
 -- ============================================================================
@@ -28,6 +28,14 @@
 --   * 让引擎座更容易断    if attachA.breakForce then ... end
 -- ============================================================================
 
+-- Round 22 (v2026.07.26): 通用默认值改为 20 Hz / 1.0 / 1.0，直接写在本
+-- 文件里（此前转读 physics.lua 的 `joints` 表，该表仍是旧的 20/1.1/0.6，
+-- 已不再是默认链路的一环）。零件用 part:setJointParams{...} 显式自定义的
+-- 覆盖值不受此默认值影响。
+local DEFAULT_FREQ = 20.0     -- frequencyHz 默认：刚性
+local DEFAULT_DAMP = 1.0      -- dampingRatio 默认：临界阻尼（was 1.1）
+local DEFAULT_ANGDAMP = 1.0   -- angularDamping 默认：每秒衰减比例（was 0.6）
+
 function jointParams(partA, attachA, partB, attachB)
     -- 两侧零件在 onLoad 里通过 part:setJointParams{...} 设置的覆盖值
     local oA = partA:getJointParams()
@@ -43,12 +51,12 @@ function jointParams(partA, attachA, partB, attachB)
     end
 
     return {
-        -- 覆盖值缺省时读 physics.lua 的 joints 表，再缺省用内置 20 / 1.1
-        frequencyHz    = freq or partA:physicsNumber("joints", "frequencyHz"),
-        dampingRatio   = damp or partA:physicsNumber("joints", "dampingRatio"),
+        -- 覆盖值缺省时用本文件的通用默认（round 22: 20 / 1.0 / 1.0）
+        frequencyHz    = freq or DEFAULT_FREQ,
+        dampingRatio   = damp or DEFAULT_DAMP,
         -- 角速度阻尼：任一侧有覆盖就用覆盖，否则用全局默认
         angularDamping = oA.angularDamping or oB.angularDamping
-                         or partA:physicsNumber("joints", "angularDamping"),
+                         or DEFAULT_ANGDAMP,
         -- breakForce 省略 → 取两连接点的较小值（见文件头说明）
     }
 end

@@ -367,12 +367,9 @@ public class GameWorld {
             Vec2d now = s.getUniversePos();
             double dx = oux[i] - now.x, dy = ouy[i] - now.y;
             if (dx * dx + dy * dy > 1e-12) {
-                for (Part p : s.parts) {
-                    if (p.body != null) {
-                        p.body.setTransform(p.body.getPosition().x + (float) dx,
-                                p.body.getPosition().y + (float) dy, p.body.getAngle());
-                    }
-                }
+                final double fdx = dx, fdy = dy;
+                s.forEachBody(b -> b.setTransform(b.getPosition().x + (float) fdx,
+                        b.getPosition().y + (float) fdy, b.getAngle()));
             }
             Vec2d vn = s.getUniverseVel();
             double dvx = ovx[i] - vn.x, dvy = ovy[i] - vn.y;
@@ -380,12 +377,9 @@ public class GameWorld {
                 if (s.onRails) {
                     s.originVel.add(dvx, dvy);
                 } else {
-                    for (Part p : s.parts) {
-                        if (p.body != null) {
-                            p.body.setLinearVelocity(p.body.getLinearVelocity().x + (float) dvx,
-                                    p.body.getLinearVelocity().y + (float) dvy);
-                        }
-                    }
+                    final double fvx = dvx, fvy = dvy;
+                    s.forEachBody(b -> b.setLinearVelocity(b.getLinearVelocity().x + (float) fvx,
+                            b.getLinearVelocity().y + (float) fvy));
                 }
             }
         }
@@ -528,13 +522,9 @@ public class GameWorld {
             if (s.onRails) {
                 s.originVel.sub(tmp2d.set(cv.x, cv.y));
             } else {
-                for (Part p : s.parts) {
-                    if (p.body != null) {
-                        p.body.setLinearVelocity(
-                                p.body.getLinearVelocity().x - cv.x,
-                                p.body.getLinearVelocity().y - cv.y);
-                    }
-                }
+                s.forEachBody(b -> b.setLinearVelocity(
+                        b.getLinearVelocity().x - cv.x,
+                        b.getLinearVelocity().y - cv.y));
             }
         }
         frameVel.add(cv.x, cv.y);
@@ -557,16 +547,10 @@ public class GameWorld {
                     // freeze: store frame-relative velocity, park the bodies rigidly
                     Vector2 cv = s.velocity(tmpV);
                     s.originVel.set(cv.x, cv.y);
-                    for (Part p : s.parts) {
-                        if (p.body != null) p.body.setLinearVelocity(0, 0);
-                    }
+                    s.forEachBody(b -> b.setLinearVelocity(0, 0));
                 } else {
                     // reactivate: give bodies the ship's frame-relative velocity
-                    for (Part p : s.parts) {
-                        if (p.body != null) {
-                            p.body.setLinearVelocity((float) s.originVel.x, (float) s.originVel.y);
-                        }
-                    }
+                    s.forEachBody(b -> b.setLinearVelocity((float) s.originVel.x, (float) s.originVel.y));
                     s.originVel.set(0, 0);
                 }
                 s.setBodiesActive(!rails);
@@ -840,6 +824,14 @@ public class GameWorld {
         // integrateRails/warpRailsShip instead.
         for (Ship s : ships) {
             if (!s.onRails) applyEnvironmentForces(s, h);
+        }
+        // script-registered continuous forces (engine thrust, RCS...):
+        // re-applied at EVERY substep so they cover the full simulated time
+        // at any warp (Box2D clears applied forces after each step — a plain
+        // applyForce only acted on the first substep, so at warp 4 engines
+        // burned 4x fuel for 1x thrust).
+        for (Ship s : ships) {
+            if (!s.onRails) s.applyFrameForces();
         }
         boxWorld.step(h, VEL_ITER, POS_ITER);
         // advance the inertial frame: the physics origin moves with frameVel

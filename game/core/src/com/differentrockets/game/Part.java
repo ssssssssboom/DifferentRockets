@@ -30,6 +30,11 @@ public class Part {
     public boolean deployed;         // parachute / lander state
     public boolean stageActivatedThisFrame;
 
+    /** Wheel physics (round 27): second body + motorized revolute joint, see createWheel. */
+    public Body tireBody;
+    public com.badlogic.gdx.physics.box2d.joints.RevoluteJoint wheelJoint;
+    public boolean wheelLocked;
+
     /** Lua-overridable absolute drag coefficient (NaN = use type.drag adjustment). */
     public double dragCd = Double.NaN;
 
@@ -127,7 +132,9 @@ public class Part {
             shapes = new ArrayList<>();
             shapes.add(sd);
         }
-        for (PartType.ShapeDef sd : shapes) {
+        // wheels have no polygon hull: the small axle circle (createWheel) is
+        // the whole part body, so nothing drags on the ground while rolling
+        for (PartType.ShapeDef sd : (type.wheel != null ? new ArrayList<PartType.ShapeDef>() : shapes)) {
             int n = Math.min(sd.verts.size(), 8);
             Vector2[] vs = new Vector2[n];
             // flippedX/flippedY mirror the polygon (round 27): negate the
@@ -143,6 +150,8 @@ public class Part {
             FixtureDef fd = new FixtureDef();
             fd.shape = ps;
             fd.density = 1f;
+            fd.filter.categoryBits = PartType.CAT_PART;
+            fd.filter.maskBits = -1; // parts collide with everything
             // round 13 item 1a: Box2D mixes contact friction as sqrt(fA*fB).
             // With the old 0.4 part default, terrain friction was nearly
             // irrelevant (sqrt(0.4*1.0)=0.63 — the ship slid on any slope no
@@ -157,6 +166,104 @@ public class Part {
             ps.dispose();
         }
         updateMass();
+        if (type.wheel != null) createWheel(ox, oy, shipAngle);
+    }
+
+    /**
+     * Wheel physics (round 27, see PartType.WheelDef): the part body created
+     * above doubles as the AXLE; here we add the TIRE — a second dynamic body
+     * (diameter = part width) on a motorized revolute joint. The tire only
+     * collides with terrain and other tires, never with parts, so the chassis
+     * between the wheels is contact-free. Starts LOCKED (wheel-*.lua unlocks
+     * on staging).
+     */
+    private void createWheel(float ox, float oy, float shipAngle) {
+        PartType.WheelDef w = type.wheel;
+        // axle: replace the box fixture's role with a small circle so the
+        // wheel hub rolls over obstacles instead of corner-catching
+        com.badlogic.gdx.physics.box2d.CircleShape axle =
+                new com.badlogic.gdx.physics.box2d.CircleShape();
+        axle.setRadius(w.axleRadius);
+        FixtureDef fd = new FixtureDef();
+        fd.shape = axle;
+        fd.density = 1f;
+        fd.filter.categoryBits = PartType.CAT_PART;
+        fd.filter.maskBits = -1;
+        fd.friction = Math.max(1.5f, type.friction);
+        fd.restitution = 0f;
+        body.createFixture(fd);
+        axle.dispose();
+        // createFixture with density>0 triggers Box2D mass recompute (axle
+        // circle would shrink the body to ~pi kg) — restore the part mass
+        updateMass();
+
+        BodyDef td = new BodyDef();
+        td.type = BodyDef.BodyType.DynamicBody;
+        td.bullet = true;
+        td.position.set(ox, oy);
+        td.angle = shipAngle;
+        tireBody = ship.world.boxWorld.createBody(td);
+        tireBody.setUserData(this);
+        com.badlogic.gdx.physics.box2d.CircleShape tire =
+                new com.badlogic.gdx.physics.box2d.CircleShape();
+        tire.setRadius(type.width / 2f); // tire diameter == wheel width
+        FixtureDef tf = new FixtureDef();
+        tf.shape = tire;
+        tf.density = 1f;
+        tf.filter.categoryBits = PartType.CAT_TIRE;
+        // terrain + other tires ONLY — never parts (per owner spec)
+        tf.filter.maskBits = (short) (PartType.CAT_TERRAIN | PartType.CAT_TIRE);
+        tf.friction = 2.0f; // rubber grip: propulsion is contact friction
+        tf.restitution = 0f;
+        tireBody.createFixture(tf);
+        tire.dispose();
+        // tire mass = wheel mass (the axle body's mass is unchanged: the hub
+        // carries the part's structural mass; the tire is the same order and
+        // the revolute joint pins their centers anyway)
+        com.badlogic.gdx.physics.box2d.MassData tm =
+                new com.badlogic.gdx.physics.box2d.MassData();
+        tm.mass = (float) Math.max(0.05, type.massKg());
+        tm.I = tm.mass * type.width * type.width / 8f; // solid disk
+        tm.center.set(0, 0);
+        tireBody.setMassData(tm);
+
+        com.badlogic.gdx.physics.box2d.joints.RevoluteJointDef jd =
+                new com.badlogic.gdx.physics.box2d.joints.RevoluteJointDef();
+        jd.initialize(body, tireBody, tireBody.getPosition());
+        jd.enableMotor = true;
+        jd.motorSpeed = 0f;
+        jd.maxMotorTorque = w.lockTorque; // locked until staged
+        jd.collideConnected = false;
+        wheelJoint = (com.badlogic.gdx.physics.box2d.joints.RevoluteJoint)
+                ship.world.boxWorld.createJoint(jd);
+        wheelLocked = true;
+    }
+
+    /** Locked = motor holds the tire rigidly (pre-stage / parked). */
+    public void setWheelLocked(boolean locked) {
+        wheelLocked = locked;
+        if (wheelJoint == null || type.wheel == null) return;
+        if (locked) {
+            wheelJoint.setMotorSpeed(0f);
+            wheelJoint.setMaxMotorTorque(type.wheel.lockTorque);
+        }
+    }
+
+    /**
+     * Signed drive fraction -1..1 (wheel-*.lua): motor runs at the signed max
+     * speed with |frac| of max torque; 0 = free-spin (unlocked, no drive).
+     */
+    public void setWheelDrive(double frac) {
+        if (wheelJoint == null || type.wheel == null || wheelLocked) return;
+        float f = (float) Math.max(-1, Math.min(1, frac));
+        PartType.WheelDef w = type.wheel;
+        if (f == 0f) {
+            wheelJoint.setMotorSpeed(0f);
+            wheelJoint.setMaxMotorTorque(0f); // free-spin
+        } else {
+            wheelJoint.setMotorSpeed(Math.signum(f) * w.maxSpeed);
+            wheelJoint.setMaxMotorTorque(Math.abs(f) * w.maxTorque);
+        }
     }
 
     /** Set mass from definition (tank mass varies with fuel). */
@@ -164,7 +271,9 @@ public class Part {
         if (body == null) return;
         double kg = type.massKg();
         if (type.tank != null) {
-            kg = type.tank.dryMassTons * 1000.0 + fuel;
+            // tank dry mass uses the same 500 kg unit as PartType.mass;
+            // fuel units are already kg
+            kg = type.tank.dryMassTons * 500.0 + fuel;
         }
         MassData md = new MassData();
         md.mass = (float) Math.max(0.05, kg);
@@ -243,9 +352,14 @@ public class Part {
 
     public void destroyBody() {
         if (body != null) {
-            ship.world.boxWorld.destroyBody(body);
+            ship.world.boxWorld.destroyBody(body); // wheel joint dies with it
             body = null;
         }
+        if (tireBody != null) {
+            ship.world.boxWorld.destroyBody(tireBody);
+            tireBody = null;
+        }
+        wheelJoint = null;
     }
 
     // ---------- attach points in world space ----------

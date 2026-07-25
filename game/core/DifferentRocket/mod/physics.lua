@@ -1,4 +1,4 @@
--- v2026.07.25
+-- v2026.07.27
 -- ============================================================================
 -- physics.lua — physics laws (PLAYER-EDITABLE)
 -- ============================================================================
@@ -70,7 +70,7 @@ steering = { kp = 1.8, ki = 0.5, kd = 1.2 }
 --                  deg of the target = ~4 s of phase tolerance, the most
 --                  robust window available. Cost: sustained turn rate scales
 --                  ~1/damping, so coarse slews feel heavier than the PID era.
-joints = { frequencyHz = 20.0, dampingRatio = 1.1, angularDamping = 0.6 }
+joints = { frequencyHz = 20.0, dampingRatio = 1.0, angularDamping = 1.0 }
 
 -- Per-part override (round 9): a part's own Lua script may call
 --   part:setJointParams{frequencyHz=…, dampingRatio=…, angularDamping=…}

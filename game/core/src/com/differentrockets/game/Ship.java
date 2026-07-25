@@ -686,7 +686,37 @@ public class Ship {
 
     // ---------------------------------------------------------------- update
 
+    /**
+     * A continuous force registered by a script this frame. Box2D clears
+     * applied forces after every step, so a plain body.applyForce from a
+     * script only acts on the NEXT single substep; at warp >1 (several
+     * substeps per frame) thrust would cover only 1/N of the simulated time
+     * while fuel drain covered all of it. Scripts therefore REGISTER forces
+     * here and GameWorld.substep re-applies them before every step.
+     */
+    public static class FrameForce {
+        public com.badlogic.gdx.physics.box2d.Body body;
+        public float fx, fy, px, py;
+    }
+    public final List<FrameForce> frameForces = new ArrayList<>();
+
+    /** Register a continuous force for this frame (see FrameForce). */
+    public void addFrameForce(com.badlogic.gdx.physics.box2d.Body b,
+                              float fx, float fy, float px, float py) {
+        FrameForce f = new FrameForce();
+        f.body = b; f.fx = fx; f.fy = fy; f.px = px; f.py = py;
+        frameForces.add(f);
+    }
+
+    /** Re-apply this frame's registered forces (called before every substep). */
+    public void applyFrameForces() {
+        for (FrameForce f : frameForces) {
+            if (f.body != null) f.body.applyForce(f.fx, f.fy, f.px, f.py, true);
+        }
+    }
+
     public void updateScripts(double dt) {
+        frameForces.clear(); // scripts re-register their continuous forces below
         for (Part p : parts) p.flameLevel = 0f;
         for (Part p : parts) p.callOnUpdate(dt);
         // stage flags persist until the end of the frame so Lua onUpdate can read them
@@ -705,6 +735,7 @@ public class Ship {
      * behavior. Skipped while the ship rides rails (super-warp parks it).
      */
     public void updateEngineScripts(double dt) {
+        frameForces.clear();
         for (Part p : parts) {
             if (p.body != null && "engine".equals(p.type.type)) {
                 p.flameLevel = 0f;
@@ -754,9 +785,7 @@ public class Ship {
     }
 
     public void setBodiesActive(boolean active) {
-        for (Part p : parts) {
-            if (p.body != null) p.body.setActive(active);
-        }
+        forEachBody(b -> b.setActive(active));
     }
 
     /** The part that provides control input/heading reference: the pod, else the first part. */
@@ -812,13 +841,17 @@ public class Ship {
     }
 
     /** Shift every body of this ship by (dx,dy) (used when the floating origin moves). */
-    public void shiftBodies(double dx, double dy) {
+    /** All physics bodies of this ship: part bodies plus wheel tire bodies. */
+    public void forEachBody(java.util.function.Consumer<com.badlogic.gdx.physics.box2d.Body> c) {
         for (Part p : parts) {
-            if (p.body != null) {
-                p.body.setTransform((float) (p.body.getPosition().x + dx),
-                        (float) (p.body.getPosition().y + dy), p.body.getAngle());
-            }
+            if (p.body != null) c.accept(p.body);
+            if (p.tireBody != null) c.accept(p.tireBody);
         }
+    }
+
+    public void shiftBodies(double dx, double dy) {
+        forEachBody(b -> b.setTransform((float) (b.getPosition().x + dx),
+                (float) (b.getPosition().y + dy), b.getAngle()));
         origin.x -= dx;
         origin.y -= dy;
     }

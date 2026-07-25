@@ -337,22 +337,21 @@ public class SandboxScreen extends ScreenAdapter {
         root.add(mid).expandY().fillX().row();
 
         Table bottomA = new Table();
-        bottomA.add(leftBtn).width(120).height(96).pad(4);
-        bottomA.add(rightBtn).width(120).height(96).pad(4);
         bottomA.add(stageLabel).expandX().center().padLeft(8);
         bottomA.add(zoomIn).width(96).height(96).pad(4);
         bottomA.add(zoomOut).width(96).height(96).pad(4);
         bottomA.add(centerBtn).width(130).height(96).pad(4);
         root.add(bottomA).fillX().row();
 
+        // bottom row (user request): ACTIVATE/STAGE pinned LEFT, turn buttons
+        // < > CENTERED, BACK pinned to the right edge (same size as STAGE,
+        // same behavior as the phone BACK key — toggleBackDialog, task D2)
         Table bottomB = new Table();
-        bottomB.add().expandX();
-        bottomB.add(activateBtn).width(170).height(110).pad(6);
+        bottomB.add(activateBtn).width(170).height(110).pad(6).padLeft(16);
         bottomB.add(stageBtn).width(200).height(110).pad(6);
-        // bottom-right back button (user request): same size as STAGE, same
-        // behavior as the phone BACK key (toggleBackDialog, task D2).
-        // Pinned to the RIGHT EDGE: ACTIVATE/STAGE keep their centered pair,
-        // BACK gets its own expandX gap in front and only a small margin.
+        bottomB.add().expandX();
+        bottomB.add(leftBtn).width(120).height(96).pad(4);
+        bottomB.add(rightBtn).width(120).height(96).pad(4);
         bottomB.add().expandX();
         TextButton backBtn = new TextButton("BACK", game.ui.skin);
         backBtn.addListener(new ClickListener() {
@@ -391,22 +390,26 @@ public class SandboxScreen extends ScreenAdapter {
     }
 
     private TextButton holdBtn(String label, final int dir) {
-        // turn buttons: fine slew of the steering target heading (item 4);
-        // while HELD they also drive SteeringIO.buttonTurn (item 2-UI), which
-        // the steering consumer treats as an override of the ring
+        // turn buttons (semantics revision): while HELD the steering ring is
+        // deactivated (target heading UNCHANGED — SteeringIO.targetHeadingRad
+        // is never touched here) and buttonTurn carries the direction at full
+        // deflection: "<" (dir=+1, nose left) = -1, ">" (dir=-1) = +1.
+        // control.lua reads buttonTurn and swings every gimbaled engine to
+        // its own max angle (and the wheel script uses the same signal).
+        // On release buttonTurn returns to 0 and the ring's previous
+        // activation state is restored.
         TextButton b = new TextButton(label, game.ui.skin);
         b.addListener(new ClickListener() {
+            boolean prevRingActive;
             @Override public boolean touchDown(InputEvent e, float x, float y, int pointer, int button) {
-                slewDir = dir;
-                syncButtonTurn();
-                // round 20 item 2: grabbing a TURN button hands steering to
-                // the buttons — the ring loses activation (gray standby)
+                prevRingActive = SteeringIO.ringActive;
                 SteeringIO.ringActive = false;
+                SteeringIO.buttonTurn = dir > 0 ? -1 : 1; // contract: -1 left, +1 right (held)
                 return true;
             }
             @Override public void touchUp(InputEvent e, float x, float y, int pointer, int button) {
-                if (slewDir == dir) slewDir = 0;
-                syncButtonTurn();
+                SteeringIO.buttonTurn = 0; // released: no deflection
+                SteeringIO.ringActive = prevRingActive;
             }
         });
         return b;

@@ -1,4 +1,8 @@
--- v2026.07.25
+-- v2026.07.27
+-- v2026.07.27: thrust constant 1e5 -> 8.5e4 N per power unit (SR calibration:
+-- power*85 = rated kN; Blasto 425 = 5.0 power = 425 kN. With fuel kg and
+-- consumption kg/s this reproduces SR's moon hop: 6000 kg / 125 kg/s = 48 s,
+-- vmax ~= 4523 m/s. Mass unit is 500 kg (owner calibration, PartType.massKg).
 -- DifferentRockets generic engine behavior.
 -- Thrust vector = power * throttle along the nozzle, gimbal follows the SHARED
 -- control law in mod/control.lua (round 12), fuel drained through the ship's
@@ -88,7 +92,7 @@ function onUpdate(part, dt)
   if ft == 3 then
     -- solid rocket booster
     local frac = drainOwn(part, dt)
-    thrust = part:getEnginePower() * 1e5 * frac
+    thrust = part:getEnginePower() * 8.5e4 * frac
     gimbal = 0 -- SRB: rigid nozzle, no gimbal
   else
     if th <= 0 then return end
@@ -97,7 +101,7 @@ function onUpdate(part, dt)
     local need = part:getEngineConsumption() * te * dt
     local got = part:drainFuel(ft, need)
     local frac = need > 0 and (got / need) or 0
-    thrust = part:getEnginePower() * 1e5 * te * frac
+    thrust = part:getEnginePower() * 8.5e4 * te * frac
   end
 
   if thrust <= 0 then return end
@@ -106,5 +110,5 @@ function onUpdate(part, dt)
   local dy = math.cos(ang)
   -- apply at the nozzle so gimbaling produces torque
   part:applyForceAt(dx * thrust, dy * thrust, 0, -part:getHeight() / 2)
-  part:emitFlame(math.min(1.2, thrust / (part:getEnginePower() * 1e5)), gimbal)
+  part:emitFlame(math.min(1.2, thrust / (part:getEnginePower() * 8.5e4)), gimbal)
 end

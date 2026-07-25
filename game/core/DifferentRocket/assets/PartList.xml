@@ -1,4 +1,4 @@
-﻿<PartTypes xmlns="http://jundroo.com/simplerockets/partlist.xsd">
+<PartTypes xmlns="http://jundroo.com/simplerockets/partlist.xsd">
    <PartType id="pod-1" name="Command Pod Mk1" description="This is your ship's brain. Be careful with it." sprite="Pod.png" type="pod" mass="1.0" width="4" height="3" hidden="true">
       <Damage disconnect="1500" explode="1500" explosionPower="5" explosionSize="10" />
       <Shape>
@@ -45,10 +45,10 @@
    </PartType>
    <PartType id="strut-1" name="Strut" description="Light weight and strong." sprite="Beam.png" type="strut" mass="2.0" width="16" height="2" canExplode="false" buoyancy="0.5">
       <AttachPoints>
-         <AttachPoint location="Top" breakAngle="20" breakForce="150.0" />
-         <AttachPoint location="Bottom" breakAngle="20" breakForce="150.0" />
-         <AttachPoint location="LeftSide" breakAngle="20" breakForce="150.0" />
-         <AttachPoint location="RightSide" breakAngle="20" breakForce="150.0" />
+         <AttachPoint location="Top" breakAngle="20" breakForce="2000.0" />
+         <AttachPoint location="Bottom" breakAngle="20" breakForce="2000.0" />
+         <AttachPoint location="LeftSide" breakAngle="20" breakForce="2000.0" />
+         <AttachPoint location="RightSide" breakAngle="20" breakForce="2000.0" />
       </AttachPoints>
    </PartType>
 

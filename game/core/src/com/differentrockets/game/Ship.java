@@ -34,6 +34,8 @@ public class Ship {
         public float breakForce = Float.MAX_VALUE;
         /** index of each side's attach point in its part's attachDefs (-1 = unknown). */
         public int attachIndexA = -1, attachIndexB = -1;
+        /** consecutive frames spent over breakForce (debounce, see checkJointBreaks). */
+        public int overFrames;
     }
 
     public final GameWorld world;
@@ -262,14 +264,28 @@ public class Ship {
         links.remove(l);
     }
 
-    /** Destroy joints whose reaction force exceeds their breakForce. */
+    /**
+     * Destroy joints whose reaction force exceeds their breakForce. The overload
+     * must PERSIST for BREAK_DEBOUNCE_FRAMES consecutive frames: a single-frame
+     * spike is almost always a position-correction impulse (spawn settling,
+     * ground-contact jitter amplified by stiff 35 Hz strut joints), not a real
+     * structural overload — probe showed 170-250 kN one-frame spikes on a
+     * healthy pad spawn, while genuine overloads (hard landing, over-stacked
+     * weight) hold the force high for many frames.
+     */
+    static final int BREAK_DEBOUNCE_FRAMES = 5; // ~83 ms at 60 fps
+
     public void checkJointBreaks(float invDt) {
         List<Link> dead = new ArrayList<>();
         for (Link l : links) {
             if (l.breakForce == Float.MAX_VALUE) continue;
             Vector2 f = l.joint.getReactionForce(invDt);
             float kn = f.len() / 1000f; // reaction force in kN
-            if (kn > l.breakForce) dead.add(l);
+            if (kn > l.breakForce) {
+                if (++l.overFrames >= BREAK_DEBOUNCE_FRAMES) dead.add(l);
+            } else {
+                l.overFrames = 0;
+            }
         }
         for (Link l : dead) destroyLink(l);
         if (!dead.isEmpty()) splitIfDisconnected();

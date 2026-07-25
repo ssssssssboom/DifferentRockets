@@ -1339,6 +1339,115 @@ public class EditorScreen extends ScreenAdapter {
         int part = -1, apM = -1, apO = -1;
     }
 
+    // ------------------------------------------------------------ multi-candidate snap (round 9)
+    //
+    // Instead of a single best contact, every attach pair within the snap
+    // radius is a CANDIDATE the player can cycle through by nudging the
+    // finger: the current scheme is kept until another candidate beats its
+    // contact distance by more than SNAP_HYST (hysteresis — snappy but no
+    // flicker). The chosen pair drives the ghost correction, the green
+    // highlight, and the weld recorded on drop.
+
+    /** hysteresis band (m): a rival must be closer by more than this to take over */
+    private static final float SNAP_HYST = 0.18f;
+
+    private static class SnapCand {
+        int part, apM, apO;
+        float d;        // contact distance at the RAW (finger) position
+        float nx, ny;   // ghost position after this pair's snap correction
+    }
+
+    /** currently selected candidate identity (-1 = none) */
+    private int snapSelPart = -1, snapSelApM = -1, snapSelApO = -1;
+    /** the pair currently shown as the welding scheme (highlight + drop weld) */
+    private final SnapWin lastSnapWin = new SnapWin();
+
+    private void clearSnapSel() {
+        snapSelPart = -1;
+        lastSnapWin.part = -1;
+    }
+
+    /** Snap correction for one specific attach pair (same rules as snap():
+     *  edge-type pairs quantize the free slide along the mating segment). */
+    private Vector2 snapCorrection(float px, float py, PartType.AttachPoint apM,
+                                   PartType.AttachPoint apO, Vector2 ma, Vector2 mb,
+                                   Vector2 oa, Vector2 ob, Vector2 cm, Vector2 co) {
+        float nx = px + (co.x - cm.x), ny = py + (co.y - cm.y);
+        Vector2 qn = new Vector2();
+        if (apO.edge != PartType.AttachPoint.EDGE_NONE) {
+            return Attach.quantizeAlongSegment(nx, ny, oa, ob, qn);
+        }
+        if (apM.edge != PartType.AttachPoint.EDGE_NONE) {
+            return Attach.quantizeAlongSegment(nx, ny, ma, mb, qn);
+        }
+        return new Vector2(nx, ny);
+    }
+
+    /** All candidate attach pairs within the snap radius, nearest first. */
+    private List<SnapCand> collectSnapCandidates(float px, float py, int rot, PartType type,
+                                                 int ignoreIndex,
+                                                 java.util.Collection<Integer> exclude) {
+        List<SnapCand> out = new ArrayList<>();
+        Vector2 ma = new Vector2(), mb = new Vector2();
+        Vector2 oa = new Vector2(), ob = new Vector2();
+        Vector2 cm = new Vector2(), co = new Vector2();
+        for (int i = 0; i < design.parts.size(); i++) {
+            if (i == ignoreIndex || exclude.contains(i)) continue;
+            if (!targetOk(i)) continue; // main-ship targets only (task 2)
+            ShipDesign.DesignPart dp = design.parts.get(i);
+            PartType t = PartList.get(dp.typeId);
+            if (t == null) continue;
+            for (int am = 0; am < type.attach.size(); am++) {
+                attachWorldSeg(type, px, py, rot, type.attach.get(am), ma, mb);
+                for (int ao = 0; ao < t.attach.size(); ao++) {
+                    attachWorldSeg(t, dp.x, dp.y, dp.rot, t.attach.get(ao), oa, ob);
+                    float d = Attach.closestBetweenSegments(ma, mb, oa, ob, cm, co);
+                    if (d < 2.2f) {
+                        SnapCand cnd = new SnapCand();
+                        cnd.part = i; cnd.apM = am; cnd.apO = ao; cnd.d = d;
+                        Vector2 corr = snapCorrection(px, py,
+                                type.attach.get(am), t.attach.get(ao), ma, mb, oa, ob, cm, co);
+                        cnd.nx = corr.x; cnd.ny = corr.y;
+                        out.add(cnd);
+                    }
+                }
+            }
+        }
+        out.sort((a, b) -> Float.compare(a.d, b.d));
+        return out;
+    }
+
+    /**
+     * Multi-scheme snap: collect every legal candidate at the raw position,
+     * keep the previously selected scheme while it stays within SNAP_HYST of
+     * the best (hysteresis), otherwise switch to the nearest. Returns the
+     * corrected ghost position for the SELECTED scheme and records it in
+     * lastSnapWin for the highlight and the drop weld.
+     */
+    private Vector2 snapMulti(float px, float py, int rot, PartType type, int ignoreIndex,
+                              java.util.Collection<Integer> exclude) {
+        List<SnapCand> cands = collectSnapCandidates(px, py, rot, type, ignoreIndex, exclude);
+        if (cands.isEmpty()) {
+            clearSnapSel();
+            return new Vector2(px, py);
+        }
+        SnapCand chosen = cands.get(0);
+        for (SnapCand c : cands) {
+            if (c.part == snapSelPart && c.apM == snapSelApM && c.apO == snapSelApO
+                    && c.d <= chosen.d + SNAP_HYST) {
+                chosen = c; // keep the current scheme: rival not clearly closer
+                break;
+            }
+        }
+        snapSelPart = chosen.part;
+        snapSelApM = chosen.apM;
+        snapSelApO = chosen.apO;
+        lastSnapWin.part = chosen.part;
+        lastSnapWin.apM = chosen.apM;
+        lastSnapWin.apO = chosen.apO;
+        return new Vector2(chosen.nx, chosen.ny);
+    }
+
     /** Same contact search as snap(), but reports the winning attach pair. */
     private SnapWin findSnapWinner(float px, float py, int rot, PartType type, int ignoreIndex,
                                    java.util.Collection<Integer> exclude) {
@@ -1408,11 +1517,13 @@ public class EditorScreen extends ScreenAdapter {
             }
         }
         if (dragType != null) {
-            SnapWin win = findSnapWinner(px, py, rot, dragType, ignoreIndex, exclude);
+            // the SELECTED scheme (multi-candidate snap, hysteresis-kept) —
+            // snapMulti refreshed lastSnapWin earlier this same frame
+            SnapWin win = lastSnapWin;
             for (int am = 0; am < dragType.attach.size(); am++) {
                 drawOneMarker(dragType, px, py, rot, dragType.attach.get(am), am == win.apM);
             }
-            if (win.part >= 0) {
+            if (win.part >= 0 && win.part < design.parts.size()) {
                 ShipDesign.DesignPart dp = design.parts.get(win.part);
                 PartType t = PartList.get(dp.typeId);
                 if (t != null && win.apO >= 0 && win.apO < t.attach.size()) {
@@ -1631,7 +1742,7 @@ public class EditorScreen extends ScreenAdapter {
         private boolean firstFingerDown(int screenX, int screenY, int button) {
             Vector2 w = screenToWorld(screenX, screenY);
             if (button == Input.Buttons.RIGHT) {
-                if (placing != null) { placing = null; return true; }
+                if (placing != null) { placing = null; clearSnapSel(); return true; }
                 int idx = partAt(w);
                 if (idx >= 0) {
                     pushHistory();
@@ -1649,8 +1760,11 @@ public class EditorScreen extends ScreenAdapter {
             }
             if (placing != null) {
                 pushHistory();
-                Vector2 snapped = snap(w.x, w.y, dragRot, placing, -1);
+                // multi-scheme snap: weld exactly the SELECTED scheme on drop
+                Vector2 snapped = snapMulti(w.x, w.y, dragRot, placing, -1,
+                        java.util.Collections.<Integer>emptySet());
                 design.parts.add(newPart(placing, snapped.x, snapped.y));
+                clearSnapSel();
                 // task 1: record the weld (targets: main ship only)
                 inferConnectionFor(design.parts.size() - 1,
                         java.util.Collections.<Integer>emptySet());
@@ -1753,6 +1867,7 @@ public class EditorScreen extends ScreenAdapter {
                     dragBlock.addAll(design.subtreeOf(dragIndex));
                 }
                 updateDelButton(); // show the trash can while dragging (task 6)
+                clearSnapSel(); // fresh scheme selection for the new gesture
             }
             if (dragMoved && dragIndex >= 0) {
                 Vector2 w = screenToWorld(screenX, screenY);
@@ -1765,7 +1880,7 @@ public class EditorScreen extends ScreenAdapter {
                     float dx = w.x - design.parts.get(dragIndex).x;
                     float dy = w.y - design.parts.get(dragIndex).y;
                     if (rt != null) {
-                        Vector2 snappedRoot = snap(rp.x + dx, rp.y + dy, dragRot, rt, -1, dragBlock);
+                        Vector2 snappedRoot = snapMulti(rp.x + dx, rp.y + dy, dragRot, rt, -1, dragBlock);
                         dx = snappedRoot.x - rp.x;
                         dy = snappedRoot.y - rp.y;
                     }
@@ -1780,7 +1895,7 @@ public class EditorScreen extends ScreenAdapter {
                     return true;
                 }
                 PartType t = PartList.get(design.parts.get(dragIndex).typeId);
-                Vector2 snapped = snap(w.x, w.y, dragRot, t, dragIndex, dragBlock);
+                Vector2 snapped = snapMulti(w.x, w.y, dragRot, t, dragIndex, dragBlock);
                 dragX = snapped.x;
                 dragY = snapped.y;
                 // translate by the snap-corrected delta so the block keeps formation
@@ -1880,6 +1995,7 @@ public class EditorScreen extends ScreenAdapter {
                 dragWholeBlock = false;
                 dragBlockRoot = -1;
                 updateDelButton(); // hide the trash can (task 6)
+                clearSnapSel(); // scheme selection ends with the gesture
                 return true;
             }
             if (panning) {
@@ -1915,6 +2031,7 @@ public class EditorScreen extends ScreenAdapter {
             dragWholeBlock = false;
             dragBlockRoot = -1;
             updateDelButton();
+            clearSnapSel();
             return false;
         }
 
@@ -1923,7 +2040,7 @@ public class EditorScreen extends ScreenAdapter {
             if (keycode == Input.Keys.R) { rotateGhost(); return true; }
             if (keycode == Input.Keys.ESCAPE || keycode == Input.Keys.BACK) {
                 if (overlay != null) closeOverlay();
-                else if (placing != null) placing = null;
+                else if (placing != null) { placing = null; clearSnapSel(); }
                 else if (openDrawer != 0) closeDrawers();
                 else game.setScreen(new MenuScreen(game));
                 return true;
@@ -1941,6 +2058,7 @@ public class EditorScreen extends ScreenAdapter {
         dragRot = 0;
         dragFlipX = false;
         dragFlipY = false;
+        clearSnapSel();
         closeDrawers(); // free the canvas for placement
         status("Placing: " + t.name + " (R = rotate, right-click = cancel, shift = keep placing)");
     }
@@ -2012,8 +2130,11 @@ public class EditorScreen extends ScreenAdapter {
         if (screenX > drawerW) {
             pushHistory();
             Vector2 w = screenToWorld(screenX, screenY);
-            Vector2 snapped = snap(w.x, w.y, dragRot, placing, -1);
+            // multi-scheme snap: weld exactly the SELECTED scheme on drop
+            Vector2 snapped = snapMulti(w.x, w.y, dragRot, placing, -1,
+                    java.util.Collections.<Integer>emptySet());
             design.parts.add(newPart(placing, snapped.x, snapped.y));
+            clearSnapSel();
             // task 1: record the weld (targets: main ship only)
             inferConnectionFor(design.parts.size() - 1,
                     java.util.Collections.<Integer>emptySet());
@@ -2123,7 +2244,8 @@ public class EditorScreen extends ScreenAdapter {
         int markerRot = 0, markerIgnore = -1;
         if (placing != null) {
             Vector2 w = screenToWorld(Gdx.input.getX(), Gdx.input.getY());
-            Vector2 snapped = snap(w.x, w.y, dragRot, placing, -1);
+            Vector2 snapped = snapMulti(w.x, w.y, dragRot, placing, -1,
+                    java.util.Collections.<Integer>emptySet());
             drawPart(placing.id, snapped.x, snapped.y, dragRot, dragFlipX, dragFlipY, 0.6f);
             markerType = placing;
             markerX = snapped.x; markerY = snapped.y; markerRot = dragRot;
@@ -2259,6 +2381,7 @@ public class EditorScreen extends ScreenAdapter {
         dragWholeBlock = false;
         dragBlockRoot = -1;
         updateDelButton();
+        clearSnapSel();
         if (stage != null) stage.cancelTouchFocus();
     }
 }

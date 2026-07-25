@@ -342,6 +342,13 @@ public class SandboxScreen extends ScreenAdapter {
         bottomB.add().expandX();
         bottomB.add(activateBtn).width(170).height(110).pad(6);
         bottomB.add(stageBtn).width(200).height(110).pad(6);
+        // bottom-right back button (user request): same size as STAGE, same
+        // behavior as the phone BACK key (toggleBackDialog, task D2)
+        TextButton backBtn = new TextButton("BACK", game.ui.skin);
+        backBtn.addListener(new ClickListener() {
+            @Override public void clicked(InputEvent e, float x, float y) { toggleBackDialog(); }
+        });
+        bottomB.add(backBtn).width(200).height(110).pad(6);
         bottomB.add().expandX();
         root.add(bottomB).fillX().padBottom(8);
     }

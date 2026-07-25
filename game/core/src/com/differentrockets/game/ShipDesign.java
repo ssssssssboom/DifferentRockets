@@ -19,8 +19,8 @@ public class ShipDesign {
         public String typeId;
         public float x, y;       // editor position (meters)
         public int rot;          // 0..3 (steps of 90 deg CCW) == XML editorAngle
-        /** activation group 0 = none, 1..8 (item 6); one group per part.
-         *  Maps to the XML Pod/Staging Step list (group g -> Step g-1). */
+        /** activation group 0 = none, 1..N (dynamic, item 6); one group per part.
+         *  Maps to the XML Pod/Staging Step list (group g -> Step g). */
         public int group;
         /** XML flippedX / flippedY (visual mirror; preserved even where the
          *  editor has no flip-specific behavior). */
@@ -58,6 +58,62 @@ public class ShipDesign {
 
     /** weld records of the design (see Connection); maps to XML Connections. */
     public final List<Connection> connections = new ArrayList<>();
+
+    /**
+     * Show_Rocket / SR1 XML files store positions at half our internal unit
+     * scale: our PartList sizes are exactly 2x SR1's (pod 4x3 vs our 2x1.5,
+     * fueltank-3 4x16 vs our 2x8, ...), and the sample's coordinates fit
+     * perfectly once doubled (pod y=0.75 -> bottom at 0 in our units).
+     * XML coordinates are multiplied by this factor on load, divided on save.
+     */
+    private static final float XML_UNIT = 2f;
+
+    /**
+     * Rebuild the stages list from per-part groups (group g -> stages[g-1]).
+     * Called whenever groups change so stages never go stale.
+     */
+    public void syncStagesFromGroups() {
+        int max = 0;
+        for (DesignPart p : parts) if (p.group > max) max = p.group;
+        stages.clear();
+        for (int g = 1; g <= max; g++) {
+            List<Integer> st = new ArrayList<>();
+            for (int i = 0; i < parts.size(); i++) {
+                if (parts.get(i).group == g) st.add(i);
+            }
+            stages.add(st);
+        }
+        if (stages.isEmpty()) stages.add(new ArrayList<>());
+    }
+
+    /**
+     * Copy of this design restricted to the root-connected weld tree (the
+     * flyable main ship): floating blocks are dropped so launch never spawns
+     * debris. Connections, groups and stages are remapped to the new indices.
+     */
+    public ShipDesign mainTreeOnly() {
+        boolean[] mask = componentFromRoot();
+        int[] remap = new int[parts.size()];
+        ShipDesign d = new ShipDesign();
+        for (int i = 0; i < parts.size(); i++) {
+            if (!mask[i]) { remap[i] = -1; continue; }
+            remap[i] = d.parts.size();
+            DesignPart p = parts.get(i);
+            DesignPart np = new DesignPart(p.typeId, p.x, p.y, p.rot);
+            np.group = p.group;
+            np.flippedX = p.flippedX;
+            np.flippedY = p.flippedY;
+            d.parts.add(np);
+        }
+        for (Connection c : connections) {
+            if (c.partA < 0 || c.partA >= mask.length || c.partB < 0 || c.partB >= mask.length) continue;
+            if (!mask[c.partA] || !mask[c.partB]) continue;
+            d.connections.add(new Connection(remap[c.partA], remap[c.partB], c.attachA, c.attachB));
+        }
+        d.loadedName = loadedName;
+        d.syncStagesFromGroups();
+        return d;
+    }
 
     public void clear() { parts.clear(); stages.clear(); connections.clear(); }
 
@@ -107,8 +163,9 @@ public class ShipDesign {
         }
         connections.clear();
         connections.addAll(nc);
-        // stages reference part indices too — the safest rebuild is autoStage
-        autoStage();
+        // stages reference part indices, but groups are per-part and survive
+        // the reindex — rebuild stages from groups, preserving manual groups
+        syncStagesFromGroups();
     }
 
     /** Connectivity mask: parts reachable from the root (index 0), BFS over
@@ -154,23 +211,64 @@ public class ShipDesign {
         }
     }
 
+    /**
+     * Automatic staging, matching the sample Show_Rocket's Staging semantics:
+     * only ACTIVATABLE parts of the root-connected tree are staged (engines,
+     * detachers, parachutes/landers, solars — the sample never stages pods,
+     * tanks, struts, ports or RCS). Parts are grouped by their tree depth
+     * from the root (BFS down the parent->child weld tree, root pod = 0);
+     * deepest parts fire first. Within one depth, engines come before
+     * detachers, then parachutes/landers, then solars (the sample: side
+     * engine d7 -> side detacher d6 -> main engine d2 -> radial detachers
+     * d2 -> solars d2). The number of groups is dynamic; everything else
+     * stays unassigned (group 0).
+     */
     public void autoStage() {
-        stages.clear();
-        // stage 0: engines; stage 1: detachers; stage 2: parachutes + landers (if any)
-        List<Integer> engines = new ArrayList<>();
-        List<Integer> detachers = new ArrayList<>();
-        List<Integer> aux = new ArrayList<>();
-        for (int i = 0; i < parts.size(); i++) {
-            PartType t = PartList.get(parts.get(i).typeId);
-            if (t == null) continue;
-            if (t.engine != null) engines.add(i);
-            else if ("detacher".equals(t.type)) detachers.add(i);
-            else if ("parachute".equals(t.type) || "lander".equals(t.type)) aux.add(i);
+        int n = parts.size();
+        for (DesignPart p : parts) p.group = 0;
+        if (n == 0) { stages.clear(); stages.add(new ArrayList<>()); return; }
+        // BFS depth from the root (part 0) along parent->child edges; parts
+        // outside the root tree keep depth -1 and are never staged
+        int[] depth = new int[n];
+        java.util.Arrays.fill(depth, -1);
+        depth[0] = 0;
+        List<Integer> queue = new ArrayList<>();
+        queue.add(0);
+        while (!queue.isEmpty()) {
+            int cur = queue.remove(0);
+            for (Connection c : connections) {
+                if (c.partA == cur && c.partB >= 0 && c.partB < n && depth[c.partB] < 0) {
+                    depth[c.partB] = depth[cur] + 1;
+                    queue.add(c.partB);
+                }
+            }
         }
-        if (!engines.isEmpty()) stages.add(engines);
-        if (!detachers.isEmpty()) stages.add(detachers);
-        if (!aux.isEmpty()) stages.add(aux);
-        if (stages.isEmpty()) stages.add(new ArrayList<>());
+        List<int[]> keys = new ArrayList<>(); // [depth, rank, index]
+        for (int i = 0; i < n; i++) {
+            int rank = categoryRank(i);
+            if (depth[i] <= 0 || rank < 0) continue; // root itself never fires
+            keys.add(new int[]{depth[i], rank, i});
+        }
+        java.util.Collections.sort(keys, (a, b) ->
+                a[0] != b[0] ? b[0] - a[0] : a[1] != b[1] ? a[1] - b[1] : a[2] - b[2]);
+        int g = 0, prevDepth = Integer.MIN_VALUE, prevRank = -1;
+        for (int[] k : keys) {
+            if (k[0] != prevDepth || k[1] != prevRank) { g++; prevDepth = k[0]; prevRank = k[1]; }
+            parts.get(k[2]).group = g;
+        }
+        syncStagesFromGroups();
+    }
+
+    /** Staging category: engine 0, detacher 1, parachute/lander 2, solar 3;
+     *  -1 = never auto-staged (pod, tank, strut, port, rcs, ...). */
+    private int categoryRank(int idx) {
+        PartType t = PartList.get(parts.get(idx).typeId);
+        if (t == null) return -1;
+        if (t.engine != null) return 0;
+        if ("detacher".equals(t.type)) return 1;
+        if ("parachute".equals(t.type) || "lander".equals(t.type)) return 2;
+        if (t.solar != null) return 3;
+        return -1;
     }
 
     // ---------------- Show_Rocket-compatible XML ----------------
@@ -274,7 +372,7 @@ public class ShipDesign {
             boolean isTank = t != null && t.tank != null;
             boolean isPod = t != null && "pod".equals(t.type);
             sb.append("<Part partType=\"").append(esc(p.typeId)).append("\" id=\"").append(ids[i])
-                    .append("\" x=\"").append(f6(p.x)).append("\" y=\"").append(f6(p.y))
+                    .append("\" x=\"").append(f6(p.x / XML_UNIT)).append("\" y=\"").append(f6(p.y / XML_UNIT))
                     .append("\" angle=\"").append(f6(p.rot * Math.PI / 2)).append("\"")
                     .append(" angleV=\"0.000000\" editorAngle=\"").append(p.rot).append("\"");
             if (!isTank && !isPod) {
@@ -321,8 +419,10 @@ public class ShipDesign {
 
     /** group g -> Step g (1-based), Activate Id refs scoped to the component. */
     private void appendStagingXml(StringBuilder sb, String[] ids, boolean[] mask) {
+        int maxGroup = 0;
+        for (DesignPart p : parts) if (p.group > maxGroup) maxGroup = p.group;
         sb.append("<Staging currentStage=\"0\">\n");
-        for (int g = 1; g <= 8; g++) {
+        for (int g = 1; g <= maxGroup; g++) {
             StringBuilder step = new StringBuilder();
             for (int i = 0; i < parts.size(); i++) {
                 if (mask[i] && parts.get(i).group == g) {
@@ -396,6 +496,7 @@ public class ShipDesign {
             }
         }
         // staging: first main-ship Pod that carries a Staging element wins
+        boolean hadStaging = false;
         if (mainParts != null) {
             for (int i = 0; i < mainParts.getChildCount(); i++) {
                 XmlReader.Element pe = mainParts.getChild(i);
@@ -412,12 +513,12 @@ public class ShipDesign {
                     if ("Staging".equals(pod.getChild(c).getName())) { staging = pod.getChild(c); break; }
                 }
                 if (staging == null) continue;
+                hadStaging = true;
                 int stepIdx = 0;
                 for (int s = 0; s < staging.getChildCount(); s++) {
                     XmlReader.Element step = staging.getChild(s);
                     if (!"Step".equals(step.getName())) continue;
                     stepIdx++;
-                    if (stepIdx > 8) break;
                     for (int a = 0; a < step.getChildCount(); a++) {
                         XmlReader.Element act = step.getChild(a);
                         if (!"Activate".equals(act.getName())) continue;
@@ -429,7 +530,9 @@ public class ShipDesign {
                 break; // one pod's staging is enough
             }
         }
-        if (d.stages.isEmpty()) d.autoStage();
+        // a file with explicit staging keeps its groups; otherwise derive them
+        if (hadStaging) d.syncStagesFromGroups();
+        else d.autoStage();
         return d;
     }
 
@@ -440,8 +543,8 @@ public class ShipDesign {
             if (!"Part".equals(pe.getName())) continue;
             DesignPart dp = new DesignPart();
             dp.typeId = pe.getAttribute("partType", "pod-1");
-            dp.x = pe.getFloatAttribute("x", 0f);
-            dp.y = pe.getFloatAttribute("y", 0f);
+            dp.x = pe.getFloatAttribute("x", 0f) * XML_UNIT;
+            dp.y = pe.getFloatAttribute("y", 0f) * XML_UNIT;
             int ea = pe.getIntAttribute("editorAngle", -1);
             if (ea < 0) {
                 double ang = Xml.getDouble(pe, "angle", 0);

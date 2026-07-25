@@ -93,6 +93,13 @@ public class EditorScreen extends ScreenAdapter {
     private float dragX, dragY;       // current ghost position (world)
     // task 1: the dragged part's whole child block moves with it
     private final List<Integer> dragBlock = new ArrayList<>();
+    /** true while dragging a whole DETACHED block (grabbed part not welded to
+     *  the root): the block translates as one rigid body, snaps/welds only
+     *  through its root part, and cannot be rotated. */
+    private boolean dragWholeBlock;
+    /** root of the dragged detached block: the block part with no incoming
+     *  connection (no edge where it is partB); -1 when not in block mode. */
+    private int dragBlockRoot = -1;
     private int dragRot;              // rotation of ghost
     private boolean dragFlipX, dragFlipY; // mirror state of ghost (XML flippedX/flippedY)
     private boolean panning;
@@ -409,6 +416,7 @@ public class EditorScreen extends ScreenAdapter {
         }
         pushHistory();
         design.parts.get(part).group = target;
+        design.syncStagesFromGroups();
         status("Moved " + (t != null ? t.name : "part")
                 + (target == 0 ? " to Unassigned" : " into STAGE " + target));
         rebuildStageList();
@@ -780,17 +788,23 @@ public class EditorScreen extends ScreenAdapter {
                 game.ui.skin);
         hint.setWrap(true);
         stageListTable.add(hint).width(stageRowWidth()).pad(4).row();
-        for (int g = 1; g <= 8; g++) addStageSection(g);
-        addStageSection(0);
+        // dynamic stage count (sample semantics): one section per used group,
+        // then a "+ New Stage" section whose header assigns group maxGroup+1
+        int maxGroup = 0;
+        for (ShipDesign.DesignPart dp : design.parts) if (dp.group > maxGroup) maxGroup = dp.group;
+        for (int g = 1; g <= maxGroup; g++) addStageSection(g, false);
+        addStageSection(maxGroup + 1, true); // always offers the next free stage
+        addStageSection(0, false);
     }
 
-    private void addStageSection(final int g) {
+    private void addStageSection(final int g, boolean isNew) {
         int count = 0;
         for (ShipDesign.DesignPart dp : design.parts) if (dp.group == g) count++;
         Table h = new Table();
         h.setBackground(game.ui.tinted(new Color(0.14f, 0.16f, 0.24f, 1f)));
+        String caption = g == 0 ? "Unassigned" : isNew ? "+ New Stage" : "STAGE " + g;
         TextButton hb = new TextButton(
-                fitText((g == 0 ? "Unassigned" : "STAGE " + g) + "  (" + count + ")",
+                fitText(caption + "  (" + count + ")",
                         stageRowWidth() - 120 - 8), game.ui.skin);
         hb.addListener(new ClickListener() {
             @Override public void clicked(InputEvent e, float x, float y) { selectGroup(g); }
@@ -885,6 +899,7 @@ public class EditorScreen extends ScreenAdapter {
         for (int i : selected) {
             if (i < design.parts.size()) design.parts.get(i).group = g;
         }
+        design.syncStagesFromGroups();
         status(g == 0 ? "Unassigned " + selected.size() + " part(s)"
                 : "Assigned " + selected.size() + " part(s) to STAGE " + g);
         rebuildStageList();
@@ -1020,9 +1035,9 @@ public class EditorScreen extends ScreenAdapter {
     // ------------------------------------------------------------ launch
 
     private void launch(Planet planet) {
-        design.autoStage();
-        autosave(); // C6: keep the build for the next editor visit
-        game.world.launchShip(design, planet);
+        autosave(); // C6: keep the FULL build (incl. floating blocks) for next visit
+        // only the root-connected main ship flies — floating blocks are not launched
+        game.world.launchShip(design.mainTreeOnly(), planet);
         game.setScreen(new SandboxScreen(game));
     }
 
@@ -1058,8 +1073,20 @@ public class EditorScreen extends ScreenAdapter {
         return best;
     }
 
+    /** Snap targets are main-ship parts only: floating blocks can be welded
+     *  ONTO the ship, never the other way round (task 2). */
+    private boolean targetOk(int i) {
+        return i >= 0 && i < rootConnected.length && rootConnected[i];
+    }
+
     /** Try to snap ghost position to attach points of other parts. Returns snapped position. */
     private Vector2 snap(float px, float py, int rot, PartType type, int ignoreIndex) {
+        return snap(px, py, rot, type, ignoreIndex, java.util.Collections.<Integer>emptySet());
+    }
+
+    /** Snap with an extra exclude set (e.g. the dragged block's own parts). */
+    private Vector2 snap(float px, float py, int rot, PartType type, int ignoreIndex,
+                         java.util.Collection<Integer> exclude) {
         Vector2 best = new Vector2(px, py);
         float bestD = 2.2f; // snap radius (m)
         // edge-aware snapping (round 11 item 5): an edge attach point accepts
@@ -1070,7 +1097,8 @@ public class EditorScreen extends ScreenAdapter {
         Vector2 cm = new Vector2(), co = new Vector2();
         Vector2 qn = new Vector2();
         for (int i = 0; i < design.parts.size(); i++) {
-            if (i == ignoreIndex) continue;
+            if (i == ignoreIndex || exclude.contains(i)) continue;
+            if (!targetOk(i)) continue; // task 2: snap onto the main ship only
             ShipDesign.DesignPart dp = design.parts.get(i);
             PartType t = PartList.get(dp.typeId);
             if (t == null) continue;
@@ -1136,14 +1164,16 @@ public class EditorScreen extends ScreenAdapter {
     }
 
     /** Same contact search as snap(), but reports the winning attach pair. */
-    private SnapWin findSnapWinner(float px, float py, int rot, PartType type, int ignoreIndex) {
+    private SnapWin findSnapWinner(float px, float py, int rot, PartType type, int ignoreIndex,
+                                   java.util.Collection<Integer> exclude) {
         SnapWin win = new SnapWin();
         float bestD = 2.2f; // identical threshold to snap()
         Vector2 ma = new Vector2(), mb = new Vector2();
         Vector2 oa = new Vector2(), ob = new Vector2();
         Vector2 cm = new Vector2(), co = new Vector2();
         for (int i = 0; i < design.parts.size(); i++) {
-            if (i == ignoreIndex) continue;
+            if (i == ignoreIndex || exclude.contains(i)) continue;
+            if (!targetOk(i)) continue; // task 2: highlight main-ship targets only
             ShipDesign.DesignPart dp = design.parts.get(i);
             PartType t = PartList.get(dp.typeId);
             if (t == null) continue;
@@ -1188,10 +1218,12 @@ public class EditorScreen extends ScreenAdapter {
      * dragged part's own markers light up and the exact attach pair that would
      * weld on drop is highlighted on BOTH parts.
      */
-    private void drawAttachMarkers(PartType dragType, float px, float py, int rot, int ignoreIndex) {
+    private void drawAttachMarkers(PartType dragType, float px, float py, int rot, int ignoreIndex,
+                                   java.util.Collection<Integer> exclude) {
         game.shapes.setProjectionMatrix(cam.combined);
         game.shapes.begin(com.badlogic.gdx.graphics.glutils.ShapeRenderer.ShapeType.Line);
         for (int i = 0; i < design.parts.size(); i++) {
+            if (!targetOk(i)) continue; // task 2: only weldable main-ship parts show points
             ShipDesign.DesignPart dp = design.parts.get(i);
             PartType t = PartList.get(dp.typeId);
             if (t == null) continue;
@@ -1200,7 +1232,7 @@ public class EditorScreen extends ScreenAdapter {
             }
         }
         if (dragType != null) {
-            SnapWin win = findSnapWinner(px, py, rot, dragType, ignoreIndex);
+            SnapWin win = findSnapWinner(px, py, rot, dragType, ignoreIndex, exclude);
             for (int am = 0; am < dragType.attach.size(); am++) {
                 drawOneMarker(dragType, px, py, rot, dragType.attach.get(am), am == win.apM);
             }
@@ -1216,6 +1248,10 @@ public class EditorScreen extends ScreenAdapter {
     }
 
     private void rotateGhost() {
+        if (dragWholeBlock) {
+            status("Detached blocks move as-is — weld the block on, then rotate parts");
+            return;
+        }
         if (placing != null && !placing.disableEditorRotation) {
             dragRot = (dragRot + 1) % 4;
             status("Rotation: " + (dragRot * 90) + " deg");
@@ -1270,14 +1306,50 @@ public class EditorScreen extends ScreenAdapter {
         rootConnected = design.componentFromRoot();
     }
 
+    /** Undirected connected component containing idx (a whole detached block). */
+    private List<Integer> collectComponent(int idx) {
+        List<Integer> out = new ArrayList<>();
+        if (idx < 0 || idx >= design.parts.size()) return out;
+        boolean[] seen = new boolean[design.parts.size()];
+        List<Integer> queue = new ArrayList<>();
+        seen[idx] = true;
+        queue.add(idx);
+        while (!queue.isEmpty()) {
+            int cur = queue.remove(queue.size() - 1);
+            out.add(cur);
+            for (ShipDesign.Connection c : design.connections) {
+                int other = c.partA == cur ? c.partB : c.partB == cur ? c.partA : -1;
+                if (other >= 0 && other < design.parts.size() && !seen[other]) {
+                    seen[other] = true;
+                    queue.add(other);
+                }
+            }
+        }
+        return out;
+    }
+
+    /** The block's weld-tree root: the member with no incoming connection
+     *  (never a partB). Falls back to the grabbed part for degenerate blocks. */
+    private int blockRootOf(List<Integer> block, int fallback) {
+        for (int i : block) {
+            boolean hasParent = false;
+            for (ShipDesign.Connection c : design.connections) {
+                if (c.partB == i) { hasParent = true; break; }
+            }
+            if (!hasParent) return i;
+        }
+        return fallback;
+    }
+
     /**
      * (Re)infer the parent weld of one part from geometry: nearest attach
-     * segment contact under WELD_TOL against any other part. Records at most
-     * one incoming connection (partB == idx); part 0 is the tree root and
-     * never gets a parent. Called on placement (the snap target wins, contact
-     * ~0) and after moves/loads to rewire orphans.
+     * segment contact under WELD_TOL against any other MAIN-SHIP part (task 2:
+     * floating blocks are not valid parents). Records at most one incoming
+     * connection (partB == idx); part 0 is the tree root and never gets a
+     * parent. Called on placement (the snap target wins, contact ~0) and after
+     * moves. `exclude` skips parts of the dragged block/subtree itself.
      */
-    private void inferConnectionFor(int idx) {
+    private void inferConnectionFor(int idx, java.util.Collection<Integer> exclude) {
         design.connections.removeIf(c -> c.partB == idx);
         if (idx <= 0 || idx >= design.parts.size()) return;
         ShipDesign.DesignPart dp = design.parts.get(idx);
@@ -1289,7 +1361,8 @@ public class EditorScreen extends ScreenAdapter {
         int bestJ = -1, bestAm = -1, bestAo = -1;
         float bestD = WELD_TOL;
         for (int j = 0; j < design.parts.size(); j++) {
-            if (j == idx) continue;
+            if (j == idx || exclude.contains(j)) continue;
+            if (!targetOk(j)) continue;
             ShipDesign.DesignPart op = design.parts.get(j);
             PartType ot = PartList.get(op.typeId);
             if (ot == null) continue;
@@ -1363,6 +1436,8 @@ public class EditorScreen extends ScreenAdapter {
                 panning = false;
                 downIndex = -1; dragIndex = -1; dragMoved = false;
                 dragBlock.clear();
+                dragWholeBlock = false;
+                dragBlockRoot = -1;
                 return true;
             }
             // Canvas-or-chrome decision via the stage itself (no coordinate
@@ -1399,7 +1474,9 @@ public class EditorScreen extends ScreenAdapter {
                 pushHistory();
                 Vector2 snapped = snap(w.x, w.y, dragRot, placing, -1);
                 design.parts.add(newPart(placing, snapped.x, snapped.y));
-                inferConnectionFor(design.parts.size() - 1); // task 1: record the weld
+                // task 1: record the weld (targets: main ship only)
+                inferConnectionFor(design.parts.size() - 1,
+                        java.util.Collections.<Integer>emptySet());
                 afterTopologyChange();
                 selected.clear();
                 updateDelButton();
@@ -1479,15 +1556,51 @@ public class EditorScreen extends ScreenAdapter {
                 pushHistory();
                 dragMoved = true;
                 dragIndex = downIndex;
-                dragRot = design.parts.get(dragIndex).rot;
-                // task 1: the whole child block of the grabbed part comes along
-                dragBlock.clear();
-                dragBlock.addAll(design.subtreeOf(dragIndex));
+                if (dragIndex < rootConnected.length && !rootConnected[dragIndex]) {
+                    // task 1/2: grabbed part belongs to a DETACHED block — the
+                    // whole undirected block moves as one rigid body; snapping
+                    // and welding happen only through the block's root part.
+                    dragWholeBlock = true;
+                    dragBlock.clear();
+                    dragBlock.addAll(collectComponent(dragIndex));
+                    dragBlockRoot = blockRootOf(dragBlock, dragIndex);
+                    dragRot = design.parts.get(dragBlockRoot).rot;
+                } else {
+                    dragWholeBlock = false;
+                    dragBlockRoot = -1;
+                    dragRot = design.parts.get(dragIndex).rot;
+                    // task 1: the whole child block of the grabbed part comes along
+                    dragBlock.clear();
+                    dragBlock.addAll(design.subtreeOf(dragIndex));
+                }
             }
             if (dragMoved && dragIndex >= 0) {
                 Vector2 w = screenToWorld(screenX, screenY);
+                if (dragWholeBlock && dragBlockRoot >= 0 && dragBlockRoot < design.parts.size()) {
+                    // rigid block: the grabbed handle follows the finger; the
+                    // block ROOT's attach points do the snapping against the
+                    // main ship, and the same correction shifts the whole block
+                    ShipDesign.DesignPart rp = design.parts.get(dragBlockRoot);
+                    PartType rt = PartList.get(rp.typeId);
+                    float dx = w.x - design.parts.get(dragIndex).x;
+                    float dy = w.y - design.parts.get(dragIndex).y;
+                    if (rt != null) {
+                        Vector2 snappedRoot = snap(rp.x + dx, rp.y + dy, dragRot, rt, -1, dragBlock);
+                        dx = snappedRoot.x - rp.x;
+                        dy = snappedRoot.y - rp.y;
+                    }
+                    for (int bi : dragBlock) {
+                        if (bi >= 0 && bi < design.parts.size()) {
+                            design.parts.get(bi).x += dx;
+                            design.parts.get(bi).y += dy;
+                        }
+                    }
+                    dragX = rp.x;
+                    dragY = rp.y;
+                    return true;
+                }
                 PartType t = PartList.get(design.parts.get(dragIndex).typeId);
-                Vector2 snapped = snap(w.x, w.y, dragRot, t, dragIndex);
+                Vector2 snapped = snap(w.x, w.y, dragRot, t, dragIndex, dragBlock);
                 dragX = snapped.x;
                 dragY = snapped.y;
                 // translate by the snap-corrected delta so the block keeps formation
@@ -1534,6 +1647,8 @@ public class EditorScreen extends ScreenAdapter {
                 panLastX = gpaX; panLastY = gpaY;
                 panning = false; downIndex = -1; dragIndex = -1; dragMoved = false;
                 dragBlock.clear();
+                dragWholeBlock = false;
+                dragBlockRoot = -1;
                 return true;
             }
             touchPtrA = -1;
@@ -1544,6 +1659,14 @@ public class EditorScreen extends ScreenAdapter {
                     status(selected.isEmpty() ? "Tap [Add Part] for parts. Tap part = select; drag = move; DEL deletes."
                             : selected.size() + " selected — open [Stages] to assign a group");
                     updateDelButton();
+                } else if (dragWholeBlock) {
+                    // block drop: internal welds stay; only the block ROOT may
+                    // weld onto the main ship from this drag's own snap
+                    if (dragBlockRoot >= 0 && dragBlockRoot < design.parts.size()) {
+                        inferConnectionFor(dragBlockRoot, dragBlock);
+                    }
+                    afterTopologyChange();
+                    rebuildStageList();
                 } else {
                     // a moved part's welds break; only the MOVED part itself may
                     // re-weld (that is this player drag's own snap). Former
@@ -1551,16 +1674,17 @@ public class EditorScreen extends ScreenAdapter {
                     if (dragIndex >= 0 && dragIndex < design.parts.size()) {
                         final int moved = dragIndex;
                         design.connections.removeIf(c -> c.partA == moved || c.partB == moved);
-                        inferConnectionFor(moved);
+                        inferConnectionFor(moved, dragBlock);
                     }
                     afterTopologyChange();
-                    design.autoStage();
                     rebuildStageList();
                 }
                 downIndex = -1;
                 dragIndex = -1;
                 dragMoved = false;
                 dragBlock.clear();
+                dragWholeBlock = false;
+                dragBlockRoot = -1;
                 return true;
             }
             if (panning) {
@@ -1593,6 +1717,8 @@ public class EditorScreen extends ScreenAdapter {
             dragIndex = -1;
             dragMoved = false;
             dragBlock.clear();
+            dragWholeBlock = false;
+            dragBlockRoot = -1;
             return false;
         }
 
@@ -1692,7 +1818,9 @@ public class EditorScreen extends ScreenAdapter {
             Vector2 w = screenToWorld(screenX, screenY);
             Vector2 snapped = snap(w.x, w.y, dragRot, placing, -1);
             design.parts.add(newPart(placing, snapped.x, snapped.y));
-            inferConnectionFor(design.parts.size() - 1); // task 1: record the weld
+            // task 1: record the weld (targets: main ship only)
+            inferConnectionFor(design.parts.size() - 1,
+                    java.util.Collections.<Integer>emptySet());
             afterTopologyChange();
             selected.clear();
             updateDelButton();
@@ -1798,16 +1926,19 @@ public class EditorScreen extends ScreenAdapter {
             markerType = placing;
             markerX = snapped.x; markerY = snapped.y; markerRot = dragRot;
         } else if (dragMoved && dragIndex >= 0 && dragIndex < design.parts.size()) {
-            ShipDesign.DesignPart dp = design.parts.get(dragIndex);
+            // block drag: the attach preview belongs to the block ROOT (the
+            // only part that snaps/welds); subtree drag: the grabbed part
+            int mi = dragWholeBlock && dragBlockRoot >= 0 ? dragBlockRoot : dragIndex;
+            ShipDesign.DesignPart dp = design.parts.get(mi);
             markerType = PartList.get(dp.typeId);
             markerX = dp.x; markerY = dp.y; markerRot = dragRot;
-            markerIgnore = dragIndex;
+            markerIgnore = dragWholeBlock ? -1 : dragIndex;
         }
         game.batch.end();
 
         // task 4: persistent attach-point markers + live highlight of the pair
         // that WILL weld if the player drops right now
-        drawAttachMarkers(markerType, markerX, markerY, markerRot, markerIgnore);
+        drawAttachMarkers(markerType, markerX, markerY, markerRot, markerIgnore, dragBlock);
 
         // selection outlines + activation-group badges (item 6a)
         if (!selected.isEmpty() || hasAnyGroup()) {
@@ -1923,6 +2054,8 @@ public class EditorScreen extends ScreenAdapter {
         dragIndex = -1;
         dragMoved = false;
         dragBlock.clear();
+        dragWholeBlock = false;
+        dragBlockRoot = -1;
         if (stage != null) stage.cancelTouchFocus();
     }
 }

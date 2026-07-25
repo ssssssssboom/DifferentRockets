@@ -1858,12 +1858,16 @@ public class EditorScreen extends ScreenAdapter {
                     afterTopologyChange();
                     rebuildStageList();
                 } else {
-                    // a moved part's welds break; only the MOVED part itself may
-                    // re-weld (that is this player drag's own snap). Former
-                    // children are deliberately NOT auto-rewelded (task 3).
+                    // subtree drop: only the grabbed part's INCOMING weld breaks
+                    // (that is what "detaching a block" means). Its welds to its
+                    // CHILDREN are block-internal and MUST survive — removing
+                    // them shattered the dragged block into singletons on the
+                    // next grab (manual-test bug). inferConnectionFor removes
+                    // the incoming weld itself and re-welds the moved part if
+                    // this drag's own snap landed on the main ship; former
+                    // children are NOT auto-rewelded to anything else (task 3).
                     if (dragIndex >= 0 && dragIndex < design.parts.size()) {
                         final int moved = dragIndex;
-                        design.connections.removeIf(c -> c.partA == moved || c.partB == moved);
                         inferConnectionFor(moved, dragBlock);
                     }
                     afterTopologyChange();

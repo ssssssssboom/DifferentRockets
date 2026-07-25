@@ -674,6 +674,26 @@ public class Ship {
         for (Part p : parts) p.stageActivatedThisFrame = false;
     }
 
+    /**
+     * onUpdate for ENGINE parts only, for ships that are NOT the active one
+     * (round 27): a stage that was fired and then cut loose by a detacher in
+     * the same activation keeps burning — splitIfDisconnected reuses the Part
+     * objects, so the engine's Lua `staged` flag survives the split, and
+     * part:getThrottle() reads the live player throttle, so the dropped stage
+     * thrusts at exactly throttle x max power from the separation instant on.
+     * Every other script type stays inert on non-active ships (no steering,
+     * no wheels, no chutes) — only engines have a meaningful unattended
+     * behavior. Skipped while the ship rides rails (super-warp parks it).
+     */
+    public void updateEngineScripts(double dt) {
+        for (Part p : parts) {
+            if (p.body != null && "engine".equals(p.type.type)) {
+                p.flameLevel = 0f;
+                p.callOnUpdate(dt);
+            }
+        }
+    }
+
     public Vector2 centerOfMass(Vector2 out) {
         out.set(0, 0);
         if (parts.isEmpty()) return out;

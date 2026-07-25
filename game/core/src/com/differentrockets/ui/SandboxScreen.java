@@ -343,13 +343,15 @@ public class SandboxScreen extends ScreenAdapter {
         bottomB.add(activateBtn).width(170).height(110).pad(6);
         bottomB.add(stageBtn).width(200).height(110).pad(6);
         // bottom-right back button (user request): same size as STAGE, same
-        // behavior as the phone BACK key (toggleBackDialog, task D2)
+        // behavior as the phone BACK key (toggleBackDialog, task D2).
+        // Pinned to the RIGHT EDGE: ACTIVATE/STAGE keep their centered pair,
+        // BACK gets its own expandX gap in front and only a small margin.
+        bottomB.add().expandX();
         TextButton backBtn = new TextButton("BACK", game.ui.skin);
         backBtn.addListener(new ClickListener() {
             @Override public void clicked(InputEvent e, float x, float y) { toggleBackDialog(); }
         });
-        bottomB.add(backBtn).width(200).height(110).pad(6);
-        bottomB.add().expandX();
+        bottomB.add(backBtn).width(200).height(110).pad(6).padRight(16);
         root.add(bottomB).fillX().padBottom(8);
     }
 
@@ -1652,29 +1654,27 @@ public class SandboxScreen extends ScreenAdapter {
             return;
         }
 
-        // item 3: ship velocity vector on the ring. Task D6: when a map
-        // target is selected the ring shows the velocity RELATIVE TO THE
-        // TARGET (pink) instead of the usual planet-relative one (cyan).
+        // item 3: ship velocity vectors on the ring. Task D6 (revised):
+        // the planet-relative velocity (cyan) is ALWAYS shown; when a map
+        // target is selected the target-relative velocity (pink) is drawn
+        // ALONGSIDE it — blue and pink arrows coexist.
         Ship actShip = game.world.active;
         Vec2d sv = actShip.getUniverseVel();
+        Planet vcp = game.world.currentPlanet();
+        double pvx = sv.x - (vcp != null ? vcp.vel.x : 0);
+        double pvy = sv.y - (vcp != null ? vcp.vel.y : 0);
+        double pSpd = Math.hypot(pvx, pvy);
+        double pHead = Math.atan2(-pvx, pvy); // ring heading convention
         boolean relToTarget = mapTargetShip != null || mapTargetPlanet != null;
-        double rvx, rvy;
+        double tvx = 0, tvy = 0;
         if (mapTargetShip != null) {
             Vec2d tv = mapTargetShip.getUniverseVel();
-            rvx = sv.x - tv.x; rvy = sv.y - tv.y;
+            tvx = sv.x - tv.x; tvy = sv.y - tv.y;
         } else if (mapTargetPlanet != null) {
-            rvx = sv.x - mapTargetPlanet.vel.x; rvy = sv.y - mapTargetPlanet.vel.y;
-        } else {
-            Planet vcp = game.world.currentPlanet();
-            rvx = sv.x - (vcp != null ? vcp.vel.x : 0);
-            rvy = sv.y - (vcp != null ? vcp.vel.y : 0);
+            tvx = sv.x - mapTargetPlanet.vel.x; tvy = sv.y - mapTargetPlanet.vel.y;
         }
-        double spd = Math.hypot(rvx, rvy);
-        double vHead = Math.atan2(-rvx, rvy); // ring heading convention
-        // velocity marker color: pink relative-to-target, cyan planet-relative
-        final float vr = relToTarget ? 1f : 0.35f;
-        final float vg = relToTarget ? 0.45f : 0.85f;
-        final float vb = relToTarget ? 0.80f : 1f;
+        double tSpd = Math.hypot(tvx, tvy);
+        double tHead = Math.atan2(-tvx, tvy);
 
         game.shapes.begin(ShapeRenderer.ShapeType.Line);
         game.shapes.setColor(1f, 1f, 1f, 0.30f);
@@ -1700,11 +1700,16 @@ public class SandboxScreen extends ScreenAdapter {
         game.shapes.setColor(0.3f, 1f, 0.45f, 0.95f);
         game.shapes.line(ringPtX(tgt), ringPtY(tgt),
                 ringX + (ringPtX(tgt) - ringX) * 1.14f, ringY + (ringPtY(tgt) - ringY) * 1.14f);
-        // velocity marker (cyan tick, pink when target-relative — task D6)
-        if (spd > 0.5) {
-            game.shapes.setColor(vr, vg, vb, 0.95f);
-            game.shapes.line(ringX + (ringPtX(vHead) - ringX) * 0.90f, ringY + (ringPtY(vHead) - ringY) * 0.90f,
-                    ringX + (ringPtX(vHead) - ringX) * 1.05f, ringY + (ringPtY(vHead) - ringY) * 1.05f);
+        // velocity ticks: cyan = planet-relative (always), pink = target-relative
+        if (pSpd > 0.5) {
+            game.shapes.setColor(0.35f, 0.85f, 1f, 0.95f);
+            game.shapes.line(ringX + (ringPtX(pHead) - ringX) * 0.90f, ringY + (ringPtY(pHead) - ringY) * 0.90f,
+                    ringX + (ringPtX(pHead) - ringX) * 1.05f, ringY + (ringPtY(pHead) - ringY) * 1.05f);
+        }
+        if (relToTarget && tSpd > 0.5) {
+            game.shapes.setColor(1f, 0.45f, 0.80f, 0.95f);
+            game.shapes.line(ringX + (ringPtX(tHead) - ringX) * 0.90f, ringY + (ringPtY(tHead) - ringY) * 0.90f,
+                    ringX + (ringPtX(tHead) - ringX) * 1.05f, ringY + (ringPtY(tHead) - ringY) * 1.05f);
         }
         game.shapes.end();
 
@@ -1716,32 +1721,46 @@ public class SandboxScreen extends ScreenAdapter {
         game.shapes.circle(ringX + (ringPtX(tgt) - ringX) * 1.14f, ringY + (ringPtY(tgt) - ringY) * 1.14f, 8f, 12);
         game.shapes.setColor(1f, 1f, 1f, 0.95f);
         game.shapes.circle(ringPtX(cur), ringPtY(cur), 6f, 12);
-        // velocity arrowhead on the ring at the velocity heading — item 3
-        if (spd > 0.5) {
-            float bx = ringPtX(vHead), by = ringPtY(vHead);
-            float ox = (bx - ringX) / ringR, oy = (by - ringY) / ringR; // unit outward
-            float pxu = -oy, pyu = ox;                                  // unit tangent
-            game.shapes.setColor(vr, vg, vb, 0.95f);
-            game.shapes.triangle(bx + ox * 24, by + oy * 24,
-                    bx - pxu * 12, by - pyu * 12,
-                    bx + pxu * 12, by + pyu * 12);
-        }
+        // velocity arrowheads on the ring — item 3 (cyan + pink, D6 revised)
+        if (pSpd > 0.5) velArrow(pHead, 0.35f, 0.85f, 1f);
+        if (relToTarget && tSpd > 0.5) velArrow(tHead, 1f, 0.45f, 0.80f);
         game.shapes.end();
         Gdx.gl.glLineWidth(1f);
 
-        // numeric speed readout just outside the ring at the velocity heading
-        if (spd > 0.5) {
+        // numeric speed readouts outside the ring: cyan planet-relative at
+        // its heading, pink target-relative slightly further out (D6 revised)
+        boolean anyLabel = pSpd > 0.5 || (relToTarget && tSpd > 0.5);
+        if (anyLabel) {
             game.batch.setProjectionMatrix(ringMat);
             game.batch.begin();
             game.font.getData().setScale(BS);
-            game.font.setColor(vr, vg, vb, 0.95f);
-            float tx = ringX + (float) -Math.sin(vHead) * ringR * 1.22f;
-            float ty = ringY + (float) Math.cos(vHead) * ringR * 1.22f;
-            game.font.draw(game.batch, fmt(spd) + " m/s", tx, ty);
+            if (pSpd > 0.5) {
+                game.font.setColor(0.35f, 0.85f, 1f, 0.95f);
+                float tx = ringX + (float) -Math.sin(pHead) * ringR * 1.22f;
+                float ty = ringY + (float) Math.cos(pHead) * ringR * 1.22f;
+                game.font.draw(game.batch, fmt(pSpd) + " m/s", tx, ty);
+            }
+            if (relToTarget && tSpd > 0.5) {
+                game.font.setColor(1f, 0.45f, 0.80f, 0.95f);
+                float tx = ringX + (float) -Math.sin(tHead) * ringR * 1.42f;
+                float ty = ringY + (float) Math.cos(tHead) * ringR * 1.42f;
+                game.font.draw(game.batch, fmt(tSpd) + " m/s", tx, ty);
+            }
             game.font.getData().setScale(game.ui.fontScale);
             game.font.setColor(Color.WHITE);
             game.batch.end();
         }
+    }
+
+    /** Velocity arrowhead on the ring at the given heading, in the given color. */
+    private void velArrow(double vHead, float r, float g, float b) {
+        float bx = ringPtX(vHead), by = ringPtY(vHead);
+        float ox = (bx - ringX) / ringR, oy = (by - ringY) / ringR; // unit outward
+        float pxu = -oy, pyu = ox;                                  // unit tangent
+        game.shapes.setColor(r, g, b, 0.95f);
+        game.shapes.triangle(bx + ox * 24, by + oy * 24,
+                bx - pxu * 12, by - pyu * 12,
+                bx + pxu * 12, by + pyu * 12);
     }
 
     /** Ring point for a heading angle: nose dir is (-sinθ, cosθ), screen is y-up here. */

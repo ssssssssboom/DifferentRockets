@@ -266,6 +266,18 @@ public class TerrainSystem implements Disposable {
         totalChunks = Math.max(1, (totalCols + COLS_PER_CHUNK - 1) / COLS_PER_CHUNK);
     }
 
+    /**
+     * Force the chunk window (physics colliders included) to exist around pos
+     * IMMEDIATELY, bypassing the 10 Hz manage() throttle. launchShip places a
+     * ship in direct contact with the ground; waiting for the next throttled
+     * update() would step the first frames with no ground at all — a hidden
+     * free-fall followed by an impact spike on every weld.
+     */
+    public void forceRefresh(Vec2d pos) {
+        refreshT = REFRESH_S;
+        update(pos, 0);
+    }
+
     /** Call every frame with the active ship's universe position + this frame's simulated seconds. */
     public void update(Vec2d shipUniverse, double simDt) {
         refreshParams();

@@ -1,23 +1,24 @@
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation, PillowWriter
+from scipy.optimize import brentq
 import os
 
 
-# =========================
-# Engine parameters
-# =========================
+# =====================================================
+# Engine
+# =====================================================
 
 class RocketEngine:
 
     def __init__(
         self,
-        thrust=100000,
-        nozzle_diameter=0.8,
+        thrust=500000,
+        nozzle_diameter=1.2,
         chamber_pressure=7e6,
         chamber_temperature=3500,
         gamma=1.22,
-        R=355
+        gas_constant=355
     ):
 
         self.F = thrust
@@ -25,158 +26,334 @@ class RocketEngine:
         self.Pc = chamber_pressure
         self.Tc = chamber_temperature
         self.gamma = gamma
-        self.R = R
+        self.R = gas_constant
 
         self.area = np.pi*(self.D/2)**2
 
 
-# =========================
-# Plume physics
-# =========================
 
-def calculate_plume(engine, ambient_pressure):
-
-    if ambient_pressure < 10:
-        pressure_ratio = 0.001
-    else:
-        pressure_ratio = ambient_pressure/engine.Pc
+# =====================================================
+# nozzle equations
+# =====================================================
 
 
-    Ve = np.sqrt(
-        2*engine.gamma/(engine.gamma-1)
-        *
-        engine.R
-        *
-        engine.Tc
-        *
+def area_ratio(M,gamma):
+
+    return (
+        1/M *
         (
-        1-pressure_ratio**(
-        (engine.gamma-1)/engine.gamma)
+            (2/(gamma+1))
+            *
+            (1+(gamma-1)/2*M*M)
         )
+        **
+        ((gamma+1)/(2*(gamma-1)))
     )
 
 
-    # expansion factor
-    expansion = np.sqrt(
-        engine.Pc/max(ambient_pressure,100)
+
+def solve_exit_mach(engine):
+
+    # typical rocket nozzle
+    target_area_ratio=25
+
+    return brentq(
+        lambda m:
+        area_ratio(
+            m,
+            engine.gamma
+        )
+        - target_area_ratio,
+
+        1.01,
+        20
     )
 
 
-    length = engine.D*8*expansion**0.25
 
-    radius = engine.D*0.5*expansion**0.2
+def exit_state(engine,ambient):
+
+    g=engine.gamma
+
+    Me=solve_exit_mach(engine)
 
 
-    return length,radius,Ve
+    Pe=engine.Pc*(
+        1+(g-1)/2*Me*Me
+    )**(-g/(g-1))
+
+
+    Te=engine.Tc/(
+        1+(g-1)/2*Me*Me
+    )
+
+
+    # expansion condition
+
+    pressure_ratio=Pe/max(ambient,1)
+
+
+    if pressure_ratio>1:
+        state="under_expanded"
+    else:
+        state="over_expanded"
 
 
 
-# =========================
+    return Me,Pe,Te,state
+
+
+
+
+# =====================================================
 # plume field
-# =========================
+# =====================================================
 
-def generate_field(
+
+def generate_plume(
         engine,
         ambient_pressure,
-        resolution=400):
+        resolution=700
+):
 
 
-    L,R,V=calculate_plume(
+    Me,Pe,Te,state=exit_state(
         engine,
         ambient_pressure
     )
 
 
-    margin=L*0.25
+    NPR=engine.Pc/max(
+        ambient_pressure,
+        1
+    )
+
+
+    # expansion angle
+
+    angle=np.arctan(
+        0.15*np.log(NPR)
+    )
+
+
+    # length
+
+    L=(
+        engine.D*
+        (
+        8+
+        2*np.sqrt(NPR)
+        )
+    )
+
+
+    R0=engine.D/2
+
+
+    margin=R0*2
 
 
     x=np.linspace(
-        -margin,
-        L+margin,
+        0,
+        L,
         resolution
     )
 
     y=np.linspace(
-        -R*3,
-        R*3,
+        -L*0.35,
+        L*0.35,
         resolution//2
     )
 
 
-    X,Y=np.meshgrid(x,y)
-
-
-    # axial decay
-
-    envelope=np.exp(
-        -X/(L*0.8)
+    X,Y=np.meshgrid(
+        x,y
     )
 
 
-    # radial spreading
+    # -------------------------
+    # plume radius
+    # -------------------------
 
-    width=R*(1+X/L*2)
+    radius=(
+        R0+
+        np.tan(angle)*X
+    )
 
+
+    # density distribution
 
     radial=np.exp(
-        -(Y/width)**2
+        -(Y/radius)**4
     )
 
 
-    plume=envelope*radial
+    axial=np.exp(
+        -X/(L*0.55)
+    )
+
+
+    density=radial*axial
 
 
 
+    # -------------------------
     # shock diamonds
-
-    shock=np.sin(
-        X/(engine.D*0.45)
-        *
-        np.pi
-    )**2
+    # -------------------------
 
 
-    plume*=(
-        0.75+
-        0.25*shock
+    shock_length=(
+        np.pi*
+        engine.D*
+        Me/
+        np.sqrt(Me*Me-1)
     )
 
 
-    # remove nozzle upstream
-
-    plume[X<0]=0
-
-
-    # adaptive threshold
-
-    threshold=np.max(plume)*0.015
-
-    plume[plume<threshold]=0
+    shock=np.cos(
+        2*np.pi*
+        X/shock_length
+    )
 
 
-    return X,Y,plume,L,R
+    # only center jet has strong diamonds
+
+    diamond=(
+        0.5+
+        0.5*shock
+    )
+
+
+    density*=(
+        0.65+
+        0.35*diamond
+    )
 
 
 
-# =========================
-# render gif
-# =========================
+    # -------------------------
+    # temperature field
+    # -------------------------
 
 
-def render_case(
-        name,
+    temperature=(
+        density**0.35
+    )
+
+
+    # nozzle exit temperature
+
+    temperature*=Te/engine.Tc
+
+
+
+    # -------------------------
+    # color intensity
+    # -------------------------
+
+    intensity=(
+        density*
+        (0.5+temperature)
+    )
+
+
+    return (
+        X,
+        Y,
+        intensity,
+        density,
+        state
+    )
+
+
+
+
+
+# =====================================================
+# RGB flame shader
+# =====================================================
+
+
+def flame_color(field):
+
+
+    f=np.clip(field,0,1)
+
+
+    rgb=np.zeros(
+        f.shape+(3,)
+    )
+
+
+    # hot core
+
+    rgb[:,:,0]=np.minimum(
+        1,
+        f*3
+    )
+
+
+    rgb[:,:,1]=np.maximum(
+        0,
+        f*1.8-0.2
+    )
+
+
+    rgb[:,:,2]=np.maximum(
+        0,
+        f*0.35-0.15
+    )
+
+
+    return rgb
+
+
+
+
+
+# =====================================================
+# render
+# =====================================================
+
+
+def render(
+        filename,
         engine,
-        pressure):
+        pressure
+):
 
 
-    X,Y,Z,L,R=generate_field(
+    X,Y,I,D,state=generate_plume(
         engine,
         pressure
     )
 
 
+    # normalize
+
+    I/=I.max()
+
+
+    rgb=flame_color(I)
+
+
+    alpha=np.clip(
+        D*1.8,
+        0,
+        1
+    )
+
+
+    rgba=np.dstack(
+        (
+        rgb,
+        alpha
+        )
+    )
+
+
     fig,ax=plt.subplots(
-        figsize=(8,3),
+        figsize=(10,4),
         dpi=120
     )
 
@@ -185,53 +362,56 @@ def render_case(
 
 
     img=ax.imshow(
-        Z,
-        cmap="inferno",
-        origin="lower",
-        extent=[
-            X.min(),
-            X.max(),
-            Y.min(),
-            Y.max()
-        ],
-        alpha=0.9
+        rgba,
+        origin="lower"
     )
 
 
     ax.set_xlim(
-        X.min(),
-        X.max()
+        0,
+        rgba.shape[1]
     )
+
 
     ax.set_ylim(
-        Y.min(),
-        Y.max()
+        0,
+        rgba.shape[0]
     )
-
 
 
     frames=[]
 
-    for i in range(30):
 
-        phase=i/30*np.pi*2
+    for i in range(40):
 
-        shift=np.sin(
-            X*20+phase
-        )*0.03
+        phase=i/40*np.pi*2
 
-        frame=Z*(1+shift)
+
+        wave=(
+            1+
+            0.05*
+            np.sin(
+                X*8+phase
+            )
+        )
+
+
+        frame=rgba.copy()
+
+        frame[:,:,:3]*=wave[:,:,None]
 
         frames.append(frame)
 
 
+
     def update(i):
 
-        img.set_array(
+        img.set_data(
             frames[i]
         )
 
         return img,
+
 
 
     ani=FuncAnimation(
@@ -243,13 +423,13 @@ def render_case(
 
 
     os.makedirs(
-        "plume_outputs",
+        "output",
         exist_ok=True
     )
 
 
     ani.save(
-        f"plume_outputs/{name}.gif",
+        "output/"+filename,
         writer=PillowWriter(
             fps=20
         )
@@ -260,9 +440,9 @@ def render_case(
 
 
 
-# =========================
+# =====================================================
 # main
-# =========================
+# =====================================================
 
 
 if __name__=="__main__":
@@ -270,33 +450,38 @@ if __name__=="__main__":
 
     engine=RocketEngine(
         thrust=500000,
-        nozzle_diameter=1.2
+        nozzle_diameter=1.2,
+        chamber_pressure=7e6
     )
 
 
     cases={
 
-        "sea_level":
+        "sea_level.gif":
             101325,
 
-        "high_altitude":
-            5000,
+        "altitude_10km.gif":
+            26000,
 
-        "vacuum":
-            0
+        "vacuum.gif":
+            1
 
     }
 
 
+
     for name,p in cases.items():
 
-        render_case(
+        print(
+            "render",
+            name
+        )
+
+        render(
             name,
             engine,
             p
         )
 
 
-    print(
-        "Finished"
-    )
+    print("done")

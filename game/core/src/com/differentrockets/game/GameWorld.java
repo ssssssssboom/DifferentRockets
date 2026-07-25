@@ -295,24 +295,37 @@ public class GameWorld {
         }
 
         double padAngle = Math.PI / 2; // top of the planet
-        double surfR = planet.radius + planet.heightAt(padAngle); // incl. noise terrain
-        // full design bounding box (every part, not just root)
-        float minY = Float.MAX_VALUE, maxY = -Float.MAX_VALUE;
+        // Per-part ground clearance (round 27 spawn-settle fix): the spawn
+        // height must put the LOWEST part exactly ON the collision surface,
+        // and the collision surface is TerrainScript's lua height (with the
+        // built-in fallback), not just planet.heightAt at the pad top. Using
+        // a single center sample + a 0.1 m air gap made every spawn a short
+        // free-fall followed by an impact — a 170-250 kN one-frame weld-force
+        // spike that has nothing to do with static load. Compute the required
+        // lift for EVERY part (its own terrain sample at its own surface
+        // angle, its own bottom extent incl. 90-degree rotations) and take
+        // the max, with a 2 mm slop instead of 100 mm.
+        double spawnR = 0;
+        boolean any = false;
         for (ShipDesign.DesignPart dp : design.parts) {
             PartType t = PartList.get(dp.typeId);
             if (t == null) continue;
-            minY = Math.min(minY, dp.y - t.height / 2f);
-            maxY = Math.max(maxY, dp.y + t.height / 2f);
+            double halfH = (dp.rot % 2 == 0) ? t.height / 2.0 : t.width / 2.0;
+            // design +y maps to radial-out; design +x maps to surface-east,
+            // which DECREASES the angle at the pad top
+            double ang = padAngle - dp.x / planet.radius;
+            double arc = ang * planet.radius;
+            double r = TerrainScript.surfaceHeight(planet.name, arc);
+            if (Double.isNaN(r) || Double.isInfinite(r) || r < planet.radius * 0.5) {
+                r = planet.radius + planet.heightAt(ang); // built-in fallback
+            }
+            double need = r - (dp.y - halfH);
+            if (!any || need > spawnR) { spawnR = need; any = true; }
         }
-        if (minY == Float.MAX_VALUE) { minY = -2; maxY = 2; }
+        if (!any) { spawnR = planet.radius + planet.heightAt(padAngle) + 2; }
 
-        // place the design origin so the LOWEST part point sits just above the
-        // terrain surface (lowest = spawnR + minY == surfR + margin)
-        // round 13: margin 1.2 -> 0.1 m. Restitution is now 0 everywhere, but
-        // the 1.2 m free-fall still built up impact speed that showed up as a
-        // landing transient; 0.1 m keeps clearance without the drop.
         double ux = Math.cos(padAngle), uy = Math.sin(padAngle);
-        double spawnR = surfR - minY + 0.1;
+        spawnR += 0.002; // 2 mm slop: no free-fall drop, no initial penetration
         double sx = planet.pos.x + ux * spawnR;
         double sy = planet.pos.y + uy * spawnR;
 
@@ -360,6 +373,11 @@ public class GameWorld {
             }
         }
         updateRailsFlags();
+        // build the terrain colliders under the newborn ship NOW: chunk
+        // creation normally runs at 10 Hz AFTER the physics substep, so the
+        // first frames otherwise step with no ground at all — a hidden
+        // free-fall + impact spike on every weld.
+        terrain.forceRefresh(ship.getUniversePos());
         System.out.println("[launch] planet.vel=" + planet.vel.x + "," + planet.vel.y
                 + " body0.vel=" + ship.parts.get(0).body.getLinearVelocity()
                 + " shipUniverseVel=" + ship.getUniverseVel().x + "," + ship.getUniverseVel().y
@@ -569,6 +587,10 @@ public class GameWorld {
             if (active != null) {
                 updateSteering(frameDt * warp);
                 active.updateScripts(frameDt * warp);
+            }
+            // engines on non-active ships (staged-away boosters) keep burning
+            for (Ship s : ships) {
+                if (s != active && !s.onRails) s.updateEngineScripts(frameDt * warp);
             }
             // apply any structural changes the scripts requested (detach etc.)
             processDeferredStructure();

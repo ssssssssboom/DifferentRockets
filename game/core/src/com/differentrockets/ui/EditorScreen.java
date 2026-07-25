@@ -181,6 +181,7 @@ public class EditorScreen extends ScreenAdapter {
         selected.clear();
         rebuildStageList();
         updateDelButton();
+        afterTopologyChange();
     }
 
     public ShipDesign getDesign() { return design; }
@@ -236,6 +237,8 @@ public class EditorScreen extends ScreenAdapter {
 
         stage = new Stage(new ScreenViewport());
         buildChrome();
+        reinferOrphans(); // restored/legacy designs may lack weld records
+        afterTopologyChange();
         rebuildStageList();
 
         InputMultiplexer mux = new InputMultiplexer();
@@ -675,6 +678,8 @@ public class EditorScreen extends ScreenAdapter {
             if (nameField != null) nameField.setText(shipName);
             if (nameLabel != null) nameLabel.setText(shipName);
             selected.clear();
+            reinferOrphans(); // legacy files may lack Connections; geometry fills in
+            afterTopologyChange();
             rebuildStageList();
             updateDelButton();
             status("Loaded " + shipName);
@@ -694,6 +699,7 @@ public class EditorScreen extends ScreenAdapter {
         selected.clear();
         rebuildStageList();
         updateDelButton();
+        afterTopologyChange();
         status("New ship");
     }
 
@@ -881,15 +887,15 @@ public class EditorScreen extends ScreenAdapter {
     private void deleteSelected() {
         if (selected.isEmpty()) return;
         pushHistory();
-        // touch-friendly delete (right-click does not exist on phones)
-        List<Integer> idx = new ArrayList<>(selected);
-        idx.sort(java.util.Collections.reverseOrder());
-        for (int i : idx) design.parts.remove(i);
+        // task 1: delete each selected part together with its child block
+        Set<Integer> victims = new HashSet<>();
+        for (int i : selected) victims.addAll(design.subtreeOf(i));
+        design.removeParts(victims);
         selected.clear();
-        design.autoStage();
         rebuildStageList();
         updateDelButton();
-        status("Deleted " + idx.size() + " parts");
+        afterTopologyChange();
+        status("Deleted " + victims.size() + " parts");
     }
 
     /** Show/hide the floating DEL button with the selection state. */
@@ -1159,6 +1165,69 @@ public class EditorScreen extends ScreenAdapter {
         return dp;
     }
 
+    // ------------------------------------------------------------ weld tree (tasks 1-2)
+
+    /** parts reachable from the root (pod) through welds; refreshed on change */
+    private boolean[] rootConnected = new boolean[0];
+    /** max attach-contact distance (m) that still counts as welded */
+    private static final float WELD_TOL = 0.3f;
+
+    /** Recompute the root-connectivity mask after any connection change. */
+    private void afterTopologyChange() {
+        rootConnected = design.componentFromRoot();
+    }
+
+    /**
+     * (Re)infer the parent weld of one part from geometry: nearest attach
+     * segment contact under WELD_TOL against any other part. Records at most
+     * one incoming connection (partB == idx); part 0 is the tree root and
+     * never gets a parent. Called on placement (the snap target wins, contact
+     * ~0) and after moves/loads to rewire orphans.
+     */
+    private void inferConnectionFor(int idx) {
+        design.connections.removeIf(c -> c.partB == idx);
+        if (idx <= 0 || idx >= design.parts.size()) return;
+        ShipDesign.DesignPart dp = design.parts.get(idx);
+        PartType t = PartList.get(dp.typeId);
+        if (t == null) return;
+        Vector2 ma = new Vector2(), mb = new Vector2();
+        Vector2 oa = new Vector2(), ob = new Vector2();
+        Vector2 cm = new Vector2(), co = new Vector2();
+        int bestJ = -1, bestAm = -1, bestAo = -1;
+        float bestD = WELD_TOL;
+        for (int j = 0; j < design.parts.size(); j++) {
+            if (j == idx) continue;
+            ShipDesign.DesignPart op = design.parts.get(j);
+            PartType ot = PartList.get(op.typeId);
+            if (ot == null) continue;
+            for (int am = 0; am < t.attach.size(); am++) {
+                attachWorldSeg(t, dp.x, dp.y, dp.rot, t.attach.get(am), ma, mb);
+                for (int ao = 0; ao < ot.attach.size(); ao++) {
+                    attachWorldSeg(ot, op.x, op.y, op.rot, ot.attach.get(ao), oa, ob);
+                    float d = Attach.closestBetweenSegments(ma, mb, oa, ob, cm, co);
+                    if (d < bestD) {
+                        bestD = d;
+                        bestJ = j; bestAm = am; bestAo = ao;
+                    }
+                }
+            }
+        }
+        if (bestJ >= 0) {
+            design.connections.add(new ShipDesign.Connection(bestJ, idx, bestAo, bestAm));
+        }
+    }
+
+    /** Give every parentless non-root part a chance to (re)weld to a neighbor. */
+    private void reinferOrphans() {
+        for (int i = 1; i < design.parts.size(); i++) {
+            boolean hasParent = false;
+            for (ShipDesign.Connection c : design.connections) {
+                if (c.partB == i) { hasParent = true; break; }
+            }
+            if (!hasParent) inferConnectionFor(i);
+        }
+    }
+
     /** Diagnostic: ghost/drag rotation steps (smoke tests). */
     public int dragRotForTest() { return dragRot; }
 
@@ -1228,11 +1297,14 @@ public class EditorScreen extends ScreenAdapter {
                 int idx = partAt(w);
                 if (idx >= 0) {
                     pushHistory();
-                    design.parts.remove(idx);
+                    // task 1: detaching a part detaches its whole child block
+                    List<Integer> victims = design.subtreeOf(idx);
+                    design.removeParts(victims);
                     selected.clear();
                     updateDelButton();
-                    design.autoStage();
                     rebuildStageList();
+                    afterTopologyChange();
+                    status("Removed " + victims.size() + " part(s)");
                     return true;
                 }
                 return false;
@@ -1241,6 +1313,8 @@ public class EditorScreen extends ScreenAdapter {
                 pushHistory();
                 Vector2 snapped = snap(w.x, w.y, dragRot, placing, -1);
                 design.parts.add(newPart(placing, snapped.x, snapped.y));
+                inferConnectionFor(design.parts.size() - 1); // task 1: record the weld
+                afterTopologyChange();
                 selected.clear();
                 updateDelButton();
                 design.autoStage();
@@ -1374,6 +1448,15 @@ public class EditorScreen extends ScreenAdapter {
                             : selected.size() + " selected — open [Stages] to assign a group");
                     updateDelButton();
                 } else {
+                    // task 1: a moved part's welds break; rewire it and any
+                    // orphans (its former children) by geometry
+                    if (dragIndex >= 0 && dragIndex < design.parts.size()) {
+                        final int moved = dragIndex;
+                        design.connections.removeIf(c -> c.partA == moved || c.partB == moved);
+                        inferConnectionFor(moved);
+                        reinferOrphans();
+                    }
+                    afterTopologyChange();
                     design.autoStage();
                     rebuildStageList();
                 }
@@ -1510,6 +1593,8 @@ public class EditorScreen extends ScreenAdapter {
             Vector2 w = screenToWorld(screenX, screenY);
             Vector2 snapped = snap(w.x, w.y, dragRot, placing, -1);
             design.parts.add(newPart(placing, snapped.x, snapped.y));
+            inferConnectionFor(design.parts.size() - 1); // task 1: record the weld
+            afterTopologyChange();
             selected.clear();
             updateDelButton();
             design.autoStage();
@@ -1595,11 +1680,13 @@ public class EditorScreen extends ScreenAdapter {
         }
         game.shapes.end();
 
-        // parts
+        // parts (task 2: blocks not welded to the root/pod render translucent)
         game.batch.setProjectionMatrix(cam.combined);
         game.batch.begin();
-        for (ShipDesign.DesignPart dp : design.parts) {
-            drawPart(dp.typeId, dp.x, dp.y, dp.rot, dp.flippedX, dp.flippedY, 1f);
+        for (int i = 0; i < design.parts.size(); i++) {
+            ShipDesign.DesignPart dp = design.parts.get(i);
+            boolean welded = i < rootConnected.length && rootConnected[i];
+            drawPart(dp.typeId, dp.x, dp.y, dp.rot, dp.flippedX, dp.flippedY, welded ? 1f : 0.4f);
         }
         // ghost
         if (placing != null) {

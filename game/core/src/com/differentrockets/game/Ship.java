@@ -70,9 +70,11 @@ public class Ship {
 
     /** Instantiate parts (bodies created at design positions, rotated by spawnAngle). */
     public void buildFromDesign(ShipDesign d, float spawnAngle) {
+        // design index -> runtime Part (null for unknown types, which are skipped)
+        List<Part> byDesign = new ArrayList<>();
         for (ShipDesign.DesignPart dp : d.parts) {
             PartType t = PartList.get(dp.typeId);
-            if (t == null) continue;
+            if (t == null) { byDesign.add(null); continue; }
             Part p = new Part(t, this, dp);
             p.group = dp.group;
             // rotate design offset by spawn angle
@@ -81,13 +83,52 @@ public class Ship {
             float oy = dp.x * s + dp.y * c;
             p.createBody(ox, oy, spawnAngle);
             parts.add(p);
+            byDesign.add(p);
         }
         for (List<Integer> st : d.stages) stages.add(new ArrayList<>(st));
         // onLoad BEFORE welding (round 9 item 1): part scripts set per-part
         // joint overrides (setJointParams) in onLoad — welds must resolve
         // against those, not against the global defaults.
         for (Part p : parts) p.callOnLoad();
-        connectAttachPoints();
+        // round 27: connection-record-driven welding (Show_Rocket Connections).
+        // The editor records exactly which attach points mate; weld those.
+        // Designs without records (old saves, hand-built) fall back to the
+        // geometric overlap sweep.
+        if (!d.connections.isEmpty()) {
+            for (ShipDesign.Connection c : d.connections) {
+                if (c.partA < 0 || c.partA >= byDesign.size()
+                        || c.partB < 0 || c.partB >= byDesign.size()) continue;
+                Part a = byDesign.get(c.partA), b = byDesign.get(c.partB);
+                if (a == null || b == null || a == b) continue;
+                weldAt(a, c.attachA, b, c.attachB);
+            }
+            // a design whose records ALL failed (e.g. every part type missing)
+            // still needs structure — fall back if nothing got welded
+            if (links.isEmpty() && parts.size() > 1) connectAttachPoints();
+        } else {
+            connectAttachPoints();
+        }
+    }
+
+    /**
+     * Weld two parts at SPECIFIC attach indices: the anchor is the midpoint of
+     * the closest pair between the two attach segments (same contact rule as
+     * the geometric sweep), and the weld params resolve against those exact
+     * attach defs. Out-of-range indices fall back to nearest-attach welding.
+     */
+    public void weldAt(Part a, int ai, Part b, int bi) {
+        if (ai < 0 || bi < 0 || ai >= a.attachDefs().size() || bi >= b.attachDefs().size()) {
+            weldLoaded(a, b);
+            return;
+        }
+        Vector2 a1 = new Vector2(), a2 = new Vector2();
+        Vector2 b1 = new Vector2(), b2 = new Vector2();
+        Vector2 cA = new Vector2(), cB = new Vector2();
+        a.attachWorldSegment(ai, a1, a2);
+        b.attachWorldSegment(bi, b1, b2);
+        Attach.closestBetweenSegments(a1, a2, b1, b2, cA, cB);
+        Vector2 anchor = new Vector2((cA.x + cB.x) / 2f, (cA.y + cB.y) / 2f);
+        weld(a, b, anchor, a.attachDefs().get(ai), b.attachDefs().get(bi));
     }
 
     /**

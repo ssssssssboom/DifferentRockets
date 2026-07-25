@@ -38,7 +38,100 @@ public class ShipDesign {
     /** ship name recovered from the XML Pod name attribute on load (null if none). */
     public String loadedName;
 
-    public void clear() { parts.clear(); stages.clear(); }
+    /**
+     * A weld between two placed parts (shared editor/game interface).
+     * partA = parent (the pre-existing part that was snapped TO),
+     * partB = child (the part that was attached); attachA/attachB are indices
+     * into each part type's attach list. Every non-root part (index 0 = root)
+     * has at most one incoming connection as partB, so the connections form a
+     * forest rooted at part 0.
+     */
+    public static class Connection {
+        public int partA, partB;
+        public int attachA, attachB;
+        public Connection() {}
+        public Connection(int partA, int partB, int attachA, int attachB) {
+            this.partA = partA; this.partB = partB;
+            this.attachA = attachA; this.attachB = attachB;
+        }
+    }
+
+    /** weld records of the design (see Connection); maps to XML Connections. */
+    public final List<Connection> connections = new ArrayList<>();
+
+    public void clear() { parts.clear(); stages.clear(); connections.clear(); }
+
+    /**
+     * The part itself plus every descendant hanging off it via parent->child
+     * connections (the block that comes off when this part is detached).
+     */
+    public List<Integer> subtreeOf(int idx) {
+        List<Integer> out = new ArrayList<>();
+        if (idx < 0 || idx >= parts.size()) return out;
+        boolean[] seen = new boolean[parts.size()];
+        List<Integer> queue = new ArrayList<>();
+        seen[idx] = true;
+        queue.add(idx);
+        while (!queue.isEmpty()) {
+            int cur = queue.remove(queue.size() - 1);
+            out.add(cur);
+            for (Connection c : connections) {
+                if (c.partA == cur && c.partB >= 0 && c.partB < parts.size() && !seen[c.partB]) {
+                    seen[c.partB] = true;
+                    queue.add(c.partB);
+                }
+            }
+        }
+        return out;
+    }
+
+    /** Remove parts and every connection touching them, reindexing the rest. */
+    public void removeParts(java.util.Collection<Integer> victims) {
+        boolean[] kill = new boolean[parts.size()];
+        for (int v : victims) if (v >= 0 && v < parts.size()) kill[v] = true;
+        int[] remap = new int[parts.size()];
+        List<DesignPart> np = new ArrayList<>();
+        int n = 0;
+        for (int i = 0; i < parts.size(); i++) {
+            if (kill[i]) { remap[i] = -1; continue; }
+            remap[i] = n++;
+            np.add(parts.get(i));
+        }
+        parts.clear();
+        parts.addAll(np);
+        List<Connection> nc = new ArrayList<>();
+        for (Connection c : connections) {
+            if (c.partA < 0 || c.partA >= kill.length || c.partB < 0 || c.partB >= kill.length) continue;
+            if (kill[c.partA] || kill[c.partB]) continue;
+            nc.add(new Connection(remap[c.partA], remap[c.partB], c.attachA, c.attachB));
+        }
+        connections.clear();
+        connections.addAll(nc);
+        // stages reference part indices too — the safest rebuild is autoStage
+        autoStage();
+    }
+
+    /** Connectivity mask: parts reachable from the root (index 0), BFS over
+     *  the UNDIRECTED connection graph (a detached block stays internally
+     *  connected but is not root-connected). */
+    public boolean[] componentFromRoot() {
+        boolean[] conn = new boolean[parts.size()];
+        if (parts.isEmpty()) return conn;
+        List<Integer> queue = new ArrayList<>();
+        conn[0] = true;
+        queue.add(0);
+        while (!queue.isEmpty()) {
+            int cur = queue.remove(queue.size() - 1);
+            for (Connection c : connections) {
+                int other = c.partA == cur ? c.partB : c.partB == cur ? c.partA : -1;
+                if (other >= 0 && other < parts.size() && !conn[other]) {
+                    conn[other] = true;
+                    queue.add(other);
+                }
+            }
+        }
+        return conn;
+    }
 
     /** Deep copy via the JSON round-trip (used for undo/redo snapshots). */
     public ShipDesign snapshot() { return fromJson(toJson()); }
@@ -55,6 +148,10 @@ public class ShipDesign {
         }
         stages.clear();
         for (List<Integer> s : o.stages) stages.add(new ArrayList<>(s));
+        connections.clear();
+        for (Connection c : o.connections) {
+            connections.add(new Connection(c.partA, c.partB, c.attachA, c.attachB));
+        }
     }
 
     public void autoStage() {
@@ -96,8 +193,8 @@ public class ShipDesign {
      *   Type children: Tank[fuel], Engine[fuel], Pod[throttle,name] > Staging.
      * Editor activation groups are written as the sample's staging: group g
      * becomes Step #g (1-based) of every Pod's Staging element; the ship name
-     * rides in the first Pod's name attribute. We do not track weld
-     * connections, so Connections is written empty (accepted by the format).
+     * rides in the first Pod's name attribute. Weld records (connections list)
+     * map to Connections with 1-based attach numbering; empty when none.
      */
     public String toXml(String shipName) {
         String[] ids = new String[parts.size()];
@@ -140,7 +237,21 @@ public class ShipDesign {
             }
         }
         sb.append("</Parts>\n");
-        sb.append("<Connections/>\n");
+        if (connections.isEmpty()) {
+            sb.append("<Connections/>\n");
+        } else {
+            sb.append("<Connections>\n");
+            for (Connection c : connections) {
+                if (c.partA < 0 || c.partA >= parts.size() || c.partB < 0 || c.partB >= parts.size())
+                    continue;
+                // XML attach numbering is 1-based (sample: values 1..4)
+                sb.append("<Connection parentAttachPoint=\"").append(c.attachA + 1)
+                        .append("\" childAttachPoint=\"").append(c.attachB + 1)
+                        .append("\" parentPart=\"").append(ids[c.partA])
+                        .append("\" childPart=\"").append(ids[c.partB]).append("\"/>\n");
+            }
+            sb.append("</Connections>\n");
+        }
         sb.append("</Ship>");
         return sb.toString();
     }
@@ -242,6 +353,22 @@ public class ShipDesign {
                 break; // one pod's staging is enough
             }
         }
+        // connections: parentPart/childPart are id refs; attach numbering is 1-based
+        for (int i = 0; i < root.getChildCount(); i++) {
+            XmlReader.Element ch = root.getChild(i);
+            if (!"Connections".equals(ch.getName())) continue;
+            for (int c = 0; c < ch.getChildCount(); c++) {
+                XmlReader.Element ce = ch.getChild(c);
+                if (!"Connection".equals(ce.getName())) continue;
+                int pa = ids.indexOf(ce.getAttribute("parentPart", ""));
+                int pb = ids.indexOf(ce.getAttribute("childPart", ""));
+                if (pa < 0 || pb < 0) continue;
+                d.connections.add(new Connection(pa, pb,
+                        ce.getIntAttribute("parentAttachPoint", 1) - 1,
+                        ce.getIntAttribute("childAttachPoint", 1) - 1));
+            }
+            break;
+        }
         if (d.stages.isEmpty()) d.autoStage();
         return d;
     }
@@ -262,6 +389,13 @@ public class ShipDesign {
             if (p.flippedX) w.set("fx", 1);
             if (p.flippedY) w.set("fy", 1);
             w.endObj();
+        }
+        w.endArr();
+        w.key("conn"); w.arr();
+        for (Connection c : connections) {
+            w.arr();
+            w.val(c.partA); w.val(c.partB); w.val(c.attachA); w.val(c.attachB);
+            w.endArr();
         }
         w.endArr();
         w.key("stages"); w.arr();
@@ -291,6 +425,17 @@ public class ShipDesign {
                 dp.flippedX = o.getInt("fx", 0) != 0;
                 dp.flippedY = o.getInt("fy", 0) != 0;
                 d.parts.add(dp);
+            }
+        }
+        List<Json.Value> cs = root.getArr("conn");
+        if (cs != null) {
+            for (Json.Value v : cs) {
+                List<Json.Value> a = v.asArr();
+                if (a.size() >= 4) {
+                    d.connections.add(new Connection(
+                            a.get(0).asInt(0), a.get(1).asInt(0),
+                            a.get(2).asInt(0), a.get(3).asInt(0)));
+                }
             }
         }
         List<Json.Value> ss = root.getArr("stages");

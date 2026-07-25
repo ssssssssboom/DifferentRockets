@@ -1317,9 +1317,13 @@ public class GameWorld {
                     for (int i = 0; i < connsEl.getChildCount(); i++) {
                         XmlReader.Element ce = connsEl.getChild(i);
                         if (!"Connection".equals(ce.getName())) continue;
+                        // {parentPartId, childPartId, parentAttach(0-based, -1
+                        // = unknown), childAttach}; XML numbering is 1-based
                         rs.conns.add(new int[] {
                                 (int) getNumAttr(ce, "parentPart", -1),
-                                (int) getNumAttr(ce, "childPart", -1) });
+                                (int) getNumAttr(ce, "childPart", -1),
+                                (int) getNumAttr(ce, "parentAttachPoint", 0) - 1,
+                                (int) getNumAttr(ce, "childAttachPoint", 0) - 1 });
                     }
                 }
                 records.add(rs);
@@ -1376,7 +1380,7 @@ public class GameWorld {
                 if (!rs.conns.isEmpty()) {
                     for (int[] c : rs.conns) {
                         Part a = byId.get(c[0]), b = byId.get(c[1]);
-                        if (a != null && b != null && a != b) s.weldLoaded(a, b);
+                        if (a != null && b != null && a != b) s.weldAt(a, c[2], b, c[3]);
                     }
                 } else if (s.parts.size() > 1) {
                     s.connectOverlaps(); // no Connections in file: re-weld by overlap

@@ -117,7 +117,7 @@ public final class PhysicsScript {
     // editable in mod/physics.lua via the `joints` table.
     // round 27 owner tuning: built-in joint defaults are 20 Hz / 1.0 / 1.0;
     // physics.lua's joints table (player-editable) overrides these when present.
-    private static final double DEF_JOINT_FREQ = 20.0, DEF_JOINT_DAMP = 1.0, DEF_ANG_DAMP = 1.0;
+    private static final double DEF_JOINT_FREQ = 28.0, DEF_JOINT_DAMP = 1.0, DEF_ANG_DAMP = 1.0;
 
     /**
      * Weld-joint parameters from Lua (`joints = {frequencyHz=.., dampingRatio=..,

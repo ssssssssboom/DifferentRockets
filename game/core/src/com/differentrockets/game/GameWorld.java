@@ -415,6 +415,20 @@ public class GameWorld {
         steerPrimed = false;
         wtCount = 0;
         SteeringIO.ringActive = false;
+        SteeringIO.targetHeadingRad = 0; // task 1: deactivation drops the target
+    }
+
+    /**
+     * Deactivate the steering ring AND drop the held target heading (user
+     * request, task 1): a deactivated ring keeps NO target angle —
+     * targetHeadingRad is cleared and steerPrimed=false re-primes the world
+     * target from the ship's live heading, so the next activation restarts
+     * fresh (the ring grab re-anchors on the current heading anyway).
+     */
+    public void deactivateRing() {
+        SteeringIO.ringActive = false;
+        SteeringIO.targetHeadingRad = 0;
+        steerPrimed = false;
     }
 
     /** Change the universe position assigned to the physics origin; bodies do NOT move. */

@@ -70,7 +70,10 @@ steering = { kp = 1.8, ki = 0.5, kd = 1.2 }
 --                  deg of the target = ~4 s of phase tolerance, the most
 --                  robust window available. Cost: sustained turn rate scales
 --                  ~1/damping, so coarse slews feel heavier than the PID era.
-joints = { frequencyHz = 20.0, dampingRatio = 1.0, angularDamping = 1.0 }
+-- Round 23 (v2026.07.27): unified to 28 Hz / 1.0 / 1.0 for EVERY connection,
+-- matching joints.lua's DEFAULT_* constants; the per-part overrides shipped
+-- in earlier rounds (strut-1, dock-1, port-1) were removed.
+joints = { frequencyHz = 28.0, dampingRatio = 1.0, angularDamping = 1.0 }
 
 -- Per-part override (round 9): a part's own Lua script may call
 --   part:setJointParams{frequencyHz=…, dampingRatio=…, angularDamping=…}
@@ -78,8 +81,8 @@ joints = { frequencyHz = 20.0, dampingRatio = 1.0, angularDamping = 1.0 }
 -- -> Java defaults). When two parts are welded, the override with the HIGHER
 -- frequencyHz wins — the stiffer side rules the connection — and its
 -- dampingRatio comes along. angularDamping applies to the part's own body.
--- Shipped examples: strut-1.lua = extra-rigid (35 Hz), dock-1/port-1 = softer
--- (8 Hz) so docked assemblies have a little give.
+-- (Round 23: no shipped part uses this anymore — all connections use the
+-- unified 28 / 1.0 / 1.0 above.)
 --
 -- Per-connection rules (round 11): mod/joints.lua decides the final
 -- frequencyHz / dampingRatio / angularDamping / breakForce of EVERY weld and

@@ -41,6 +41,13 @@ public class Ship {
     public final GameWorld world;
     public final List<Part> parts = new ArrayList<>();
     public final List<Link> links = new ArrayList<>();
+
+    /**
+     * Recorded parent part per child (from connection records / save XML, see
+     * weldAt). Geometric fallback welds and legacy saves leave this empty —
+     * detachers then fall back to the attach-index<=0 parent rule.
+     */
+    public final Map<Part, Part> parentOf = new IdentityHashMap<>();
     /**
      * Throttle frozen at the moment this ship was cut loose (round 27):
      * a detached stage keeps burning at the throttle it had at separation;
@@ -139,6 +146,11 @@ public class Ship {
         Attach.closestBetweenSegments(a1, a2, b1, b2, cA, cB);
         Vector2 anchor = new Vector2((cA.x + cB.x) / 2f, (cA.y + cB.y) / 2f);
         weld(a, b, anchor, a.attachDefs().get(ai), b.attachDefs().get(bi));
+        // Connection records are parent->child (ShipDesign.Connection: partA =
+        // parent; save XML parentPart/childPart): remember the recorded parent
+        // so detachers sever EXACTLY the parent-side link regardless of which
+        // attach index the parent happens to be mated to (flipped detachers).
+        if (!parentOf.containsKey(b)) parentOf.put(b, a);
     }
 
     /**
@@ -246,19 +258,30 @@ public class Ship {
     }
 
     /**
-     * Detach MODE 2 (detacher-*.lua, round 26): sever ONLY the joint sitting
-     * on this part's FIRST attach point (index 0 — the parent/upstream side:
-     * TopCenter on detacher-1, LeftCenter on detacher-2). Joints on every
-     * other attach point survive, so the detacher ring stays with the lower
-     * stage instead of falling free. Links without a recorded attach index
-     * (-1, e.g. rebuilt from an old save) are treated as parent joints and
-     * severed too — a detacher that keeps a mystery link would never staged.
+     * Detach MODE 2 (detacher-*.lua, round 26/27): sever ONLY the link to this
+     * part's RECORDED PARENT (weldAt records it from the design/save
+     * connection list — the parent is partA/parentPart there). This is
+     * orientation-independent: a flipped detacher whose parent mates on
+     * attach index 1 (BottomCenter instead of TopCenter) still cuts the pod
+     * side, never the tank side. Joints on every other attach point survive,
+     * so the detacher ring stays with the lower stage.
+     * Fallback (geometric welds, legacy saves, links without a recorded
+     * parent): sever the joint on attach index <= 0 — links without a
+     * recorded attach index (-1) are treated as parent joints and severed
+     * too, so a detacher that keeps a mystery link would never stage.
      */
     public void removeParentJointOf(Part p) {
         List<Link> dead = new ArrayList<>();
-        for (Link l : links) {
-            if (l.a == p && l.attachIndexA <= 0) dead.add(l);
-            else if (l.b == p && l.attachIndexB <= 0) dead.add(l);
+        Part parent = parentOf.get(p);
+        if (parent != null) {
+            for (Link l : links) {
+                if ((l.a == p && l.b == parent) || (l.b == p && l.a == parent)) dead.add(l);
+            }
+        } else {
+            for (Link l : links) {
+                if (l.a == p && l.attachIndexA <= 0) dead.add(l);
+                else if (l.b == p && l.attachIndexB <= 0) dead.add(l);
+            }
         }
         for (Link l : dead) destroyLink(l);
         if (!dead.isEmpty()) splitIfDisconnected();
@@ -347,6 +370,8 @@ public class Ship {
                 parts.remove(p);
                 ns.parts.add(p);
                 p.ship = ns;
+                Part par = parentOf.remove(p);
+                if (par != null) ns.parentOf.put(p, par);
             }
             // move links
             List<Link> mv = new ArrayList<>();

@@ -1037,11 +1037,18 @@ public class EditorScreen extends ScreenAdapter {
         status("Rotated " + (ccw ? "CCW" : "CW") + " 90 deg");
     }
 
-    /** Mirror-copy every selected block about its centroid axis (task 5).
-     *  horizontal=true mirrors about the vertical axis x=avgX (toggle flippedX,
-     *  rot -> 180deg-rot); horizontal=false about y=avgY (toggle flippedY,
-     *  rot -> -rot). Attach geometry is flip-invariant (Attach.localSegment),
-     *  so the rigid isometry keeps every internal weld contact consistent. */
+    /** Mirror-copy every selected block about its centroid axis (task 5,
+     *  rot mapping fixed round 10). Mirroring is a reflection, and reflection
+     *  conjugates rotation to its INVERSE: F·R(θ) = R(−θ)·F. So for BOTH axes
+     *  the exact appearance mirror is rot' = −rot (mod 360) with the flip flag
+     *  on the mirror axis toggled — Mir H (vertical axis) toggles flippedX,
+     *  Mir V (horizontal axis) toggles flippedY. Consequences: a y-axis-parallel
+     *  part (rot 0/2) mirrored about a y-parallel axis keeps its angle
+     *  unchanged, and the mapping is never a naive +180. Note: Attach geometry
+     *  is flip-invariant (Attach.localSegment), so attach POINTS of strongly
+     *  asymmetric center attaches are the engine's best approximation of the
+     *  mirrored geometry (flip-aware attach geometry would need Attach-side
+     *  support, owned by the other agent). */
     private void mirrorSelectedBlocks(boolean horizontal) {
         duplicateSelectedBlocks(horizontal ? 1 : 2);
         status(horizontal ? "Mirrored copy (about avg X)" : "Mirrored copy (about avg Y)");
@@ -1073,10 +1080,14 @@ public class EditorScreen extends ScreenAdapter {
                 np.flippedX = p.flippedX;
                 np.flippedY = p.flippedY;
                 if (mode == 1) {
+                    // mirror about a y-parallel axis (x = avgX): exact mirror
+                    // is rot' = -rot with flippedX toggled (F·R(θ) = R(−θ)·F)
                     np.x = 2 * cx - p.x;
-                    np.rot = (2 - p.rot + 4) & 3;
+                    np.rot = (4 - p.rot) & 3;
                     np.flippedX = !np.flippedX;
                 } else if (mode == 2) {
+                    // mirror about an x-parallel axis (y = avgY): same rot
+                    // inversion, flippedY toggled instead
                     np.y = 2 * cy - p.y;
                     np.rot = (4 - p.rot) & 3;
                     np.flippedY = !np.flippedY;
@@ -1304,7 +1315,10 @@ public class EditorScreen extends ScreenAdapter {
         return best;
     }
 
-    /** Design-space world segment of one attach point of a part at (px,py,rot). */
+    /** Design-space world segment of one attach point of a part at (px,py,rot).
+     *  Attach.localSegment already shrinks edge-type decision regions inward
+     *  by Attach.EDGE_SHRINK (round 28, Attach-side) — every editor consumer
+     *  (snap/weld/markers) inherits exactly that valid interval. */
     private static void attachWorldSeg(PartType t, float px, float py, int rot,
                                        PartType.AttachPoint ap, Vector2 outA, Vector2 outB) {
         Attach.localSegment(t, ap, outA, outB);
@@ -1313,6 +1327,23 @@ public class EditorScreen extends ScreenAdapter {
         float bx = outB.x * c - outB.y * s, by = outB.x * s + outB.y * c;
         outA.set(px + ax, py + ay);
         outB.set(px + bx, py + by);
+    }
+
+    /** Clamp the along-segment component of (px,py) to the segment's own
+     *  interval — after grid quantization the anchor must still lie INSIDE
+     *  the (shrunk) valid region, or the contact falls out of the decision
+     *  region and the part appears to slide freely. */
+    private static Vector2 clampAlongSegment(float px, float py, Vector2 a, Vector2 b, Vector2 out) {
+        float abx = b.x - a.x, aby = b.y - a.y;
+        float len2 = abx * abx + aby * aby;
+        if (len2 < 1e-9f) return out.set(px, py);
+        float inv = 1f / (float) Math.sqrt(len2);
+        float ux = abx * inv, uy = aby * inv;
+        float s = px * ux + py * uy;
+        float sA = a.x * ux + a.y * uy, sB = b.x * ux + b.y * uy;
+        float lo = Math.min(sA, sB), hi = Math.max(sA, sB);
+        float q = Math.max(lo, Math.min(hi, s));
+        return out.set(px + ux * (q - s), py + uy * (q - s));
     }
 
     /** Smoke-test hook (round 11 item 5): snap as if dragging typeId to (px,py). */
@@ -1355,30 +1386,44 @@ public class EditorScreen extends ScreenAdapter {
         int part, apM, apO;
         float d;        // contact distance at the RAW (finger) position
         float nx, ny;   // ghost position after this pair's snap correction
+        float ax, ay;   // contact anchor (midpoint of the contact pair), world
     }
 
     /** currently selected candidate identity (-1 = none) */
     private int snapSelPart = -1, snapSelApM = -1, snapSelApO = -1;
     /** the pair currently shown as the welding scheme (highlight + drop weld) */
     private final SnapWin lastSnapWin = new SnapWin();
+    /** previous raw finger position inside one gesture (direction weighting) */
+    private float snapPrevX, snapPrevY;
+    private boolean snapPrevValid;
+
+    /** min finger displacement (m) that counts as a directional nudge */
+    private static final float SNAP_DIR_MIN = 0.04f;
+    /** cos cone: the nudge must point within ~60 deg of the rival's anchor */
+    private static final float SNAP_DIR_COS = 0.5f;
 
     private void clearSnapSel() {
         snapSelPart = -1;
+        snapPrevValid = false;
         lastSnapWin.part = -1;
     }
 
     /** Snap correction for one specific attach pair (same rules as snap():
-     *  edge-type pairs quantize the free slide along the mating segment). */
+     *  edge-type pairs quantize the free slide along the mating segment,
+     *  then clamp into the shrunk valid interval — strictly discrete, the
+     *  anchor can never ride past the decision region). */
     private Vector2 snapCorrection(float px, float py, PartType.AttachPoint apM,
                                    PartType.AttachPoint apO, Vector2 ma, Vector2 mb,
                                    Vector2 oa, Vector2 ob, Vector2 cm, Vector2 co) {
         float nx = px + (co.x - cm.x), ny = py + (co.y - cm.y);
         Vector2 qn = new Vector2();
         if (apO.edge != PartType.AttachPoint.EDGE_NONE) {
-            return Attach.quantizeAlongSegment(nx, ny, oa, ob, qn);
+            Attach.quantizeAlongSegment(nx, ny, oa, ob, qn);
+            return clampAlongSegment(qn.x, qn.y, oa, ob, new Vector2());
         }
         if (apM.edge != PartType.AttachPoint.EDGE_NONE) {
-            return Attach.quantizeAlongSegment(nx, ny, ma, mb, qn);
+            Attach.quantizeAlongSegment(nx, ny, ma, mb, qn);
+            return clampAlongSegment(qn.x, qn.y, ma, mb, new Vector2());
         }
         return new Vector2(nx, ny);
     }
@@ -1405,6 +1450,8 @@ public class EditorScreen extends ScreenAdapter {
                     if (d < 2.2f) {
                         SnapCand cnd = new SnapCand();
                         cnd.part = i; cnd.apM = am; cnd.apO = ao; cnd.d = d;
+                        cnd.ax = (cm.x + co.x) / 2f;
+                        cnd.ay = (cm.y + co.y) / 2f;
                         Vector2 corr = snapCorrection(px, py,
                                 type.attach.get(am), t.attach.get(ao), ma, mb, oa, ob, cm, co);
                         cnd.nx = corr.x; cnd.ny = corr.y;
@@ -1420,9 +1467,12 @@ public class EditorScreen extends ScreenAdapter {
     /**
      * Multi-scheme snap: collect every legal candidate at the raw position,
      * keep the previously selected scheme while it stays within SNAP_HYST of
-     * the best (hysteresis), otherwise switch to the nearest. Returns the
-     * corrected ghost position for the SELECTED scheme and records it in
-     * lastSnapWin for the highlight and the drop weld.
+     * the best (hysteresis). Additionally a clear finger nudge TOWARD an
+     * in-band rival's contact anchor switches to that rival even without the
+     * full hysteresis margin (direction weighting — this is how the player
+     * picks between near-equidistant schemes like strutA/strutB without
+     * moving the part). Returns the corrected ghost position for the
+     * SELECTED scheme and records it in lastSnapWin.
      */
     private Vector2 snapMulti(float px, float py, int rot, PartType type, int ignoreIndex,
                               java.util.Collection<Integer> exclude) {
@@ -1431,12 +1481,32 @@ public class EditorScreen extends ScreenAdapter {
             clearSnapSel();
             return new Vector2(px, py);
         }
-        SnapCand chosen = cands.get(0);
+        SnapCand best = cands.get(0);
+        SnapCand chosen = best;
+        SnapCand cur = null;
         for (SnapCand c : cands) {
-            if (c.part == snapSelPart && c.apM == snapSelApM && c.apO == snapSelApO
-                    && c.d <= chosen.d + SNAP_HYST) {
-                chosen = c; // keep the current scheme: rival not clearly closer
+            if (c.part == snapSelPart && c.apM == snapSelApM && c.apO == snapSelApO) {
+                cur = c;
                 break;
+            }
+        }
+        if (cur != null && cur.d <= best.d + SNAP_HYST) {
+            chosen = cur; // hysteresis keep...
+            // ...unless the finger nudges clearly TOWARD an in-band rival
+            if (chosen != best || cands.size() > 1) {
+                float mvx = px - snapPrevX, mvy = py - snapPrevY;
+                float ml = (float) Math.sqrt(mvx * mvx + mvy * mvy);
+                if (snapPrevValid && ml >= SNAP_DIR_MIN) {
+                    for (SnapCand c : cands) {
+                        if (c == cur || c.d > cur.d + SNAP_HYST) continue;
+                        float dirx = c.ax - cur.ax, diry = c.ay - cur.ay;
+                        float dl = (float) Math.sqrt(dirx * dirx + diry * diry);
+                        if (dl > 1e-4f && (mvx * dirx + mvy * diry) / (ml * dl) > SNAP_DIR_COS) {
+                            chosen = c; // direction-weighted switch
+                            break;
+                        }
+                    }
+                }
             }
         }
         snapSelPart = chosen.part;
@@ -1445,6 +1515,9 @@ public class EditorScreen extends ScreenAdapter {
         lastSnapWin.part = chosen.part;
         lastSnapWin.apM = chosen.apM;
         lastSnapWin.apO = chosen.apO;
+        snapPrevX = px;
+        snapPrevY = py;
+        snapPrevValid = true;
         return new Vector2(chosen.nx, chosen.ny);
     }
 
@@ -2117,9 +2190,9 @@ public class EditorScreen extends ScreenAdapter {
     }
 
     /**
-     * Palette drag-out release (screen coords of the finger): over the canvas
-     * (right of the palette column) -> place at the snapped position; back over
-     * the palette -> cancel.
+     * Palette drag-out release (screen coords of the finger): ALWAYS places the
+     * part at the release position — including over the palette column (round
+     * 10 task 3: releasing inside the list's original area no longer cancels).
      */
     void finishDragOut(float screenX, float screenY) {
         dragOutType = null;
@@ -2127,7 +2200,7 @@ public class EditorScreen extends ScreenAdapter {
         // finger on the palette mid-drag could have re-armed one)
         stage.cancelTouchFocus();
         if (placing == null) return;
-        if (screenX > drawerW) {
+        {
             pushHistory();
             Vector2 w = screenToWorld(screenX, screenY);
             // multi-scheme snap: weld exactly the SELECTED scheme on drop
@@ -2148,8 +2221,6 @@ public class EditorScreen extends ScreenAdapter {
             status("Placed " + placing.name + " — drag another from the list, or tap a row");
             placing = null;
             openPartsDrawer(); // issue 3: ready for the next part right away
-        } else {
-            status("Cancelled");
         }
         placing = null;
     }

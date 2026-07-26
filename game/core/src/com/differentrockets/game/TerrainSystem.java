@@ -294,6 +294,17 @@ public class TerrainSystem implements Disposable {
             refreshT = REFRESH_S; // warp just ended: rebuild colliders immediately
         }
         lastPhysicsActive = physicsActive;
+        // round 28 perf: at super-warp (>4x) skip terrain ENTIRELY — no chunk
+        // generation, no colliders (above), and no render mesh streaming. Low
+        // orbit at 25x+ streamed the +-100 km window at 10 Hz (thousands of
+        // columns per chunk build) for a ground the player can't meaningfully
+        // read at time-compression; that was the warp stutter's main cost.
+        // Chunks stream back in via manage() within one refresh after warp
+        // drops to physical levels.
+        if (!physicsActive) {
+            if (planet != null) { clearChunks(); planet = null; }
+            return;
+        }
         // pick the planet we're closest to the surface of
         Planet best = null;
         double bestAlt = Double.MAX_VALUE;

@@ -47,7 +47,18 @@ public class MenuScreen extends ScreenAdapter {
         cont.addListener(new ClickListener() {
             @Override public void clicked(InputEvent e, float x, float y) {
                 game.world.load();
-                game.setScreen(new SandboxScreen(game));
+                // user request: pick WHICH ship to continue as before entering
+                // the sandbox (skipped when the save holds 0 or 1 ship)
+                java.util.List<com.differentrockets.game.Ship> ships = new java.util.ArrayList<>();
+                for (com.differentrockets.game.Ship s : game.world.ships) {
+                    if (!s.parts.isEmpty()) ships.add(s);
+                }
+                if (ships.size() <= 1) {
+                    if (ships.size() == 1) game.world.setActive(ships.get(0));
+                    game.setScreen(new SandboxScreen(game));
+                } else {
+                    showShipPicker(ships);
+                }
             }
         });
         reset.addListener(new ClickListener() {
@@ -72,6 +83,42 @@ public class MenuScreen extends ScreenAdapter {
         ver.setColor(new Color(0.5f, 0.55f, 0.68f, 1f));
         ver.setPosition(10, 8);
         stage.addActor(ver);
+    }
+
+    /** Continue-ship picker: modal list of the saved ships; CANCEL stays. */
+    private Table shipPicker;
+
+    private void showShipPicker(final java.util.List<com.differentrockets.game.Ship> ships) {
+        closeShipPicker();
+        shipPicker = new Table();
+        shipPicker.setBackground(game.ui.tinted(new Color(0.10f, 0.11f, 0.16f, 0.95f)));
+        shipPicker.add(new Label("Continue as which ship?", game.ui.skin)).pad(14).row();
+        for (final com.differentrockets.game.Ship s : ships) {
+            TextButton b = new TextButton(s.name, game.ui.skin);
+            b.addListener(new ClickListener() {
+                @Override public void clicked(InputEvent e, float x, float y) {
+                    game.world.setActive(s);
+                    game.setScreen(new SandboxScreen(game));
+                }
+            });
+            shipPicker.add(b).width(420).height(80).pad(4).row();
+        }
+        TextButton cancel = new TextButton("CANCEL", game.ui.skin);
+        cancel.addListener(new ClickListener() {
+            @Override public void clicked(InputEvent e, float x, float y) { closeShipPicker(); }
+        });
+        shipPicker.add(cancel).width(420).height(80).pad(8).row();
+        shipPicker.pack();
+        shipPicker.setPosition((Gdx.graphics.getWidth() - shipPicker.getWidth()) / 2f,
+                (Gdx.graphics.getHeight() - shipPicker.getHeight()) / 2f);
+        stage.addActor(shipPicker);
+    }
+
+    private void closeShipPicker() {
+        if (shipPicker != null) {
+            shipPicker.remove();
+            shipPicker = null;
+        }
     }
 
     @Override

@@ -47,8 +47,28 @@ public final class Attach {
             case PartType.AttachPoint.EDGE_RIGHT:  outA.set(hw, -hh);  outB.set(hw, hh); break;
             case PartType.AttachPoint.EDGE_TOP:    outA.set(-hw, hh);  outB.set(hw, hh); break;
             case PartType.AttachPoint.EDGE_BOTTOM: outA.set(-hw, -hh); outB.set(hw, -hh); break;
-            default: outA.set(ap.x, ap.y); outB.set(ap.x, ap.y); break;
+            default: outA.set(ap.x, ap.y); outB.set(ap.x, ap.y); return;
         }
+        // edge attach zones are shrunk inward by EDGE_SHRINK at both ends
+        // (round 28): corner-adjacent contacts no longer count as edge mates,
+        // so e.g. a strut pair only welds through the intended face pair.
+        shrink(outA, outB, EDGE_SHRINK);
+    }
+
+    /** Inward shrink (length units) applied at each end of an edge attach segment. */
+    public static final float EDGE_SHRINK = 0.25f;
+
+    private static void shrink(Vector2 a, Vector2 b, float amount) {
+        float dx = b.x - a.x, dy = b.y - a.y;
+        float len = (float) Math.sqrt(dx * dx + dy * dy);
+        if (len <= amount * 2f) { // segment shorter than the shrink: collapse to midpoint
+            float mx = (a.x + b.x) / 2f, my = (a.y + b.y) / 2f;
+            a.set(mx, my); b.set(mx, my);
+            return;
+        }
+        float ux = dx / len, uy = dy / len;
+        a.x += ux * amount; a.y += uy * amount;
+        b.x -= ux * amount; b.y -= uy * amount;
     }
 
     /** Closest point on segment (a,b) to point p; writes into out and returns it. */

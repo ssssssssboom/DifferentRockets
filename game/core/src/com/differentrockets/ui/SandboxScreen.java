@@ -109,6 +109,8 @@ public class SandboxScreen extends ScreenAdapter {
 
     // orbit prediction in map view (item 10): cached, re-propagated at ~2 Hz
     private final OrbitPredictor predictor = new OrbitPredictor();
+    /** Task 5: second propagator for the tapped TARGET ship's gray orbit line. */
+    private final OrbitPredictor targetPredictor = new OrbitPredictor();
     /** Map orbit re-propagation interval (round 18: 15 Hz, was 4 Hz). */
     private static final float ORBIT_INTERVAL = 1f / 15f;
     private float orbitTimer = Float.MAX_VALUE;
@@ -403,7 +405,7 @@ public class SandboxScreen extends ScreenAdapter {
             boolean prevRingActive;
             @Override public boolean touchDown(InputEvent e, float x, float y, int pointer, int button) {
                 prevRingActive = SteeringIO.ringActive;
-                SteeringIO.ringActive = false;
+                game.world.deactivateRing(); // task 1: ring off + target dropped
                 SteeringIO.buttonTurn = dir > 0 ? -1 : 1; // contract: -1 left, +1 right (held)
                 return true;
             }
@@ -520,9 +522,7 @@ public class SandboxScreen extends ScreenAdapter {
                     ringDrag = nearRing(screenX, screenY);
                     if (ringDrag) {
                         mapPanPointer = -1;
-                        SteeringIO.ringActive = true;
-                        setSteerTarget(game.world.currentHeading());
-                        ringDelta = ringAngle(screenX, screenY) - game.world.getTargetHeading();
+                        grabRing(screenX, screenY);
                     } else {
                         mapPanPointer = pointer;
                         mapPanDist = 0;
@@ -531,16 +531,7 @@ public class SandboxScreen extends ScreenAdapter {
                 } else {
                     // steering ring takes priority over tap-select near screen center
                     ringDrag = nearRing(screenX, screenY);
-                    if (ringDrag) {
-                        // item 2-UI: tapping the ring ACTIVATES steering; the
-                        // target restarts from the ship's CURRENT heading.
-                        // Item 11 (kept): grab the ring where the finger lands
-                        // — the offset between touch angle and target heading
-                        // is preserved so the ring doesn't jump to the finger.
-                        SteeringIO.ringActive = true;
-                        setSteerTarget(game.world.currentHeading());
-                        ringDelta = ringAngle(screenX, screenY) - game.world.getTargetHeading();
-                    }
+                    if (ringDrag) grabRing(screenX, screenY);
                     tapCandidate = !ringDrag;
                     tapMoved = false;
                     tapDist = 0;
@@ -592,6 +583,16 @@ public class SandboxScreen extends ScreenAdapter {
             if (tapCandidate) {
                 tapDist += Math.hypot(screenX - paX, screenY - paY);
                 if (tapDist > 12) tapMoved = true;
+                // task 4: an empty-space drag in flight view pans the camera
+                // (map-view parity). It is NOT a tap, so it never deselects a
+                // part and never deactivates the steering ring. The camera
+                // position is refreshed here so consecutive drag events in
+                // the same frame unproject against the live pan offset.
+                if (tapMoved) {
+                    panCamera(cam, camPan, paX, paY, screenX, screenY);
+                    cam.position.set(camPan.x, camPan.y, 0);
+                    cam.update();
+                }
                 paX = screenX; paY = screenY;
                 return true;
             }
@@ -727,6 +728,22 @@ public class SandboxScreen extends ScreenAdapter {
         return Math.atan2(-vx, vy);
     }
 
+    /**
+     * Ring grab (tasks 2/3): an ALREADY-ACTIVE ring keeps its target heading —
+     * only the grab offset (touch direction vs target direction at touch
+     * start) is re-anchored, so the target follows the finger at a fixed
+     * angle and does NOT snap to the ship's current heading. An INACTIVE
+     * ring activates as before: the target restarts from the ship's current
+     * heading, then follows with the same fixed-offset rule.
+     */
+    private void grabRing(float sx, float sy) {
+        if (!SteeringIO.ringActive) {
+            SteeringIO.ringActive = true;
+            setSteerTarget(game.world.currentHeading());
+        }
+        ringDelta = ringAngle(sx, sy) - game.world.getTargetHeading();
+    }
+
     /** Set the steering target heading from a ring drag position. */
     private void steerRingTo(float sx, float sy) {
         float vx = sx - ringX;
@@ -774,6 +791,7 @@ public class SandboxScreen extends ScreenAdapter {
             } else {
                 mapTargetShip = bestShip;
                 mapTargetPlanet = null;
+                orbitTimer = Float.MAX_VALUE; // task 5: gray orbit line NOW
                 stageLabel.setText("Target " + bestShip.name);
             }
             return;
@@ -847,8 +865,10 @@ public class SandboxScreen extends ScreenAdapter {
         selectedPart = best;
         if (best == null) {
             // item 2-UI: a tap that hits NO button (we're past the stage) and
-            // NO part DEACTIVATES the steering ring — engines center
-            SteeringIO.ringActive = false;
+            // NO part DEACTIVATES the steering ring — engines center.
+            // Task 1: deactivation also DROPS the target heading (cleared,
+            // re-primed from the live heading; next activation restarts fresh)
+            game.world.deactivateRing();
         }
         stageLabel.setText(best != null
                 ? "Selected " + best.type.name + (best.group > 0 ? " [group " + best.group + "]" : "")
@@ -1234,8 +1254,12 @@ public class SandboxScreen extends ScreenAdapter {
         float fd = Math.min(delta, 1f / 20f);
         game.world.update(fd);
         // SteeringIO backstop: the world's PI controller may itself re-prime
-        // the target heading (spawn, ship switch) — mirror it every frame
-        SteeringIO.targetHeadingRad = game.world.getTargetHeading();
+        // the target heading (spawn, ship switch) — mirror it every frame,
+        // but ONLY while the ring is active: a deactivated ring keeps its
+        // cleared target (task 1), the mirror must not resurrect it
+        if (SteeringIO.ringActive) {
+            SteeringIO.targetHeadingRad = game.world.getTargetHeading();
+        }
         // particle FX advance in simulated time (freeze while paused, warp-aware)
         lastSimDt = game.world.paused ? 0f : fd * game.world.warp;
         FlameFx.update(lastSimDt);
@@ -1510,7 +1534,10 @@ public class SandboxScreen extends ScreenAdapter {
             if (p.body == null) continue;
             TextureRegion r = game.shipSprites.find(p.type.sprite);
             Vector2 pos = p.body.getPosition();
-            float angleDeg = (float) Math.toDegrees(p.body.getAngle());
+            // wheels: the visible tire is the tireBody — spin the sprite with
+            // it (the axle/part body itself never rotates while rolling)
+            float angleDeg = (float) Math.toDegrees(
+                    p.tireBody != null ? p.tireBody.getAngle() : p.body.getAngle());
             if (r != null) {
                 // task D3: the tap-selected part glows light blue (tint)
                 boolean sel = p == selectedPart;
@@ -1805,6 +1832,12 @@ public class SandboxScreen extends ScreenAdapter {
             if (orbitTimer > ORBIT_INTERVAL || predictor.count == 0) {
                 orbitTimer = 0;
                 predictor.compute(game.world, game.world.active, anchorIndex);
+                // task 5: the tapped target ship's own orbit, same cadence/frame
+                if (mapTargetShip != null && !mapTargetShip.parts.isEmpty()) {
+                    targetPredictor.compute(game.world, mapTargetShip, anchorIndex);
+                } else {
+                    targetPredictor.count = 0;
+                }
             }
         }
         // auto-fit on first open: center on the active ship, framed on the prediction
@@ -1877,6 +1910,7 @@ public class SandboxScreen extends ScreenAdapter {
         // ship orbit prediction + markers
         if (game.world.active != null) {
             drawOrbitPrediction();
+            drawTargetOrbit(); // task 5: gray orbit of the tapped target ship
             // round 14 fix: drawOrbitPrediction switches ShapeRenderer to the
             // SCREEN-space ortho — restore the map camera or the ship arrows
             // below are drawn at universe coords in pixel space (invisible).
@@ -2106,6 +2140,42 @@ public class SandboxScreen extends ScreenAdapter {
                 }
                 game.shapes.line(prevX, prevY, sx, sy);
             }
+            prevX = sx; prevY = sy;
+        }
+        game.shapes.end();
+    }
+
+    /**
+     * Task 5: gray orbit line for the tapped TARGET ship (map view). Uses the
+     * second propagator (targetPredictor) filled in renderMap at the same 15
+     * Hz cadence and drawn with the SAME anchor-frame + double-precision
+     * screen projection rules as drawOrbitPrediction — the active ship's
+     * green line is untouched. OrbitPredictor itself needed no changes: its
+     * compute(world, ship, anchorIdx) entry already handles any ship.
+     */
+    private void drawTargetOrbit() {
+        if (mapTargetShip == null) return;
+        int n = targetPredictor.count;
+        if (n < 2 || targetPredictor.anchor < 0) return;
+        Planet a0 = game.world.planets.get(targetPredictor.anchor);
+        double baseX = a0.pos.x, baseY = a0.pos.y;
+        int stride = Math.max(1, (n + 1999) / 2000);
+        int drawn = (n + stride - 1) / stride;
+        if (drawn < 2) return;
+        double sw = Gdx.graphics.getWidth(), sh = Gdx.graphics.getHeight();
+        game.shapes.setProjectionMatrix(ringMat.setToOrtho2D(0, 0, (float) sw, (float) sh));
+        Gdx.gl.glEnable(GL20.GL_BLEND);
+        Gdx.gl.glBlendFunc(GL20.GL_SRC_ALPHA, GL20.GL_ONE_MINUS_SRC_ALPHA);
+        game.shapes.begin(ShapeRenderer.ShapeType.Line);
+        game.shapes.setColor(0.62f, 0.62f, 0.68f, 0.8f);
+        float prevX = 0, prevY = 0;
+        for (int i = 0; i < drawn; i++) {
+            int idx = Math.min(i * stride, n - 1);
+            double wx = targetPredictor.xs[idx] - targetPredictor.fx[idx] + baseX;
+            double wy = targetPredictor.ys[idx] - targetPredictor.fy[idx] + baseY;
+            float sx = (float) ((wx - mapCX) / mapCam.viewportWidth * sw + sw / 2);
+            float sy = (float) ((wy - mapCY) / mapCam.viewportHeight * sh + sh / 2);
+            if (i > 0) game.shapes.line(prevX, prevY, sx, sy);
             prevX = sx; prevY = sy;
         }
         game.shapes.end();

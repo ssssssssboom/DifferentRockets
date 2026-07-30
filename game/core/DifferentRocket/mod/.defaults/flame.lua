@@ -1,4 +1,4 @@
--- v2026.07.30.2
+-- v2026.07.30.3
 -- ============================================================================
 -- flame.lua — 引擎尾焰渲染：气压驱动的羽流膨胀 + 风场剪切（玩家可改）
 -- ============================================================================
@@ -266,7 +266,9 @@ end
 -- ============================================================================
 
 local function shockShimmer(f, t, phase)
-  return 0.65 + 0.35 * math.sin(f * 14 - t * 5 + phase)
+  -- 双层扰动条纹（v2026.07.30.3）：低频大条纹 + 高频细纹，更细腻
+  return 0.60 + 0.25 * math.sin(f * 14 - t * 5 + phase)
+             + 0.15 * math.sin(f * 37 + t * 9 + phase * 1.7)
 end
 
 function drawShock(sctx)
@@ -287,13 +289,15 @@ function drawShock(sctx)
 
   if sctx.sharp then
     -- ============ 附体斜激波：多层锥面渐变 ============
-    local len = math.min(half / tanMu * 1.6 + half * 2, half * 10 + 30)
+    -- v2026.07.30.3：锥长 +40%（锥角 sin(μ)=1/M 不变，spread 随 len 等比），
+    -- 层数 5 -> 9，衰减指数 2 -> 2.2（更平滑的下游淡出）
+    local len = math.min(half / tanMu * 2.2 + half * 2.8, half * 14 + 42)
     local spread = len * tanMu
-    local N = 5
+    local N = 9
     for i = 1, N do
       local f0 = (i - 1) / N
       local f1 = i / N
-      local a = a0 * 0.30 * (1 - f0) ^ 2 * shockShimmer(f0, t, phase)
+      local a = a0 * 0.34 * (1 - f0) ^ 2.2 * shockShimmer(f0, t, phase)
       if a > 0.004 then
         for sgn = -1, 1, 2 do
           -- 沿风向轴的分层四边形（两个三角形）
@@ -314,20 +318,23 @@ function drawShock(sctx)
     end
     -- 亮前沿线（锥面前缘，细长三角）
     for sgn = -1, 1, 2 do
-      local wsp = 0.10 * half
+      local wsp = 0.08 * half
       draw.triangle(x0, y0,
                     x0 + dx * len + px * spread * sgn, y0 + dy * len + py * spread * sgn,
                     x0 + dx * len * 0.985 + px * (spread - wsp) * sgn,
                     y0 + dy * len * 0.985 + py * (spread - wsp) * sgn,
-                    1, 1, 1, a0 * 0.5 * shockShimmer(0.05, t, phase))
+                    1, 1, 1, a0 * 0.55 * shockShimmer(0.05, t, phase))
     end
   else
     -- ============ 脱体弓形激波：弧形亮带 ============
-    -- 脱体距离 δ：随马赫数升高而减小（趋于附体）
-    local stand = half * clamp(0.9 / math.sqrt(mach - 1 + 0.05), 0.25, 2.0)
-    local band = 0.22 * half * (1 + 0.4 / mach)          -- 激波层厚度
-    local S = half * 4                                    -- 横向绘制范围
-    local K = 12
+    -- 脱体距离 δ：随马赫数升高而减小（趋于附体）。
+    -- v2026.07.30.3：整体尺度放大（δ×1.35、弧宽 half*4 -> half*6、
+    -- 激波层稍厚），弧段 12 -> 22，径向 2 层 -> 3 层平滑过渡，
+    -- 两翼衰减改为高斯（更柔和）。δ 的物理公式（∝0.9/√(M-1+0.05)）不变。
+    local stand = half * 1.35 * clamp(0.9 / math.sqrt(mach - 1 + 0.05), 0.25, 2.0)
+    local band = 0.26 * half * (1 + 0.4 / mach)          -- 激波层厚度
+    local S = half * 6                                    -- 横向绘制范围
+    local K = 22
     -- 弧形状（v2026.07.30.2 方向修正）：顶点在迎风最前（脱体 δ），两翼向
     -- 【下游回扫】——近轴抛物线过渡、远场渐近马赫线（每单位横向后退 1/tanμ），
     -- 裹住箭体肩部。旧版两翼错画成继续向前（上风侧）卷，看起来整支箭的
@@ -340,24 +347,29 @@ function drawShock(sctx)
       return x0 + px * s + ux * (stand + extra - backAt(s)),
              y0 + py * s + uy * (stand + extra - backAt(s))
     end
+    -- 径向三层：内缘最亮，向外 0.6 / 0.25 平滑淡出
+    local ROWS = { {0.0, 0.5, 1.0}, {0.5, 1.0, 0.6}, {1.0, 1.55, 0.25} }
     for k = 0, K - 1 do
       local s0 = -S + (2 * S * k / K)
       local s1 = -S + (2 * S * (k + 1) / K)
       local smid = (s0 + s1) / 2
-      -- 中心最强，两翼衰减；叠扰动条纹
-      local a = a0 * 0.42 / (1 + (smid / half) ^ 2 * 0.35) * shockShimmer(k / K, t, phase)
+      -- 中心最强，两翼高斯衰减；叠扰动条纹
+      local a = a0 * 0.42 * math.exp(-((smid / half) * 0.55) ^ 2) * shockShimmer(k / K, t, phase)
       if a > 0.004 then
-        local q0x, q0y = pt(s0, 0)
-        local q1x, q1y = pt(s1, 0)
-        local r0x, r0y = pt(s0, band)
-        local r1x, r1y = pt(s1, band)
-        draw.triangle(q0x, q0y, q1x, q1y, r1x, r1y, 0.88, 0.94, 1.0, a)
-        draw.triangle(q0x, q0y, r1x, r1y, r0x, r0y, 0.88, 0.94, 1.0, a)
+        for _, row in ipairs(ROWS) do
+          local e0, e1, amul = row[1] * band, row[2] * band, row[3]
+          local q0x, q0y = pt(s0, e0)
+          local q1x, q1y = pt(s1, e0)
+          local r0x, r0y = pt(s0, e1)
+          local r1x, r1y = pt(s1, e1)
+          draw.triangle(q0x, q0y, q1x, q1y, r1x, r1y, 0.88, 0.94, 1.0, a * amul)
+          draw.triangle(q0x, q0y, r1x, r1y, r0x, r0y, 0.88, 0.94, 1.0, a * amul)
+        end
       end
     end
     -- 滞止区辉光：弧内侧一小片更亮的压缩区
     local gx, gy = pt(0, band * 0.5)
-    draw.sprite("glow", gx, gy, half * 2.2, half * 1.2, 0,
-                a0 * 0.30, 0.9, 0.95, 1.0)
+    draw.sprite("glow", gx, gy, half * 2.8, half * 1.5, 0,
+                a0 * 0.34, 0.9, 0.95, 1.0)
   end
 end

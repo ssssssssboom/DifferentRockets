@@ -1990,46 +1990,24 @@ public class SandboxScreen extends ScreenAdapter {
                 game.shapes.end();
             }
         }
-        // planet bodies: TRUE-radius circles — translucent fill + outline ring,
-        // no sprite icons (they occluded ships and orbit lines). Positions are
-        // relative to the double map center (camera at origin, round 18).
+        // planet bodies (user request: simple & smooth): ONE translucent
+        // filled circle per planet at the true radius — no outline ring, no
+        // terrain polyline. Segment count adapts to the on-screen radius so
+        // the circle stays perfectly round at ANY zoom (≈3 px per segment,
+        // clamped [48, 720]). Positions relative to the double map center
+        // (camera at origin, round 18).
         game.shapes.begin(ShapeRenderer.ShapeType.Filled);
+        float pxPerMeter = Gdx.graphics.getHeight() / mapCam.viewportHeight;
         for (Planet p : game.world.planets) {
             Color c = p.mapColor;
             game.shapes.setColor(c.r, c.g, c.b, 0.35f);
+            int segs = (int) Math.max(48, Math.min(720,
+                    2 * Math.PI * p.radius * pxPerMeter / 3f));
             game.shapes.circle((float) (p.pos.x - mapCX), (float) (p.pos.y - mapCY),
-                    (float) p.radius, 48);
+                    (float) p.radius, segs);
         }
         game.shapes.end();
-        game.shapes.begin(ShapeRenderer.ShapeType.Line);
-        for (Planet p : game.world.planets) {
-            Color c = p.mapColor;
-            game.shapes.setColor(c.r, c.g, c.b, 0.9f);
-            game.shapes.circle((float) (p.pos.x - mapCX), (float) (p.pos.y - mapCY),
-                    (float) p.radius, 64);
-        }
-        // terrain-aware surface outline (fix: landed ships floated above the
-        // map — the circles above are drawn at the DATUM radius, but the real
-        // ground is radius + heightAt(angle) per terrain.lua's surfaceHeight).
-        // Sampled per frame only for planets whose relief is visible at the
-        // current zoom; all math double against (mapCX, mapCY) as usual.
-        for (Planet p : game.world.planets) {
-            double relief = Math.max(Math.abs(p.maxHeight), Math.abs(p.minHeight));
-            if (relief <= 0 || relief / mapCam.viewportHeight < 0.003) continue;
-            Color c = p.mapColor;
-            game.shapes.setColor(c.r, c.g, c.b, 0.95f);
-            final int N = 128;
-            float prevX = 0, prevY = 0;
-            for (int i = 0; i <= N; i++) {
-                double ang = i * (2 * Math.PI) / N;
-                double r = p.radius + p.heightAt(ang);
-                float x = (float) (p.pos.x + Math.cos(ang) * r - mapCX);
-                float y = (float) (p.pos.y + Math.sin(ang) * r - mapCY);
-                if (i > 0) game.shapes.line(prevX, prevY, x, y);
-                prevX = x; prevY = y;
-            }
-        }
-        game.shapes.end();
+
 
         // ship orbit prediction + markers
         if (game.world.active != null) {

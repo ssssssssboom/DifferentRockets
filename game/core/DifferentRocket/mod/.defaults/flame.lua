@@ -1,4 +1,4 @@
--- v2026.07.30
+-- v2026.07.30.1
 -- ============================================================================
 -- flame.lua — 引擎尾焰渲染：气压驱动的羽流膨胀 + 风场剪切（玩家可改）
 -- ============================================================================
@@ -46,8 +46,14 @@
 --   * 风场剪切：羽流下游被相对风吹弯——锥体末端与粒子速度按
 --     (dir*喷速 - wind*来流速度*卷吸系数) 合成，卷吸系数随密度衰减，
 --     真空中无介质、羽流不弯；
---   * 船体激波锥由 Java 端绘制（SandboxScreen.drawShockCones，
---     锥角 sin(μ)=1/M，气压低时淡出），本文件只管发动机羽流。
+--   * 船体激波由本文件 drawShock(sctx) 绘制（v2026.07.30.1 起）：Java 端
+--     （SandboxScreen.drawShockCones）只对每个"迎风暴露"的零件前缘
+--     （Ship.windwardEdges：投影前方无遮挡者）提供几何与气流数据。
+--     sctx 字段：x,y 前缘尖端；windX,windY 上风方向单位向量（气流来自该
+--     方向，激波向下游=反方向张开）；half 该前缘半宽；sharp=true 尖头件
+--     （附体斜激波锥面）/false 钝头件（脱体弓形激波）；mach 马赫数；
+--     pressure/density 气压/密度；relSpeed 来流速度；time 任务时间；
+--     partId 稳定零件 id（扰动相位）。
 -- 文件出错时回退到内置默认尾焰。保存即热重载（约 1 秒检查一次），无需重启。
 -- ============================================================================
 
@@ -247,5 +253,108 @@ function drawFlame(ctx)
                   size0 = nw * rr(0.8, 1.3), size1 = nw * rr(4, 7),
                   r = 0.70, g = 0.82, b = 1.0, a0 = 0.06, a1 = 0 }
     end
+  end
+end
+
+-- ============================================================================
+-- drawShock(sctx) — 迎风前缘激波（v2026.07.30.1）
+--   尖头件（sharp）：附体斜激波——锥角 sin(μ)=1/M 的多层半透明锥面，
+--     前缘亮、下游平方衰减，叠加沿锥面的明暗扰动条纹；
+--   钝头件：脱体弓形激波——尖端上游脱体距离 δ 处的一道弧形亮带，
+--     δ 随马赫数升高而减小，弧的两翼渐远渐淡并过渡到马赫线斜率；
+--   强度随 (M-1)/0.5 与气压 p/0.25 连续演化，真空/亚音速自动消失。
+-- ============================================================================
+
+local function shockShimmer(f, t, phase)
+  return 0.65 + 0.35 * math.sin(f * 14 - t * 5 + phase)
+end
+
+function drawShock(sctx)
+  local mach = sctx.mach or 1
+  if mach <= 1.01 then return end
+  local p = clamp(sctx.pressure or 0, 0, 1.2)
+  local a0 = clamp((mach - 1) / 0.5, 0, 1) * clamp(p / 0.25, 0, 1)
+  if a0 <= 0.01 then return end
+  local ux, uy = sctx.windX or 0, sctx.windY or 1   -- 上风方向（气流来自此）
+  local dx, dy = -ux, -uy                          -- 下游
+  local px, py = -dy, dx                           -- 垂直于来流
+  local half = math.max(0.4, sctx.half or 1)
+  local mu = math.asin(1 / mach)
+  local tanMu = math.tan(mu)
+  local t = sctx.time or 0
+  local phase = (sctx.partId or 1) * 0.37
+  local x0, y0 = sctx.x, sctx.y
+
+  if sctx.sharp then
+    -- ============ 附体斜激波：多层锥面渐变 ============
+    local len = math.min(half / tanMu * 1.6 + half * 2, half * 10 + 30)
+    local spread = len * tanMu
+    local N = 5
+    for i = 1, N do
+      local f0 = (i - 1) / N
+      local f1 = i / N
+      local a = a0 * 0.30 * (1 - f0) ^ 2 * shockShimmer(f0, t, phase)
+      if a > 0.004 then
+        for sgn = -1, 1, 2 do
+          -- 沿风向轴的分层四边形（两个三角形）
+          local bx0 = x0 + dx * len * f0
+          local by0 = y0 + dy * len * f0
+          local bx1 = x0 + dx * len * f1
+          local by1 = y0 + dy * len * f1
+          local ox0 = px * spread * f0 * sgn
+          local oy0 = py * spread * f0 * sgn
+          local ox1 = px * spread * f1 * sgn
+          local oy1 = py * spread * f1 * sgn
+          draw.triangle(bx0, by0, bx0 + ox0, by0 + oy0, bx1 + ox1, by1 + oy1,
+                        0.85, 0.92, 1.0, a)
+          draw.triangle(bx0, by0, bx1 + ox1, by1 + oy1, bx1, by1,
+                        0.85, 0.92, 1.0, a * 0.55)
+        end
+      end
+    end
+    -- 亮前沿线（锥面前缘，细长三角）
+    for sgn = -1, 1, 2 do
+      local wsp = 0.10 * half
+      draw.triangle(x0, y0,
+                    x0 + dx * len + px * spread * sgn, y0 + dy * len + py * spread * sgn,
+                    x0 + dx * len * 0.985 + px * (spread - wsp) * sgn,
+                    y0 + dy * len * 0.985 + py * (spread - wsp) * sgn,
+                    1, 1, 1, a0 * 0.5 * shockShimmer(0.05, t, phase))
+    end
+  else
+    -- ============ 脱体弓形激波：弧形亮带 ============
+    -- 脱体距离 δ：随马赫数升高而减小（趋于附体）
+    local stand = half * clamp(0.9 / math.sqrt(mach - 1 + 0.05), 0.25, 2.0)
+    local band = 0.22 * half * (1 + 0.4 / mach)          -- 激波层厚度
+    local S = half * 4                                    -- 横向绘制范围
+    local K = 12
+    -- 弧形状：中心脱体 δ，两翼按抛物线+线性渐近（趋马赫线）后掠
+    local function upAt(s)
+      local a = math.abs(s)
+      return stand + (s * s) / (half * 1.6) + a * 0.2 / math.max(tanMu, 0.2)
+    end
+    local function pt(s, extra)
+      return x0 + px * s + ux * (upAt(s) + extra),
+             y0 + py * s + uy * (upAt(s) + extra)
+    end
+    for k = 0, K - 1 do
+      local s0 = -S + (2 * S * k / K)
+      local s1 = -S + (2 * S * (k + 1) / K)
+      local smid = (s0 + s1) / 2
+      -- 中心最强，两翼衰减；叠扰动条纹
+      local a = a0 * 0.42 / (1 + (smid / half) ^ 2 * 0.35) * shockShimmer(k / K, t, phase)
+      if a > 0.004 then
+        local q0x, q0y = pt(s0, 0)
+        local q1x, q1y = pt(s1, 0)
+        local r0x, r0y = pt(s0, band)
+        local r1x, r1y = pt(s1, band)
+        draw.triangle(q0x, q0y, q1x, q1y, r1x, r1y, 0.88, 0.94, 1.0, a)
+        draw.triangle(q0x, q0y, r1x, r1y, r0x, r0y, 0.88, 0.94, 1.0, a)
+      end
+    end
+    -- 滞止区辉光：弧内侧一小片更亮的压缩区
+    local gx, gy = pt(0, band * 0.5)
+    draw.sprite("glow", gx, gy, half * 2.2, half * 1.2, 0,
+                a0 * 0.30, 0.9, 0.95, 1.0)
   end
 end

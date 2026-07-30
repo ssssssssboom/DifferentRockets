@@ -1632,17 +1632,17 @@ public class SandboxScreen extends ScreenAdapter {
     }
 
     /**
-     * Mach / vapor cone (round 28): when the ship is supersonic in enough air,
-     * draw a translucent shock cone from the windward leading tip (Ship.
-     * windwardEdge) with the physical Mach angle sin(mu) = 1/M. The cone
-     * strengthens from M1.0..1.5 and fades out as pressure drops (vacuum =
-     * no shock). Drawn additively-ish (normal blend, low alpha).
+     * Mach / vapor cone (round 28 v2): when the ship is supersonic in enough
+     * air, EVERY windward-exposed edge (Ship.windwardEdges) gets a shock —
+     * drawn procedurally by mod/flame.lua drawShock (layered cone gradient,
+     * oblique vs bow shock, shimmer stripes); a plain built-in cone per edge
+     * is the fallback. Direction convention: upwind = the direction the
+     * airflow comes FROM (= the ship's atmosphere-relative velocity
+     * direction); the cone opens downstream from the windward tip.
      */
-    private final Vector2 coneTip = new Vector2();
-    private final float[] coneHalf = new float[1];
-
     private void drawShockCones() {
-        boolean any = false;
+        boolean lua = FlameScript.begin(lastSimDt) && FlameScript.hasShock();
+        boolean anyLua = false, anyBuiltin = false;
         for (Ship s : game.world.ships) {
             if (s.onRails) continue;
             double[] f = airflow(s);
@@ -1651,45 +1651,58 @@ public class SandboxScreen extends ScreenAdapter {
             Vec2d up = s.getUniversePos();
             double pressure = game.world.pressureAt(up.x, up.y);
             if (pressure <= 0.003) continue; // effectively vacuum: no shock
-            float wx = (float) f[1], wy = (float) f[2];
-            if (!s.windwardEdge(wx, wy, coneTip, coneHalf)) continue;
-            double mu = Math.asin(1.0 / mach);
-            float tan = (float) Math.tan(mu);
-            float half = Math.max(0.5f, coneHalf[0]);
-            // long enough to envelop the hull, capped for zoomed-out sanity
-            float len = Math.min(half / tan * 1.5f + half * 2f, half * 10f + 30f);
-            float aM = (float) Math.min(1, (mach - 1.0) / 0.5);   // ramps in past M1
-            float aP = (float) Math.min(1, pressure / 0.25);      // altitude fade
-            float a = 0.16f * aM * aP;
-            if (a <= 0.004f) continue;
-            if (!any) {
-                any = true;
-                Gdx.gl.glEnable(GL20.GL_BLEND);
-                Gdx.gl.glBlendFunc(GL20.GL_SRC_ALPHA, GL20.GL_ONE_MINUS_SRC_ALPHA);
-                game.shapes.setProjectionMatrix(cam.combined);
-                game.shapes.begin(ShapeRenderer.ShapeType.Filled);
+            // upwind: where the airflow comes from = ship's motion direction
+            float ux = (float) -f[1], uy = (float) -f[2];
+            java.util.List<Ship.WindwardEdge> edges = s.windwardEdges(ux, uy);
+            if (edges.isEmpty()) continue;
+            if (lua) {
+                double density = game.world.densityAt(up.x, up.y);
+                for (Ship.WindwardEdge e : edges) {
+                    FlameScript.drawShock(e.x, e.y, e.half, e.sharp, mach, ux, uy, f[3],
+                            pressure, density, game.world.time,
+                            System.identityHashCode(e.part != null ? e.part : e));
+                }
+                anyLua = true;
+            } else {
+                if (!anyBuiltin) {
+                    anyBuiltin = true;
+                    Gdx.gl.glEnable(GL20.GL_BLEND);
+                    Gdx.gl.glBlendFunc(GL20.GL_SRC_ALPHA, GL20.GL_ONE_MINUS_SRC_ALPHA);
+                    game.shapes.setProjectionMatrix(cam.combined);
+                    game.shapes.begin(ShapeRenderer.ShapeType.Filled);
+                }
+                double mu = Math.asin(1.0 / mach);
+                float tan = (float) Math.tan(mu);
+                float aM = (float) Math.min(1, (mach - 1.0) / 0.5);
+                float aP = (float) Math.min(1, pressure / 0.25);
+                float a = 0.16f * aM * aP;
+                if (a <= 0.004f) continue;
+                float dx = -ux, dy = -uy;                    // downstream
+                float px = -dy, py = dx;                     // perpendicular
+                for (Ship.WindwardEdge e : edges) {
+                    float half = Math.max(0.5f, e.half);
+                    float len = Math.min(half / tan * 1.5f + half * 2f, half * 10f + 30f);
+                    float spread = len * tan;
+                    game.shapes.setColor(0.85f, 0.92f, 1f, a);
+                    game.shapes.triangle(e.x, e.y,
+                            e.x + dx * len + px * spread, e.y + dy * len + py * spread,
+                            e.x + dx * len * 0.45f, e.y + dy * len * 0.45f);
+                    game.shapes.triangle(e.x, e.y,
+                            e.x + dx * len - px * spread, e.y + dy * len - py * spread,
+                            e.x + dx * len * 0.45f, e.y + dy * len * 0.45f);
+                }
             }
-            float dx = -wx, dy = -wy;                    // downstream
-            float px = -dy, py = dx;                     // perpendicular
-            float spread = len * tan;
-            // cone surface: two faint fins, one per side of the wind axis
-            game.shapes.setColor(0.85f, 0.92f, 1f, a);
-            game.shapes.triangle(coneTip.x, coneTip.y,
-                    coneTip.x + dx * len + px * spread, coneTip.y + dy * len + py * spread,
-                    coneTip.x + dx * len * 0.45f, coneTip.y + dy * len * 0.45f);
-            game.shapes.triangle(coneTip.x, coneTip.y,
-                    coneTip.x + dx * len - px * spread, coneTip.y + dy * len - py * spread,
-                    coneTip.x + dx * len * 0.45f, coneTip.y + dy * len * 0.45f);
-            // brighter cone outline (the shock front itself)
-            game.shapes.setColor(1f, 1f, 1f, a * 1.8f);
-            game.shapes.triangle(coneTip.x, coneTip.y,
-                    coneTip.x + dx * len + px * spread, coneTip.y + dy * len + py * spread,
-                    coneTip.x + dx * (len - 0.4f) + px * (spread * 0.92f), coneTip.y + dy * (len - 0.4f) + py * (spread * 0.92f));
-            game.shapes.triangle(coneTip.x, coneTip.y,
-                    coneTip.x + dx * len - px * spread, coneTip.y + dy * len - py * spread,
-                    coneTip.x + dx * (len - 0.4f) - px * (spread * 0.92f), coneTip.y + dy * (len - 0.4f) - py * (spread * 0.92f));
         }
-        if (any) game.shapes.end();
+        if (anyBuiltin) game.shapes.end();
+        if (anyLua) {
+            Gdx.gl.glEnable(GL20.GL_BLEND);
+            Gdx.gl.glBlendFunc(GL20.GL_SRC_ALPHA, GL20.GL_ONE_MINUS_SRC_ALPHA);
+            game.shapes.setProjectionMatrix(cam.combined);
+            game.shapes.begin(ShapeRenderer.ShapeType.Filled);
+            FlameScript.flush(game.shapes);
+            game.shapes.end();
+            FlameScript.flushSprites(game.batch);
+        }
     }
 
     /** Built-in 3-layer plume (fallback when mod/flame.lua is missing or broken). */

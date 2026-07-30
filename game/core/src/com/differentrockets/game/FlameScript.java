@@ -41,6 +41,47 @@ public final class FlameScript {
     private static boolean callFailed;
 
     private static final LuaTable ctx = new LuaTable();
+    private static final LuaTable sctx = new LuaTable();
+
+    /** True when the loaded script provides drawShock (round 28 shock cones). */
+    public static boolean hasShock() {
+        Globals g = script.globals();
+        return g != null && !callFailed && g.get("drawShock").isfunction();
+    }
+
+    /**
+     * Let the script draw ONE windward-exposed edge's shock (round 28 v2).
+     * (x,y) tip; (windX,windY) upwind unit vector (airflow comes FROM there);
+     * half = edge half-width; sharp = pointed (oblique cone) vs blunt (bow);
+     * mach/pressure/density/relSpeed = ship airflow state; partId stable id.
+     */
+    public static void drawShock(float x, float y, float half, boolean sharp,
+                                 double mach, double windX, double windY, double relSpeed,
+                                 double pressure, double density, double time, int partId) {
+        Globals g = script.globals();
+        if (g == null || callFailed) return;
+        LuaValue fn = g.get("drawShock");
+        if (!fn.isfunction()) return;
+        sctx.set("x", x); sctx.set("y", y);
+        sctx.set("half", half);
+        sctx.set("sharp", LuaValue.valueOf(sharp));
+        sctx.set("mach", mach);
+        sctx.set("windX", windX); sctx.set("windY", windY);
+        sctx.set("relSpeed", relSpeed);
+        sctx.set("pressure", pressure);
+        sctx.set("density", density);
+        sctx.set("time", time);
+        sctx.set("partId", partId);
+        try {
+            fn.call(sctx);
+        } catch (LuaError e) {
+            if (!callFailed) {
+                callFailed = true;
+                Gdx.app.error("flame.lua", "drawShock error (built-in cone takes over): "
+                        + e.getMessage());
+            }
+        }
+    }
 
     private FlameScript() {}
 

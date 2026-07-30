@@ -813,44 +813,80 @@ public class Ship {
         forEachBody(b -> b.setActive(active));
     }
 
+    /** One windward-exposed leading edge (shock origin) of the ship. */
+    public static class WindwardEdge {
+        public float x, y;     // tip position (physics-frame coords)
+        public float half;     // this part's half-width across the wind axis
+        public boolean sharp;  // pointed (nosecone) -> oblique cone; else bow shock
+        public Part part;      // source part (stable id / per-part shimmer phase)
+    }
+
     /**
-     * Windward leading edge (round 28 shock-cone rendering): the hull corner
-     * with the greatest projection ALONG the oncoming airflow (wx,wy = unit
-     * wind vector) is the shock origin (nose tip / leading edge); the second
-     * return value is the hull's max perpendicular offset from the wind axis
-     * through that tip (the half-width the cone must envelop). Corners come
-     * from each part's width/height box (good enough for a visual cone).
-     * Returns false when the ship has no live bodies.
+     * All windward-EXPOSED leading edges (round 28 v2): (ux,uy) is the UPWIND
+     * unit vector — the direction the airflow comes FROM (the ship's
+     * atmosphere-relative velocity direction). A part counts as exposed when
+     * no other part sits strictly ahead of it (greater upwind projection)
+     * while fully covering its lateral span; flush junctions between equal
+     * projections expose only the foremost part, and a wider part behind a
+     * narrower one stays exposed at its shoulders. Each edge carries the tip
+     * (max-projection hull corner), the part's own half-width and a
+     * pointed/blunt flag for oblique-cone vs bow-shock drawing.
+     * Corner math is manual (pos + rot(angle) * local), no native calls.
      */
-    public boolean windwardEdge(float wx, float wy, Vector2 outTip, float[] outHalf) {
-        float best = -Float.MAX_VALUE;
-        float tipPerp = 0f;
-        float minPerp = Float.MAX_VALUE, maxPerp = -Float.MAX_VALUE;
-        boolean any = false;
+    public List<WindwardEdge> windwardEdges(float ux, float uy) {
+        List<WindwardEdge> out = new ArrayList<>();
+        int n = parts.size();
+        float[] proj = new float[n], pMin = new float[n], pMax = new float[n];
+        WindwardEdge[] edges = new WindwardEdge[n];
+        int m = 0;
         for (Part p : parts) {
             if (p.body == null) continue;
-            // manual local->world (corner = pos + rot(angle) * local) — avoids
-            // depending on Box2D's native getWorldPoint on the hot render path
             float ang = p.body.getAngle();
             float ca = (float) Math.cos(ang), sa = (float) Math.sin(ang);
             Vector2 bp = p.body.getPosition();
             float hw = p.type.width / 2f, hh = p.type.height / 2f;
+            float best = -Float.MAX_VALUE, tipX = 0, tipY = 0, tipPerp = 0;
+            float mn = Float.MAX_VALUE, mx = -Float.MAX_VALUE;
             for (int ci = 0; ci < 4; ci++) {
                 float lx = (ci == 0 || ci == 3) ? -hw : hw;
                 float ly = (ci < 2) ? -hh : hh;
                 float cx = bp.x + lx * ca - ly * sa;
                 float cy = bp.y + lx * sa + ly * ca;
-                float proj = cx * wx + cy * wy;
-                float perp = cx * wy - cy * wx; // signed offset from the wind axis
-                if (!any || proj > best) { best = proj; outTip.set(cx, cy); tipPerp = perp; }
-                if (perp < minPerp) minPerp = perp;
-                if (perp > maxPerp) maxPerp = perp;
-                any = true;
+                float pr = cx * ux + cy * uy;
+                float pe = cx * uy - cy * ux; // signed offset from the wind axis
+                if (pr > best) { best = pr; tipX = cx; tipY = cy; tipPerp = pe; }
+                if (pe < mn) mn = pe;
+                if (pe > mx) mx = pe;
             }
+            WindwardEdge e = new WindwardEdge();
+            e.x = tipX; e.y = tipY;
+            e.half = Math.max(0.3f, Math.max(mx - tipPerp, tipPerp - mn));
+            e.sharp = "nosecone".equals(p.type.type);
+            e.part = p;
+            proj[m] = best; pMin[m] = mn; pMax[m] = mx; edges[m] = e;
+            m++;
         }
-        if (!any) return false;
-        outHalf[0] = Math.max(maxPerp - tipPerp, tipPerp - minPerp);
-        return true;
+        // occlusion: j covers i when j is strictly AHEAD and its lateral span
+        // fully contains i's span (shoulders of a wider back part stay exposed)
+        final float AHEAD = 0.01f, EPS = 0.05f;
+        for (int i = 0; i < m; i++) {
+            boolean covered = false;
+            for (int j = 0; j < m; j++) {
+                if (i == j) continue;
+                if (proj[j] > proj[i] + AHEAD
+                        && pMin[j] <= pMin[i] + EPS && pMax[j] >= pMax[i] - EPS) {
+                    covered = true;
+                    break;
+                }
+            }
+            if (!covered) out.add(edges[i]);
+        }
+        // foremost first (stable drawing order: nose shock under shoulder shocks)
+        out.sort((a, b) -> {
+            float pa = a.x * ux + a.y * uy, pb = b.x * ux + b.y * uy;
+            return Float.compare(pb, pa);
+        });
+        return out;
     }
 
     /** The part that provides control input/heading reference: the pod, else the first part. */

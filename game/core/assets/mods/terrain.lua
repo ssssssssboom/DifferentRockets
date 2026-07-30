@@ -1,4 +1,4 @@
--- v2026.07.30.2
+-- v2026.07.30.3
 -- ============================================================================
 -- terrain.lua — planet terrain generation (PLAYER-EDITABLE)
 -- ============================================================================
@@ -267,8 +267,25 @@ local function baseTerrainHeight(planetName, angleRad)
   -- every planet has a nonzero amplitude again — random relief restored.
   local amp = defaultNoiseAmplitude[planetName]
   if amp == nil then amp = (info.maxHeight - info.minHeight) / 2 end
+
+  -- Round 26 (v2026.07.30.3) — spawn-zone main-noise kill window: the MAIN
+  -- noise layer (amp * nSym, NOT the micro texture) fades to exactly 0
+  -- inside [89, 91] deg and ramps LINEARLY back to the full amplitude over
+  -- the 5 deg outside each edge (84..89 and 91..96), wrap-safe:
+  --     amp_eff = amp * min(1, distOutsideWindow / 5)
+  -- So the ~175 km around the 90 deg spawn site is the exact datum sphere
+  -- (no more 637 m pit wall around the pad pocket), while the rest of the
+  -- planet keeps its relief. Bands/specialTerrains/micro/padFlatten are
+  -- untouched; inside a band the default noise is suppressed by wdef
+  -- anyway, so the overlapping ramp (91..93 mountain band) is harmless.
+  local dS = (deg - 89.0 + 540) % 360 - 180   -- >0 past the 89 deg edge (CCW)
+  local dE = (91.0 - deg + 540) % 360 - 180   -- >0 before the 91 deg edge (CW)
+  local distOut = math.max(0.0, -dS, -dE)     -- degrees outside [89, 91]
+  local ampMod = math.min(1.0, distOut / 5.0)
+  local ampEff = amp * ampMod
+
   local microGate = (amp == 0) and 1 or 0
-  return h + wdef * (amp * nSym) + micro * (1 - wdef * microGate)
+  return h + wdef * (ampEff * nSym) + micro * (1 - wdef * microGate)
 end
 
 -- Round 24/25b (v2026.07.30.2): the pad flattens toward EXACT datum in a

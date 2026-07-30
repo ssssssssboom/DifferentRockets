@@ -819,6 +819,8 @@ public class Ship {
         public float half;     // this part's half-width across the wind axis
         public boolean sharp;  // pointed (nosecone) -> oblique cone; else bow shock
         public Part part;      // source part (stable id / per-part shimmer phase)
+        public float waistX, waistY; // downstream edge center (the part's "waist" — skirt origin, round 31)
+        public float waistHalf;      // half-width of the downstream edge
     }
 
     /**
@@ -847,6 +849,7 @@ public class Ship {
             float hw = p.type.width / 2f, hh = p.type.height / 2f;
             float best = -Float.MAX_VALUE, tipX = 0, tipY = 0, tipPerp = 0;
             float mn = Float.MAX_VALUE, mx = -Float.MAX_VALUE;
+            float[] prC = new float[4], peC = new float[4], cxC = new float[4], cyC = new float[4];
             for (int ci = 0; ci < 4; ci++) {
                 float lx = (ci == 0 || ci == 3) ? -hw : hw;
                 float ly = (ci < 2) ? -hh : hh;
@@ -854,12 +857,23 @@ public class Ship {
                 float cy = bp.y + lx * sa + ly * ca;
                 float pr = cx * ux + cy * uy;
                 float pe = cx * uy - cy * ux; // signed offset from the wind axis
+                prC[ci] = pr; peC[ci] = pe; cxC[ci] = cx; cyC[ci] = cy;
                 if (pr > best) { best = pr; tipX = cx; tipY = cy; tipPerp = pe; }
                 if (pe < mn) mn = pe;
                 if (pe > mx) mx = pe;
             }
+            // waist (round 31 skirt origin): midpoint + half-width of the two
+            // DOWNSTREAM-most corners (the part's trailing edge across the wind)
+            int w0 = -1, w1 = -1;
+            for (int ci = 0; ci < 4; ci++) {
+                if (w0 < 0 || prC[ci] < prC[w0]) { w1 = w0; w0 = ci; }
+                else if (w1 < 0 || prC[ci] < prC[w1]) { w1 = ci; }
+            }
             WindwardEdge e = new WindwardEdge();
             e.x = tipX; e.y = tipY;
+            e.waistX = (cxC[w0] + cxC[w1]) * 0.5f;
+            e.waistY = (cyC[w0] + cyC[w1]) * 0.5f;
+            e.waistHalf = Math.max(0.3f, Math.abs(peC[w0] - peC[w1]) * 0.5f);
             e.half = Math.max(0.3f, Math.max(mx - tipPerp, tipPerp - mn));
             e.sharp = "nosecone".equals(p.type.type);
             e.part = p;

@@ -54,10 +54,21 @@ public final class FlameScript {
      * (x,y) tip; (windX,windY) upwind unit vector (airflow comes FROM there);
      * half = edge half-width; sharp = pointed (oblique cone) vs blunt (bow);
      * mach/pressure/density/relSpeed = ship airflow state; partId stable id.
+     * (waistX,waistY) = the part's downstream-most corner — origin of the
+     * waist skirt (round 31 trapezoid shock skirt); NaN/0 = no skirt.
      */
     public static void drawShock(float x, float y, float half, boolean sharp,
                                  double mach, double windX, double windY, double relSpeed,
                                  double pressure, double density, double time, int partId) {
+        drawShock(x, y, half, sharp, mach, windX, windY, relSpeed,
+                pressure, density, time, partId, 0, 0, 0);
+    }
+
+    /** Full form with waist-skirt origin (round 31). */
+    public static void drawShock(float x, float y, float half, boolean sharp,
+                                 double mach, double windX, double windY, double relSpeed,
+                                 double pressure, double density, double time, int partId,
+                                 double waistX, double waistY, double waistHalf) {
         Globals g = script.globals();
         if (g == null || callFailed) return;
         LuaValue fn = g.get("drawShock");
@@ -72,6 +83,9 @@ public final class FlameScript {
         sctx.set("density", density);
         sctx.set("time", time);
         sctx.set("partId", partId);
+        sctx.set("waistX", waistX);
+        sctx.set("waistY", waistY);
+        sctx.set("waistHalf", waistHalf);
         try {
             fn.call(sctx);
         } catch (LuaError e) {

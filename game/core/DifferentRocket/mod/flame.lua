@@ -1,4 +1,4 @@
--- v2026.07.30.4
+-- v2026.07.30.5
 -- ============================================================================
 -- flame.lua — 引擎尾焰渲染：气压驱动的羽流膨胀 + 风场剪切（玩家可改）
 -- ============================================================================
@@ -359,13 +359,12 @@ function drawShock(sctx)
   else
     -- ============ 脱体弓形激波：弧形亮带 ============
     -- 脱体距离 δ：随马赫数升高而减小（趋于附体）。
-    -- v2026.07.30.4：夸张化——弓形波尺度远超箭体直径（δ×2.4、横向范围
-    -- half×(8+2M)、辉光大幅放大），高马赫时弧更宽；δ 的物理公式
-    -- （∝0.9/√(M-1+0.05)）与下游回扫方向不变。
-    local stand = half * 2.4 * clamp(0.9 / math.sqrt(mach - 1 + 0.05), 0.25, 2.0)
-    local band = 0.30 * half * (1 + 0.4 / mach)          -- 激波层厚度
-    local S = half * (8 + 2 * mach)                       -- 横向范围随马赫数外扩
-    local K = 28
+    -- v2026.07.30.5：继续加码——δ×3.6、横向 half×(12+2.5M)、层厚 0.42、
+    -- 辉光与裙辉更大更亮；δ 物理公式（∝0.9/√(M-1+0.05)）与下游回扫不变。
+    local stand = half * 3.6 * clamp(0.9 / math.sqrt(mach - 1 + 0.05), 0.25, 2.0)
+    local band = 0.42 * half * (1 + 0.4 / mach)          -- 激波层厚度
+    local S = half * (12 + 2.5 * mach)                    -- 横向范围随马赫数外扩
+    local K = 32
     -- 弧形状（v2026.07.30.2 方向修正）：顶点在迎风最前（脱体 δ），两翼向
     -- 【下游回扫】——近轴抛物线过渡、远场渐近马赫线（每单位横向后退 1/tanμ），
     -- 裹住箭体肩部。旧版两翼错画成继续向前（上风侧）卷，看起来整支箭的
@@ -385,7 +384,7 @@ function drawShock(sctx)
       local s1 = -S + (2 * S * (k + 1) / K)
       local smid = (s0 + s1) / 2
       -- 中心最强，两翼高斯衰减（随加宽的 S 放宽）；叠扰动条纹
-      local a = a0 * 0.42 * math.exp(-((smid / half) * 0.32) ^ 2) * shockShimmer(k / K, t, phase)
+      local a = a0 * 0.50 * math.exp(-((smid / half) * 0.26) ^ 2) * shockShimmer(k / K, t, phase)
       if a > 0.004 then
         for _, row in ipairs(ROWS) do
           local e0, e1, amul = row[1] * band, row[2] * band, row[3]
@@ -398,18 +397,58 @@ function drawShock(sctx)
         end
       end
     end
-    -- 滞止区辉光：弧内侧压缩区（v2026.07.30.4 放大）
+    -- 滞止区辉光：弧内侧压缩区（v2026.07.30.5 再放）
     local gx, gy = pt(0, band * 0.5)
-    draw.sprite("glow", gx, gy, half * 5.5, half * 2.6, 0,
-                a0 * 0.34, 0.9, 0.95, 1.0)
+    draw.sprite("glow", gx, gy, half * 9, half * 3.8, 0,
+                a0 * 0.42, 0.9, 0.95, 1.0)
     -- 两翼末梢羽状辉光：高强度时弧肩两侧各一团大范围淡辉
     local skirt = clamp((a0 - 0.35) / 0.65, 0, 1)
     if skirt > 0.01 then
       for sgn = -1, 1, 2 do
-        local wx, wy = pt(S * 0.55 * sgn, band * 0.8)
-        draw.sprite("glow", wx, wy, half * 7, half * 3.2, 0,
-                    a0 * skirt * 0.16, 0.82, 0.90, 1.0)
+        local wx, wy = pt(S * 0.5 * sgn, band * 0.8)
+        draw.sprite("glow", wx, wy, half * 11, half * 4.5, 0,
+                    a0 * skirt * 0.22, 0.82, 0.90, 1.0)
       end
+    end
+  end
+
+  -- ==================== 腰裙（v2026.07.30.5 新增） ====================
+  -- 超音速时从零件腰部（下游端横截面）向下游展开的梯形激波裙/膨胀波系：
+  -- 前缘窄而亮，下游逐渐变宽变淡。alpha 随 a0（马赫数×气压）演化，
+  -- 亚音速/真空时 a0≈0 自动消失，方向恒为下游。
+  local wx0, wy0 = sctx.waistX, sctx.waistY
+  local wHalf = math.max(0.3, sctx.waistHalf or 0)
+  if wx0 and wy0 and wHalf > 0.31 and a0 > 0.02 then
+    local skl = wHalf * (4.0 + 2.0 * mach)          -- 裙长随马赫数增长
+    local widen = wHalf * (1.2 + 0.5 * mach)        -- 末端横向加宽
+    local NL = 5
+    for i = 1, NL do
+      local f0 = (i - 1) / NL
+      local f1 = i / NL
+      local a = a0 * 0.30 * (1 - f0) ^ 1.8 * shockShimmer(0.3 + f0 * 0.8, t, phase + 4.0)
+      if a > 0.004 then
+        for sgn = -1, 1, 2 do
+          -- 贴体侧线 P(f) 沿下游，外线 Q(f) 逐层外扩 -> 梯形条带
+          local p0x = wx0 + dx * skl * f0 + px * wHalf * sgn
+          local p0y = wy0 + dy * skl * f0 + py * wHalf * sgn
+          local p1x = wx0 + dx * skl * f1 + px * wHalf * sgn
+          local p1y = wy0 + dy * skl * f1 + py * wHalf * sgn
+          local q0x = p0x + px * widen * f0 * sgn
+          local q0y = p0y + py * widen * f0 * sgn
+          local q1x = p1x + px * widen * f1 * sgn
+          local q1y = p1y + py * widen * f1 * sgn
+          draw.triangle(p0x, p0y, p1x, p1y, q1x, q1y, 0.86, 0.92, 1.0, a)
+          draw.triangle(p0x, p0y, q1x, q1y, q0x, q0y, 0.86, 0.92, 1.0, a * 0.6)
+        end
+      end
+    end
+    -- 腰部前缘亮缝（窄亮带，梯形裙的"起点"）
+    for sgn = -1, 1, 2 do
+      draw.triangle(wx0, wy0,
+                    wx0 + px * wHalf * sgn, wy0 + py * wHalf * sgn,
+                    wx0 + dx * wHalf * 0.35 + px * wHalf * 0.86 * sgn,
+                    wy0 + dy * wHalf * 0.35 + py * wHalf * 0.86 * sgn,
+                    1, 1, 1, a0 * 0.4 * shockShimmer(0.1, t, phase + 4.0))
     end
   end
 end

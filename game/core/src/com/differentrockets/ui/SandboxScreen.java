@@ -1660,7 +1660,8 @@ public class SandboxScreen extends ScreenAdapter {
                 for (Ship.WindwardEdge e : edges) {
                     FlameScript.drawShock(e.x, e.y, e.half, e.sharp, mach, ux, uy, f[3],
                             pressure, density, game.world.time,
-                            System.identityHashCode(e.part != null ? e.part : e));
+                            System.identityHashCode(e.part != null ? e.part : e),
+                            e.waistX, e.waistY, e.waistHalf);
                 }
                 anyLua = true;
             } else {

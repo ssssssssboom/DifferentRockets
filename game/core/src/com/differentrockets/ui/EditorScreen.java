@@ -1425,6 +1425,24 @@ public class EditorScreen extends ScreenAdapter {
         return out.set(a.x + ux * (s - sA), a.y + uy * (s - sA));
     }
 
+    /** Quantize the LOCAL coordinate t of CONTACT POINT p along the moving
+     *  segment (a,b) — t = distance from a in the segment's own direction —
+     *  to the EDGE_SNAP_STEP grid, clamped into [0, len]. Unlike
+     *  quantizeClampContactS (used for FIXED target edges, where the world
+     *  frame is stable), this frame moves with the dragged part, so the
+     *  quantized contact point is invariant under finger motion and the
+     *  corrected part position is truly discrete. */
+    private static float quantizeClampContactLocalT(Vector2 p, Vector2 a, Vector2 b) {
+        float abx = b.x - a.x, aby = b.y - a.y;
+        float len2 = abx * abx + aby * aby;
+        if (len2 < 1e-9f) return 0; // degenerate: never called for point attaches
+        float inv = 1f / (float) Math.sqrt(len2);
+        float t = ((p.x - a.x) * abx + (p.y - a.y) * aby) * inv;
+        float q = (float) (Math.round(t / (double) Attach.EDGE_SNAP_STEP) * Attach.EDGE_SNAP_STEP);
+        float len = (float) Math.sqrt(len2);
+        return Math.max(0, Math.min(len, q));
+    }
+
     /** Snap correction for one specific attach pair. Edge-type pairs quantize
      *  the free slide DISCRETELY — but the quantity that is quantized and
      *  clamped is the CONTACT POINT's projection on the edge, never the part
@@ -1443,9 +1461,17 @@ public class EditorScreen extends ScreenAdapter {
             return new Vector2(px + (target.x - cm.x), py + (target.y - cm.y));
         }
         if (apM.edge != PartType.AttachPoint.EDGE_NONE) {
-            // target contact co fixed -> grid/clamped point on the MOVING edge
-            float s = quantizeClampContactS(cm, ma, mb);
-            Vector2 moving = pointOnSeg(ma, mb, s, new Vector2());
+            // target contact co fixed -> grid/clamped point on the MOVING edge.
+            // The coordinate that is quantized must live in the MOVING EDGE'S
+            // OWN frame (t = distance from ma). Round 13 regression: quantizing
+            // cm's WORLD-frame direction coordinate let cm ride along with the
+            // finger — the quantized value stepped but the part position kept
+            // tracking the finger continuously (sawtooth free-slide, e.g. a
+            // 6000L LeftSide edge vs a side detacher's RightCenter point).
+            float t = quantizeClampContactLocalT(cm, ma, mb);
+            float abx = mb.x - ma.x, aby = mb.y - ma.y;
+            float inv = 1f / (float) Math.sqrt(abx * abx + aby * aby);
+            Vector2 moving = new Vector2(ma.x + abx * inv * t, ma.y + aby * inv * t);
             return new Vector2(px + (co.x - moving.x), py + (co.y - moving.y));
         }
         return new Vector2(px + (co.x - cm.x), py + (co.y - cm.y));

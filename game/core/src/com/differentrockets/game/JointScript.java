@@ -33,6 +33,10 @@ public final class JointScript {
     public static final class Params {
         public float frequencyHz;
         public float dampingRatio;
+        /** angular spring rate override (round 33b); NaN = use frequencyHz. */
+        public double angularFrequencyHz = Double.NaN;
+        /** explicit viscous bushing ratio (round 33b); NaN = physics.lua/default. */
+        public double angularDampingRatio = Double.NaN;
         public float breakForce = -1f;   // <0 = caller default (min of attach points)
         public boolean fromLua;
     }
@@ -60,6 +64,8 @@ public final class JointScript {
             out.dampingRatio = (float) t.get("dampingRatio")
                     .optdouble(PhysicsScript.jointParam("dampingRatio"));
             out.breakForce = (float) t.get("breakForce").optdouble(-1.0);
+            out.angularFrequencyHz = t.get("angularFrequencyHz").optdouble(Double.NaN);
+            out.angularDampingRatio = t.get("angularDampingRatio").optdouble(Double.NaN);
             double angDamp = t.get("angularDamping").optdouble(Double.NaN);
             if (!Double.isNaN(angDamp)) {
                 // per-connection angular damping applies to both bodies

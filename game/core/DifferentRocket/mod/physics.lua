@@ -1,4 +1,4 @@
--- v2026.07.31.2
+-- v2026.07.31.3
 -- ============================================================================
 -- physics.lua — physics laws (PLAYER-EDITABLE)
 -- ============================================================================
@@ -52,6 +52,20 @@ steering = { kp = 1.8, ki = 0.5, kd = 1.2 }
 --   dampingRatio   weld damping: 1.0 = critically damped (no elastic
 --                  oscillation), >1 = over-damped.  Below ~0.9 the rocket
 --                  visibly wobbles after burns/turns.
+--   angularFrequencyHz    explicit name for the angular spring rate (equals
+--                  frequencyHz — v2026.07.31.3 source fact: this engine's
+--                  soft weld is LINEARLY rigid; elasticity only exists in
+--                  the angular channel, so frequencyHz IS the angular
+--                  spring rate).
+--   angularDampingRatio   explicit viscous angular damping (v2026.07.31.3,
+--                  the REAL vibration killer). Every physics substep applies
+--                  tau=-+c*dw across each weld with c = zeta*2*omega*I_red.
+--                  Default 1.0 = critical. Probe 21 at 48 Hz: full-throttle
+--                  steady-state bend 0.067 deg, overshoot 1.00, a 5.4 deg
+--                  impulse kick settles in 0.65 s with zero regrowth. The
+--                  joint's own dampingRatio above saturates and barely damps
+--                  structural bending (>3 s ringing at any value 1.0-1.6).
+--                  Safe range: zeta <= 1.5 (2.0 goes numerically unstable).
 --   angularDamping per-part rotational damping (Box2D body property, 0=none).
 --                  Round 12: raised 0.08 -> 0.6 because the control.lua law is
 --                  pure proportional (gimbal = clamped heading error, no
@@ -84,7 +98,12 @@ steering = { kp = 1.8, ki = 0.5, kd = 1.2 }
 -- angular-inertia floor (I>=m*25) which also stiffens the angular spring
 -- channel ~17x. Probe 20: triple-booster full-throttle climb -> max weld
 -- angle dev 0.067 deg, stretch <0.1 mm, no oscillation; small ships clean.
-joints = { frequencyHz = 48.0, dampingRatio = 1.0, angularDamping = 1.0 }
+-- Round 33b (v2026.07.31.3): angular/linear semantics split (source fact:
+-- soft weld = linearly rigid + angularly soft) and an explicit viscous
+-- angular damper (angularDampingRatio, default 1.0) that actually removes
+-- bending-mode energy — the joint's built-in damping could not (probe 21).
+joints = { frequencyHz = 48.0, dampingRatio = 1.0, angularDamping = 1.0,
+           angularFrequencyHz = 48.0, angularDampingRatio = 1.0 }
 
 -- Per-part override (round 9): a part's own Lua script may call
 --   part:setJointParams{frequencyHz=…, dampingRatio=…, angularDamping=…}

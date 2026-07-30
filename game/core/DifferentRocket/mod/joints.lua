@@ -1,4 +1,4 @@
--- v2026.07.31.2
+-- v2026.07.31.3
 -- ============================================================================
 -- joints.lua — 连接（焊接点）规则（玩家可改）
 -- ============================================================================
@@ -21,6 +21,18 @@
 --                  越低越软：2-5 松软像橡胶，20-30 中等。0 = 完全刚性
 --                  （无弹性的备选；断裂检测两种模式下都按 breakForce 反作用力）。
 --   dampingRatio   阻尼比。<1 欠阻尼（回弹），1 临界阻尼，>1 过阻尼（发黏）。
+--                  注意（v2026.07.31.3 源码事实）：本引擎 Box2D 软焊接的
+--                  frequencyHz/dampingRatio 只作用于【角向】通道——线向
+--                  始终是刚性约束，不会变弹；且其内置阻尼公式对重型堆叠的
+--                  弯曲模态几乎无效（probe21 实测 ringing >3 秒）。真正消振
+--                  请用下面的 angularDampingRatio。
+--   angularFrequencyHz    角向弹簧频率的显式命名（= frequencyHz，二选一，
+--                  同时给出时此键优先）。v2026.07.31.3 新增。
+--   angularDampingRatio   显式黏性角阻尼比（v2026.07.31.3 新增，真消振）。
+--                  每个物理子步对两零件施加 τ=∓c·Δω，c = ζ·2ω·I_red。
+--                  1.0 = 临界阻尼（默认，probe21：48Hz 下满推力爬升稳态
+--                  0.067°、扰动 0.65 秒收敛、无回摆）。安全上限约 1.5，
+--                  2.0 会数值失稳（发散抖动）。
 --   angularDamping 两零件的角速度阻尼（每秒衰减比例，0=不衰减）。
 --   breakForce     断裂力上限（千牛）。省略时取两连接点中较小的那个；
 --                  想造永不分离的连接可填 1e18。
@@ -45,10 +57,18 @@
 -- 爬升最大角位移 0.067°、拉伸 <0.1 mm、无振荡，28 Hz 在同条件下 0.22°
 -- 也及格但余量小）；求解迭代固定 24/4；小零件角惯量下限 I>=m*25（round 32
 -- 保留，它同时把角向弹簧刚度放大了 ~17 倍，是弹性回归的关键支撑）。
+-- Round 33b (v2026.07.31.3): 拆分角向语义 + 显式黏性角阻尼。源码核实本引擎
+-- Box2D 软焊接：线向刚性 2x2 约束，弹性只在角向通道，且其内置阻尼公式
+-- （gamma=h(d+h·k)）对重型堆叠弯曲模态无效（probe21：dampingRatio 1.0-1.6
+-- 均 ringing >3 秒且越调越差）。新增 angularDampingRatio（默认 1.0，每个
+-- 物理子步施加 τ=∓c·Δω，c=ζ·2ω·I_red）：probe21 实测 48Hz/ζ=1.0 满推力
+-- 稳态 0.067°、overshoot 1.00、5.4° 冲击 0.65 秒收敛、无回摆（regrow=1.00）；
+-- ζ=2.0 失稳，安全域 ζ<=1.5。angularFrequencyHz 为 frequencyHz 的显式别名。
 -- 断裂检测不变（getReactionForce 超 breakForce 持续 5 帧即断）。
 local DEFAULT_FREQ = 48.0     -- frequencyHz 默认：48 Hz 硬弹簧（round 33: 0 -> 48）
 local DEFAULT_DAMP = 1.0      -- dampingRatio 默认：临界阻尼
 local DEFAULT_ANGDAMP = 1.0   -- angularDamping 默认：每秒衰减比例（was 0.6）
+local DEFAULT_ANGVISC = 1.0   -- angularDampingRatio 默认：显式黏性角阻尼（round 33b）
 
 function jointParams(partA, attachA, partB, attachB)
     -- 两侧零件在 onLoad 里通过 part:setJointParams{...} 设置的覆盖值
@@ -68,6 +88,9 @@ function jointParams(partA, attachA, partB, attachB)
         -- 覆盖值缺省时用本文件的通用默认（round 22: 20 / 1.0 / 1.0）
         frequencyHz    = freq or DEFAULT_FREQ,
         dampingRatio   = damp or DEFAULT_DAMP,
+        -- 显式黏性角阻尼（round 33b 真消振）：任一侧有覆盖就用覆盖
+        angularDampingRatio = oA.angularDampingRatio or oB.angularDampingRatio
+                              or DEFAULT_ANGVISC,
         -- 角速度阻尼：任一侧有覆盖就用覆盖，否则用全局默认
         angularDamping = oA.angularDamping or oB.angularDamping
                          or DEFAULT_ANGDAMP,

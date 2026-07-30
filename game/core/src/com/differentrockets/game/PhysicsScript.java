@@ -117,16 +117,26 @@ public final class PhysicsScript {
     // editable in mod/physics.lua via the `joints` table.
     // round 27 owner tuning: built-in joint defaults are 20 Hz / 1.0 / 1.0;
     // physics.lua's joints table (player-editable) overrides these when present.
-    private static final double DEF_JOINT_FREQ = 28.0, DEF_JOINT_DAMP = 1.0, DEF_ANG_DAMP = 1.0;
+    // Round 33b: frequencyHz IS the angular spring rate (this Box2D build's
+    // soft weld is linear-rigid + angular-soft — see b2WeldJoint source);
+    // angularDampingRatio feeds the explicit viscous bushing (Ship.Link.cVisc).
+    // Probe 21 tuning: 48 Hz / zeta=1.0 -> steady 0.067 deg, decay 0.65 s,
+    // overshoot 1.00, no regrowth; zeta=2.0 at 24 Hz went unstable, so keep
+    // the damper at zeta<=1.5. Higher frequency (64) is even stiffer but
+    // leaves less stability margin for player-modded stacks.
+    private static final double DEF_JOINT_FREQ = 48.0, DEF_JOINT_DAMP = 1.0,
+            DEF_ANG_DAMP = 1.0, DEF_ANG_VISC = 1.0;
 
     /**
      * Weld-joint parameters from Lua (`joints = {frequencyHz=.., dampingRatio=..,
-     * angularDamping=..}`), falling back to the tuned defaults per key.
-     * key: "frequencyHz" | "dampingRatio" | "angularDamping".
+     * angularDamping=.., angularFrequencyHz=.., angularDampingRatio=..}`),
+     * falling back to the tuned defaults per key.
      */
     public static double jointParam(String key) {
         double def = "frequencyHz".equals(key) ? DEF_JOINT_FREQ
-                : "dampingRatio".equals(key) ? DEF_JOINT_DAMP : DEF_ANG_DAMP;
+                : "dampingRatio".equals(key) ? DEF_JOINT_DAMP
+                : "angularFrequencyHz".equals(key) ? DEF_JOINT_FREQ
+                : "angularDampingRatio".equals(key) ? DEF_ANG_VISC : DEF_ANG_DAMP;
         Globals g = bound;
         if (g == null) return def;
         LuaValue t = g.get("joints");
@@ -157,6 +167,8 @@ public final class PhysicsScript {
             case "frequencyHz": return DEF_JOINT_FREQ;
             case "dampingRatio": return DEF_JOINT_DAMP;
             case "angularDamping": return DEF_ANG_DAMP;
+            case "angularFrequencyHz": return DEF_JOINT_FREQ;
+            case "angularDampingRatio": return DEF_ANG_VISC;
             default: return 0;
         }
     }

@@ -36,6 +36,16 @@ public class Ship {
         public int attachIndexA = -1, attachIndexB = -1;
         /** consecutive frames spent over breakForce (debounce, see checkJointBreaks). */
         public int overFrames;
+        /**
+         * Round 33b (angular-viscous bushing): TRUE viscous damping torque
+         * applied per substep against the relative angular velocity of the
+         * welded pair. Box2D's soft-weld damping is a constraint "magic
+         * formula" (gamma = h(d+h*k)) that saturates and cannot decay the
+         * structural bending mode of a heavy stack (probe 21: >3 s ringing at
+         * any dampingRatio 1.0-1.6); this explicit damper actually removes
+         * mode energy. cVisc = angularDampingRatio * 2 * omega_ang * I_red.
+         */
+        public float cVisc;
     }
 
     public final GameWorld world;
@@ -216,6 +226,10 @@ public class Ship {
         if (JointScript.resolve(a, apA, b, apB, jp)) {
             jd.frequencyHz = jp.frequencyHz;
             jd.dampingRatio = jp.dampingRatio;
+            // round 33b: this Box2D build's soft weld is linearly RIGID and
+            // angularly SOFT, so frequencyHz is effectively the angular spring
+            // rate; joints.lua may name it explicitly via angularFrequencyHz.
+            if (!Double.isNaN(jp.angularFrequencyHz)) jd.frequencyHz = (float) jp.angularFrequencyHz;
             breakForce = jp.breakForce > 0 ? jp.breakForce : Math.min(apA.breakForce, apB.breakForce);
             debugLastWeldSource = "lua";
         } else {
@@ -238,6 +252,10 @@ public class Ship {
         if (hzOv != null) {
             try { jd.frequencyHz = Float.parseFloat(hzOv); } catch (NumberFormatException ignore) {}
         }
+        String dampOv = System.getProperty("dr.weldDamp");
+        if (dampOv != null) {
+            try { jd.dampingRatio = Float.parseFloat(dampOv); } catch (NumberFormatException ignore) {}
+        }
         debugLastWeldHz = jd.frequencyHz;
         debugLastWeldDamp = jd.dampingRatio;
         jd.collideConnected = false;
@@ -250,7 +268,39 @@ public class Ship {
         l.breakForce = breakForce;
         l.attachIndexA = a.attachDefs().indexOf(apA);
         l.attachIndexB = b.attachDefs().indexOf(apB);
+        // round 33b explicit viscous angular bushing across this weld. The
+        // soft weld's own damping ("magic formula", gamma = h(d + h*k))
+        // saturates and cannot decay the structural bending mode of a heavy
+        // stack (probe 21: >3 s ringing at dampingRatio 1.0-1.6, worse with
+        // higher ratio). Instead apply tau = -+cVisc*dw each substep with
+        // cVisc = zeta * 2 * omega_ang * I_red (parallel stiffness k comes
+        // from the joint spring, this damper only bleeds mode energy).
+        double zeta = !Double.isNaN(jp.angularDampingRatio) ? jp.angularDampingRatio
+                : PhysicsScript.jointParam("angularDampingRatio");
+        String viscOv = System.getProperty("dr.weldVisc"); // debug toggle (probe)
+        if (viscOv != null) {
+            try { zeta = Double.parseDouble(viscOv); } catch (NumberFormatException ignore) {}
+        }
+        float iA = a.body.getInertia(), iB = b.body.getInertia();
+        double iRed = (iA + iB) > 0 ? (double) iA * iB / (iA + iB) : 0;
+        l.cVisc = (float) (zeta * 2.0 * (2 * Math.PI * Math.max(0, jd.frequencyHz)) * iRed);
         links.add(l);
+    }
+
+    /**
+     * Apply the explicit viscous angular dampers (round 33b, cVisc above) once
+     * per physics SUBSTEP from GameWorld.substep, alongside the thrust/frame
+     * forces. Torque on each body opposes its rotation relative to the mate.
+     */
+    public void applyJointDampers() {
+        for (Link l : links) {
+            if (l.cVisc <= 0) continue;
+            if (!l.a.body.isActive() || !l.b.body.isActive()) continue;
+            float dw = l.b.body.getAngularVelocity() - l.a.body.getAngularVelocity();
+            float torque = l.cVisc * dw;
+            l.a.body.applyTorque(torque, true);
+            l.b.body.applyTorque(-torque, true);
+        }
     }
 
     public void removeJointsOf(Part p) {

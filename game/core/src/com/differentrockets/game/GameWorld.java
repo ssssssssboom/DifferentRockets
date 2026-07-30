@@ -1060,7 +1060,10 @@ public class GameWorld {
         // applyForce only acted on the first substep, so at warp 4 engines
         // burned 4x fuel for 1x thrust).
         for (Ship s : ships) {
-            if (!s.onRails) s.applyFrameForces();
+            if (!s.onRails) {
+                s.applyFrameForces();
+                s.applyJointDampers(); // round 33b explicit angular viscous bushing
+            }
         }
         boxWorld.step(h, VEL_ITER, POS_ITER);
         // advance the inertial frame: the physics origin moves with frameVel

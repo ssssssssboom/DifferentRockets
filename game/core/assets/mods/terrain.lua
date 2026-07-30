@@ -1,4 +1,4 @@
--- v2026.07.30
+-- v2026.07.30.1
 -- ============================================================================
 -- terrain.lua — planet terrain generation (PLAYER-EDITABLE)
 -- ============================================================================
@@ -86,24 +86,37 @@ specialTerrains = {
 --   flattenPad.enabled     master switch (true)
 --   flattenPad.angleDeg    pad center angle in degrees (90 = spawn site)
 --   flattenPad.halfWidthM  half-width of the leveled area in meters of
---                          surface arc (12000; round 24: was 120 — when the
---                          pad target became exact datum 0, a 240 m blend
---                          would have dug a ~2 km deep crater with vertical
---                          walls around the spawn site; 12 km keeps the
---                          smoothstep rim at a ~14 deg max slope).
---                          Heights blend back to the
---                          unflattened terrain with a smoothstep across this
---                          half-width; round 24: the pad center is at EXACT
---                          datum (height precisely 0, ground-to-center ==
---                          nominal radius), overriding noise AND
---                          specialTerrains, and the rim joins tangentially.
+--                          surface arc (120). Heights blend toward exact
+--                          datum 0 at the pad angle with a smoothstep across
+--                          this half-width, so the pad center is at EXACT
+--                          datum (ground-to-center == nominal radius),
+--                          overriding noise AND specialTerrains, and the rim
+--                          joins tangentially. Round 25: back to 120 m (the
+--                          round-24 12 km "wide valley" was REVERTED) — with
+--                          Smearth's default-region amplitude now 0, the pad
+--                          surroundings ARE the datum sphere, so no wide
+--                          blend is needed; padFlatten only damps the last
+--                          meters of residual noise/special-terrain overlap.
 -- Meter->angle conversion needs planet radii; keep padRadii in sync with
 -- the radius= values in planets.lua (planets missing from the table are
 -- simply not flattened).
 flattenPad = {
   enabled = true,
   angleDeg = 90.0,
-  halfWidthM = 12000.0,
+  halfWidthM = 120.0,
+}
+-- ============================================================================
+-- DEFAULT-REGION RELIEF (round 25, v2026.07.30.1): the base terrain is the
+-- EXACT nominal sphere (surface-to-center == planet radius) plus optional
+-- ZERO-MEAN noise. Noise amplitude per planet, in meters:
+--   amplitude = 0   -> default regions are at precisely the planet radius
+--   amplitude > 0   -> default regions get zero-mean noise +/- amplitude
+-- Planets not listed fall back to (maxHeight - minHeight) / 2 from their
+-- planets.lua terrain entry, preserving their relief span (recentered onto
+-- datum). Authored bands (ranges) and specialTerrains are unaffected —
+-- they are the configurable modifications stacked ON TOP of the datum base.
+defaultNoiseAmplitude = {
+  Smearth = 0.0,  -- launch planet: default surface == exact datum sphere
 }
 local padRadii = {
   Sun = 69634200.0, Smercury = 243970.0, Smenus = 605180.0,
@@ -175,6 +188,7 @@ local function baseTerrainHeight(planetName, angleRad)
     amp = amp * 0.5
   end
   local n01 = (sum / norm + 1) * 0.5          -- [0,1]
+  local nSym = sum / norm                     -- [-1,1], zero mean (round 25)
   local rough = math.min(2.5, 0.25 + info.noise * 0.28)
   local shaped = n01 ^ rough
 
@@ -239,15 +253,31 @@ local function baseTerrainHeight(planetName, angleRad)
   end
   local wdef = 1.0 - wsum
   if wdef < 0 then wdef = 0 end
-  return h + wdef * bandHeight(info.minHeight, info.maxHeight) + micro
+
+  -- Round 25 (v2026.07.30.1) — datum-centered default terrain: OUTSIDE every
+  -- authored band the surface is the EXACT nominal sphere plus ZERO-MEAN
+  -- noise with a configurable amplitude (defaultNoiseAmplitude table above;
+  -- fallback (maxHeight-minHeight)/2 keeps unlisted planets' relief span,
+  -- recentered onto datum):
+  --     default height = amp * nSym
+  -- amp == 0 (e.g. Smearth, the launch planet) => the default region is at
+  -- PRECISELY the planet radius. The micro texture is noise too, so it is
+  -- faded out across the same wdef weight when amp == 0 (kept inside bands
+  -- where authored relief lives; the fade is smooth because wdef is).
+  local amp = defaultNoiseAmplitude[planetName]
+  if amp == nil then amp = (info.maxHeight - info.minHeight) / 2 end
+  local microGate = (amp == 0) and 1 or 0
+  return h + wdef * (amp * nSym) + micro * (1 - wdef * microGate)
 end
 
--- Round 24 (v2026.07.30): the pad now flattens toward EXACT datum — height
+-- Round 24/25 (v2026.07.30.1): the pad flattens toward EXACT datum — height
 -- precisely 0 at the pad angle (ground distance to planet center == nominal
 -- radius), overriding natural noise AND specialTerrains. The smoothstep
 -- factor s is exactly 0 at the pad angle and exactly 1 at/ beyond the rim,
 -- so heights blend back to whatever the unflattened terrain is across
--- halfWidthM with a tangential join.
+-- halfWidthM (120 m) with a tangential join. On planets whose default-region
+-- amplitude is 0 (Smearth) the surroundings are already the datum sphere —
+-- this is only a last-meters guarantee, no wide valley.
 local function padFlatten(planetName, angleRad, h)
   if not flattenPad.enabled then return h end
   local radius = padRadii[planetName]

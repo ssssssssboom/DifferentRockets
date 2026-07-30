@@ -233,6 +233,11 @@ public class Ship {
             breakForce = Math.min(apA.breakForce, apB.breakForce);
             debugLastWeldSource = "fallback";
         }
+        // debug toggle (probe): force every weld's frequency, e.g. -Dr.weldHz=0
+        String hzOv = System.getProperty("dr.weldHz");
+        if (hzOv != null) {
+            try { jd.frequencyHz = Float.parseFloat(hzOv); } catch (NumberFormatException ignore) {}
+        }
         debugLastWeldHz = jd.frequencyHz;
         debugLastWeldDamp = jd.dampingRatio;
         jd.collideConnected = false;

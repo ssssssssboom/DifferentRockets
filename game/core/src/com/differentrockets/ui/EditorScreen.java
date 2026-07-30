@@ -1396,15 +1396,24 @@ public class EditorScreen extends ScreenAdapter {
     /** previous raw finger position inside one gesture (direction weighting) */
     private float snapPrevX, snapPrevY;
     private boolean snapPrevValid;
+    /** previous CORRECTED output position (jump guard baseline) */
+    private float snapPrevOutX, snapPrevOutY;
+    private boolean snapPrevOutValid;
 
     /** min finger displacement (m) that counts as a directional nudge */
     private static final float SNAP_DIR_MIN = 0.04f;
     /** cos cone: the nudge must point within ~60 deg of the rival's anchor */
     private static final float SNAP_DIR_COS = 0.5f;
+    /** max landing-point move (m) a scheme SWITCH may cause. Micro nudges must
+     *  only produce micro adjustments: a switch whose corrected position jumps
+     *  farther than this from the current ghost position is rejected and the
+     *  current scheme is kept. */
+    private static final float SNAP_MAX_SWITCH_JUMP = 1.0f;
 
     private void clearSnapSel() {
         snapSelPart = -1;
         snapPrevValid = false;
+        snapPrevOutValid = false;
         lastSnapWin.part = -1;
     }
 
@@ -1509,6 +1518,16 @@ public class EditorScreen extends ScreenAdapter {
                 }
             }
         }
+        // jump guard: a scheme SWITCH must not teleport the part. If the new
+        // scheme's corrected landing is farther than SNAP_MAX_SWITCH_JUMP from
+        // the current ghost position, reject the switch and keep the current
+        // scheme (micro nudge -> micro adjustment only).
+        if (cur != null && chosen != cur && snapPrevOutValid) {
+            float jx = chosen.nx - snapPrevOutX, jy = chosen.ny - snapPrevOutY;
+            if (jx * jx + jy * jy > SNAP_MAX_SWITCH_JUMP * SNAP_MAX_SWITCH_JUMP) {
+                chosen = cur;
+            }
+        }
         snapSelPart = chosen.part;
         snapSelApM = chosen.apM;
         snapSelApO = chosen.apO;
@@ -1518,6 +1537,9 @@ public class EditorScreen extends ScreenAdapter {
         snapPrevX = px;
         snapPrevY = py;
         snapPrevValid = true;
+        snapPrevOutX = chosen.nx;
+        snapPrevOutY = chosen.ny;
+        snapPrevOutValid = true;
         return new Vector2(chosen.nx, chosen.ny);
     }
 
@@ -1601,10 +1623,63 @@ public class EditorScreen extends ScreenAdapter {
                 PartType t = PartList.get(dp.typeId);
                 if (t != null && win.apO >= 0 && win.apO < t.attach.size()) {
                     drawOneMarker(t, dp.x, dp.y, dp.rot, t.attach.get(win.apO), true);
+                    // edge alignment guide (round 11 task 2): for edge-type
+                    // pairs, extend the mating segment with dashes and draw
+                    // tick marks at every EDGE_SNAP_STEP grid position so the
+                    // player sees WHERE the quantized slide will land
+                    Vector2 ga = new Vector2(), gb = new Vector2();
+                    if (t.attach.get(win.apO).edge != PartType.AttachPoint.EDGE_NONE) {
+                        attachWorldSeg(t, dp.x, dp.y, dp.rot, t.attach.get(win.apO), ga, gb);
+                        drawEdgeGuide(ga, gb);
+                    }
+                    if (win.apM < dragType.attach.size()
+                            && dragType.attach.get(win.apM).edge != PartType.AttachPoint.EDGE_NONE) {
+                        attachWorldSeg(dragType, px, py, rot, dragType.attach.get(win.apM), ga, gb);
+                        drawEdgeGuide(ga, gb);
+                    }
                 }
             }
         }
         game.shapes.end();
+    }
+
+    /**
+     * Alignment guide for one edge attach segment (a,b): dashed extensions
+     * beyond both (shrunk) ends, plus tick marks at every Attach.EDGE_SNAP_STEP
+     * grid multiple along the edge line (bright inside the valid interval, dim
+     * outside it) — the visual quantization ruler for the snap slide.
+     */
+    private void drawEdgeGuide(Vector2 a, Vector2 b) {
+        float abx = b.x - a.x, aby = b.y - a.y;
+        float len = (float) Math.sqrt(abx * abx + aby * aby);
+        if (len < 1e-6f) return;
+        float ux = abx / len, uy = aby / len;   // along-edge unit
+        float px = -uy, py = ux;                // perpendicular unit
+        float nOff = a.x * px + a.y * py;       // line offset along the normal
+        float sA = a.x * ux + a.y * uy;
+        float sB = b.x * ux + b.y * uy;
+        float lo = Math.min(sA, sB), hi = Math.max(sA, sB);
+        // 1) dashed extensions beyond both ends (0.25 m dash, 0.2 m gap, 1.5 m)
+        game.shapes.setColor(0.3f, 0.75f, 0.95f, 0.5f);
+        for (int side = -1; side <= 1; side += 2) {
+            float base = side < 0 ? lo : hi;
+            for (float off = 0.12f; off < 1.5f; off += 0.45f) {
+                float s0 = base + side * off, s1 = base + side * (off + 0.25f);
+                game.shapes.line(ux * s0 + px * nOff, uy * s0 + py * nOff,
+                        ux * s1 + px * nOff, uy * s1 + py * nOff);
+            }
+        }
+        // 2) quantization ruler: ticks at every EDGE_SNAP_STEP grid multiple
+        float step = Attach.EDGE_SNAP_STEP;
+        float from = (float) (Math.ceil((lo - 1.5f) / step) * step);
+        for (float s = from; s <= hi + 1.5f; s += step) {
+            boolean inside = s >= lo - 1e-4f && s <= hi + 1e-4f;
+            float tl = inside ? 0.32f : 0.18f; // tick half-length
+            if (inside) game.shapes.setColor(0.35f, 0.9f, 1f, 0.85f);
+            else game.shapes.setColor(0.35f, 0.9f, 1f, 0.35f);
+            float cx = ux * s + px * nOff, cy = uy * s + py * nOff;
+            game.shapes.line(cx - px * tl, cy - py * tl, cx + px * tl, cy + py * tl);
+        }
     }
 
     private void rotateGhost() {

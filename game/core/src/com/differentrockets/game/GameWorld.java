@@ -23,7 +23,10 @@ import java.util.Map;
 public class GameWorld {
 
     public static final float PHYS_DT = 1f / 60f;
-    public static final int VEL_ITER = 8, POS_ITER = 3;
+    /** BASE solver iterations (debug-tunable); the effective per-step counts
+     * scale up with ship size — see solverVelocityIterations(). */
+    public static final int VEL_ITER = Integer.getInteger("dr.velIter", 8),
+            POS_ITER = Integer.getInteger("dr.posIter", 3);
     public static final double RAILS_DISTANCE = 20000.0; // beyond this ships go on rails
 
     /**
@@ -1018,6 +1021,40 @@ public class GameWorld {
         }
     }
 
+    /**
+     * Round 31 (weld "softness"/jitter root-cause fix): Box2D's sequential-
+     * impulse solver must converge EVERY weld + contact constraint within a
+     * step. With the flat 8 velocity iterations that was impossible for
+     * heavy multi-body structures — worst of all parallel booster stacks
+     * whose closed weld loops and extreme mass ratios (a 125 kg side
+     * detacher welded between two 6.6 t tanks = 53:1) leave large residual
+     * impulse errors. The under-converged soft (28 Hz) weld then acted like
+     * a buzzy spring: probe 18 measured 100-230 kN reaction-force
+     * oscillation while PARKED and >1 unit of weld stretch plus 3.4 MN
+     * oscillation under slow thrust. The same 28 Hz spring at 24
+     * iterations is rock solid (0.0001 stretch), so the root cause is
+     * solver convergence, not the spring rate. Scale velocity iterations
+     * with the largest in-physics structure (cheap 8 for small ships,
+     * up to 24 for heavy stacks); position iterations get a matching bump.
+     */
+    public int solverVelocityIterations() {
+        // debug toggle (probe): -Ddr.fixedIter pins the flat base count
+        if (System.getProperty("dr.fixedIter") != null) return VEL_ITER;
+        int need = VEL_ITER;
+        for (Ship s : ships) {
+            if (s.onRails) continue;
+            int n = s.parts.size();
+            if (n < 3) continue;
+            need = Math.max(need, Math.min(VEL_ITER + 2 * n, Math.max(24, VEL_ITER)));
+        }
+        return need;
+    }
+
+    /** Position-iteration counterpart of solverVelocityIterations (3 -> 4). */
+    public int solverPositionIterations() {
+        return solverVelocityIterations() >= 20 ? Math.max(POS_ITER, 4) : POS_ITER;
+    }
+
     private void substep(float h) {
         time += h;
         sun.updateRails(time);
@@ -1041,7 +1078,7 @@ public class GameWorld {
         for (Ship s : ships) {
             if (!s.onRails) s.applyFrameForces();
         }
-        boxWorld.step(h, VEL_ITER, POS_ITER);
+        boxWorld.step(h, solverVelocityIterations(), solverPositionIterations());
         // advance the inertial frame: the physics origin moves with frameVel
         double fx = frameVel.x * h, fy = frameVel.y * h;
         if (fx != 0 || fy != 0) {

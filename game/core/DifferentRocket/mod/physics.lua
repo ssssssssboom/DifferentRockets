@@ -1,4 +1,4 @@
--- v2026.07.27
+-- v2026.07.31
 -- ============================================================================
 -- physics.lua — physics laws (PLAYER-EDITABLE)
 -- ============================================================================
@@ -41,15 +41,15 @@
 steering = { kp = 1.8, ki = 0.5, kd = 1.2 }
 
 -- Weld-joint (part connection) tuning. The ship's parts are held together by
--- spring-damper weld joints; these three values control how rigid the rocket
--- feels. All keys are optional — delete one and the default takes over.
---   frequencyHz    spring stiffness of every part-to-part weld.
---                  Higher = stiffer connection (less sag/flex), but too high
---                  can make the solver jitter.  Sane range 12..25 (must stay
---                  below half the 60 Hz physics rate).  (was 12.0)
---   dampingRatio   weld damping: 1.0 = critically damped (no elastic
---                  oscillation), >1 = over-damped.  Below ~0.9 the rocket
---                  visibly wobbles after burns/turns.  (was 1.05)
+-- weld joints; these three values control how rigid the rocket feels. All
+-- keys are optional — delete one and the default takes over.
+--   frequencyHz    0 = fully rigid weld (default since v2026.07.31): no
+--                  linear/angular compliance, breakForce detection unchanged.
+--                  >0 = spring-damper weld (soft connections sag and twist
+--                  visibly under heavy shear loads; must stay below half the
+--                  60 Hz physics rate).
+--   dampingRatio   weld damping (only when frequencyHz>0): 1.0 = critically
+--                  damped, >1 = over-damped.
 --   angularDamping per-part rotational damping (Box2D body property, 0=none).
 --                  Round 12: raised 0.08 -> 0.6 because the control.lua law is
 --                  pure proportional (gimbal = clamped heading error, no
@@ -73,7 +73,13 @@ steering = { kp = 1.8, ki = 0.5, kd = 1.2 }
 -- Round 23 (v2026.07.27): unified to 28 Hz / 1.0 / 1.0 for EVERY connection,
 -- matching joints.lua's DEFAULT_* constants; the per-part overrides shipped
 -- in earlier rounds (strut-1, dock-1, port-1) were removed.
-joints = { frequencyHz = 28.0, dampingRatio = 1.0, angularDamping = 1.0 }
+-- Round 32 (v2026.07.31): frequencyHz 28 -> 0 (fully RIGID weld). Probe 19
+-- root-caused the heavy parallel-booster twist: the 28 Hz spring deflects
+-- millimeters-to-centimeters under ~100 kN shear couples, so side boosters
+-- visibly leaned ~5 deg at full throttle regardless of solver iterations.
+-- 0 Hz = motorless rigid weld; breakForce detection is unchanged (reaction-
+-- force based). Solver iterations are now FIXED at 24/4 for all ships.
+joints = { frequencyHz = 0.0, dampingRatio = 1.0, angularDamping = 1.0 }
 
 -- Per-part override (round 9): a part's own Lua script may call
 --   part:setJointParams{frequencyHz=…, dampingRatio=…, angularDamping=…}
@@ -82,7 +88,7 @@ joints = { frequencyHz = 28.0, dampingRatio = 1.0, angularDamping = 1.0 }
 -- frequencyHz wins — the stiffer side rules the connection — and its
 -- dampingRatio comes along. angularDamping applies to the part's own body.
 -- (Round 23: no shipped part uses this anymore — all connections use the
--- unified 28 / 1.0 / 1.0 above.)
+-- unified 0 / 1.0 / 1.0 above.)
 --
 -- Per-connection rules (round 11): mod/joints.lua decides the final
 -- frequencyHz / dampingRatio / angularDamping / breakForce of EVERY weld and

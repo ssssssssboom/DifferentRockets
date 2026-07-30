@@ -1329,23 +1329,6 @@ public class EditorScreen extends ScreenAdapter {
         outB.set(px + bx, py + by);
     }
 
-    /** Clamp the along-segment component of (px,py) to the segment's own
-     *  interval — after grid quantization the anchor must still lie INSIDE
-     *  the (shrunk) valid region, or the contact falls out of the decision
-     *  region and the part appears to slide freely. */
-    private static Vector2 clampAlongSegment(float px, float py, Vector2 a, Vector2 b, Vector2 out) {
-        float abx = b.x - a.x, aby = b.y - a.y;
-        float len2 = abx * abx + aby * aby;
-        if (len2 < 1e-9f) return out.set(px, py);
-        float inv = 1f / (float) Math.sqrt(len2);
-        float ux = abx * inv, uy = aby * inv;
-        float s = px * ux + py * uy;
-        float sA = a.x * ux + a.y * uy, sB = b.x * ux + b.y * uy;
-        float lo = Math.min(sA, sB), hi = Math.max(sA, sB);
-        float q = Math.max(lo, Math.min(hi, s));
-        return out.set(px + ux * (q - s), py + uy * (q - s));
-    }
-
     /** Smoke-test hook (round 11 item 5): snap as if dragging typeId to (px,py). */
     public Vector2 snapForTest(float px, float py, int rot, String typeId, int ignoreIndex) {
         PartType t = PartList.get(typeId);
@@ -1417,24 +1400,55 @@ public class EditorScreen extends ScreenAdapter {
         lastSnapWin.part = -1;
     }
 
-    /** Snap correction for one specific attach pair (same rules as snap():
-     *  edge-type pairs quantize the free slide along the mating segment,
-     *  then clamp into the shrunk valid interval — strictly discrete, the
-     *  anchor can never ride past the decision region). */
+    /** Quantize the projection of CONTACT POINT p along segment (a,b) to the
+     *  EDGE_SNAP_STEP grid, clamped into the segment's own (shrunk) interval.
+     *  Returns the grid coordinate s along the segment direction. */
+    private static float quantizeClampContactS(Vector2 p, Vector2 a, Vector2 b) {
+        float abx = b.x - a.x, aby = b.y - a.y;
+        float len2 = abx * abx + aby * aby;
+        if (len2 < 1e-9f) return 0; // degenerate: never called for point attaches
+        float inv = 1f / (float) Math.sqrt(len2);
+        float ux = abx * inv, uy = aby * inv;
+        float s = p.x * ux + p.y * uy;
+        float q = (float) (Math.round(s / (double) Attach.EDGE_SNAP_STEP) * Attach.EDGE_SNAP_STEP);
+        float sA = a.x * ux + a.y * uy, sB = b.x * ux + b.y * uy;
+        float lo = Math.min(sA, sB), hi = Math.max(sA, sB);
+        return Math.max(lo, Math.min(hi, q));
+    }
+
+    /** World point on segment (a,b) at direction-coordinate s. */
+    private static Vector2 pointOnSeg(Vector2 a, Vector2 b, float s, Vector2 out) {
+        float abx = b.x - a.x, aby = b.y - a.y;
+        float inv = 1f / (float) Math.sqrt(abx * abx + aby * aby);
+        float ux = abx * inv, uy = aby * inv;
+        float sA = a.x * ux + a.y * uy;
+        return out.set(a.x + ux * (s - sA), a.y + uy * (s - sA));
+    }
+
+    /** Snap correction for one specific attach pair. Edge-type pairs quantize
+     *  the free slide DISCRETELY — but the quantity that is quantized and
+     *  clamped is the CONTACT POINT's projection on the edge, never the part
+     *  CENTER's. (Round 12 bug: for point↔edge pairs like a 6000L Top point
+     *  vs another tank's RightSide, the Top attach sits 8 m off the part
+     *  center; quantize+clamp of the center's projection forced the contact
+     *  back to the edge's mid-region — the part teleported to the edge CENTER
+     *  instead of sliding along the edge.) */
     private Vector2 snapCorrection(float px, float py, PartType.AttachPoint apM,
                                    PartType.AttachPoint apO, Vector2 ma, Vector2 mb,
                                    Vector2 oa, Vector2 ob, Vector2 cm, Vector2 co) {
-        float nx = px + (co.x - cm.x), ny = py + (co.y - cm.y);
-        Vector2 qn = new Vector2();
         if (apO.edge != PartType.AttachPoint.EDGE_NONE) {
-            Attach.quantizeAlongSegment(nx, ny, oa, ob, qn);
-            return clampAlongSegment(qn.x, qn.y, oa, ob, new Vector2());
+            // moving contact cm -> grid/clamped point on the TARGET edge
+            float s = quantizeClampContactS(co, oa, ob);
+            Vector2 target = pointOnSeg(oa, ob, s, new Vector2());
+            return new Vector2(px + (target.x - cm.x), py + (target.y - cm.y));
         }
         if (apM.edge != PartType.AttachPoint.EDGE_NONE) {
-            Attach.quantizeAlongSegment(nx, ny, ma, mb, qn);
-            return clampAlongSegment(qn.x, qn.y, ma, mb, new Vector2());
+            // target contact co fixed -> grid/clamped point on the MOVING edge
+            float s = quantizeClampContactS(cm, ma, mb);
+            Vector2 moving = pointOnSeg(ma, mb, s, new Vector2());
+            return new Vector2(px + (co.x - moving.x), py + (co.y - moving.y));
         }
-        return new Vector2(nx, ny);
+        return new Vector2(px + (co.x - cm.x), py + (co.y - cm.y));
     }
 
     /** All candidate attach pairs within the snap radius, nearest first. */

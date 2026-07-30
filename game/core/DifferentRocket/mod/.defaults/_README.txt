@@ -1,3 +1,3 @@
-´ËÄ¿Â¼ÎªÓÎÏ·Ä¬ÈÏ½Å±¾µÄ²Î¿¼¸±±¾£¬ÓÃÓÚ×Ô¶¯¸üĞÂÅĞ¶¨£¬ÇëÎğĞŞ¸Ä¡£
+æ­¤ç›®å½•ä¸ºæ¸¸æˆé»˜è®¤è„šæœ¬çš„å‚è€ƒå‰¯æœ¬ï¼Œç”¨äºè‡ªåŠ¨æ›´æ–°åˆ¤å®šï¼Œè¯·å‹¿ä¿®æ”¹ã€‚
 This directory holds reference copies of the bundled defaults,
 used by the auto-updater. DO NOT EDIT anything here.

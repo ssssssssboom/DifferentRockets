@@ -1,4 +1,4 @@
--- v2026.07.30.3
+-- v2026.07.30.4
 -- ============================================================================
 -- flame.lua — 引擎尾焰渲染：气压驱动的羽流膨胀 + 风场剪切（玩家可改）
 -- ============================================================================
@@ -289,9 +289,11 @@ function drawShock(sctx)
 
   if sctx.sharp then
     -- ============ 附体斜激波：多层锥面渐变 ============
-    -- v2026.07.30.3：锥长 +40%（锥角 sin(μ)=1/M 不变，spread 随 len 等比），
-    -- 层数 5 -> 9，衰减指数 2 -> 2.2（更平滑的下游淡出）
-    local len = math.min(half / tanMu * 2.2 + half * 2.8, half * 14 + 42)
+    -- v2026.07.30.4：夸张化——可见范围远超箭体直径（真实火箭再入/试飞
+    -- 参考）。锥长随马赫数增长（涡街/尾迹尺度感），锥角 sin(μ)=1/M 不变；
+    -- 高强度时（高马赫+足够气压）在最外层叠加更宽的羽状裙边扩散。
+    local len = math.min(half / tanMu * (2.2 + 1.1 * mach) + half * 4,
+                         half * 20 + 60)
     local spread = len * tanMu
     local N = 9
     for i = 1, N do
@@ -316,6 +318,35 @@ function drawShock(sctx)
         end
       end
     end
+    -- 羽状裙边（v2026.07.30.4）：高强度时主锥外再铺两层更宽更淡的扩散裙，
+    -- 视觉上远超箭体尺寸；强度门控使其只在高马赫+稠密大气出现
+    local skirt = clamp((a0 - 0.35) / 0.65, 0, 1)
+    if skirt > 0.01 then
+      local M = 3
+      for i = 1, M do
+        local f0 = 0.25 + 0.75 * (i - 1) / M
+        local f1 = 0.25 + 0.75 * i / M
+        local wide = 1.7 + 0.5 * i                       -- 裙层逐层外扩
+        local a = a0 * skirt * 0.10 * (1 - f0) ^ 1.6
+                  * shockShimmer(0.5 + f0, t, phase + 2.0)
+        if a > 0.003 then
+          for sgn = -1, 1, 2 do
+            local bx0 = x0 + dx * len * f0
+            local by0 = y0 + dy * len * f0
+            local bx1 = x0 + dx * len * f1
+            local by1 = y0 + dy * len * f1
+            local ox0 = px * spread * f0 * wide * sgn
+            local oy0 = py * spread * f0 * wide * sgn
+            local ox1 = px * spread * f1 * wide * sgn
+            local oy1 = py * spread * f1 * wide * sgn
+            draw.triangle(bx0, by0, bx0 + ox0, by0 + oy0, bx1 + ox1, by1 + oy1,
+                          0.80, 0.90, 1.0, a)
+            draw.triangle(bx0, by0, bx1 + ox1, by1 + oy1, bx1, by1,
+                          0.80, 0.90, 1.0, a * 0.6)
+          end
+        end
+      end
+    end
     -- 亮前沿线（锥面前缘，细长三角）
     for sgn = -1, 1, 2 do
       local wsp = 0.08 * half
@@ -328,13 +359,13 @@ function drawShock(sctx)
   else
     -- ============ 脱体弓形激波：弧形亮带 ============
     -- 脱体距离 δ：随马赫数升高而减小（趋于附体）。
-    -- v2026.07.30.3：整体尺度放大（δ×1.35、弧宽 half*4 -> half*6、
-    -- 激波层稍厚），弧段 12 -> 22，径向 2 层 -> 3 层平滑过渡，
-    -- 两翼衰减改为高斯（更柔和）。δ 的物理公式（∝0.9/√(M-1+0.05)）不变。
-    local stand = half * 1.35 * clamp(0.9 / math.sqrt(mach - 1 + 0.05), 0.25, 2.0)
-    local band = 0.26 * half * (1 + 0.4 / mach)          -- 激波层厚度
-    local S = half * 6                                    -- 横向绘制范围
-    local K = 22
+    -- v2026.07.30.4：夸张化——弓形波尺度远超箭体直径（δ×2.4、横向范围
+    -- half×(8+2M)、辉光大幅放大），高马赫时弧更宽；δ 的物理公式
+    -- （∝0.9/√(M-1+0.05)）与下游回扫方向不变。
+    local stand = half * 2.4 * clamp(0.9 / math.sqrt(mach - 1 + 0.05), 0.25, 2.0)
+    local band = 0.30 * half * (1 + 0.4 / mach)          -- 激波层厚度
+    local S = half * (8 + 2 * mach)                       -- 横向范围随马赫数外扩
+    local K = 28
     -- 弧形状（v2026.07.30.2 方向修正）：顶点在迎风最前（脱体 δ），两翼向
     -- 【下游回扫】——近轴抛物线过渡、远场渐近马赫线（每单位横向后退 1/tanμ），
     -- 裹住箭体肩部。旧版两翼错画成继续向前（上风侧）卷，看起来整支箭的
@@ -353,8 +384,8 @@ function drawShock(sctx)
       local s0 = -S + (2 * S * k / K)
       local s1 = -S + (2 * S * (k + 1) / K)
       local smid = (s0 + s1) / 2
-      -- 中心最强，两翼高斯衰减；叠扰动条纹
-      local a = a0 * 0.42 * math.exp(-((smid / half) * 0.55) ^ 2) * shockShimmer(k / K, t, phase)
+      -- 中心最强，两翼高斯衰减（随加宽的 S 放宽）；叠扰动条纹
+      local a = a0 * 0.42 * math.exp(-((smid / half) * 0.32) ^ 2) * shockShimmer(k / K, t, phase)
       if a > 0.004 then
         for _, row in ipairs(ROWS) do
           local e0, e1, amul = row[1] * band, row[2] * band, row[3]
@@ -367,9 +398,18 @@ function drawShock(sctx)
         end
       end
     end
-    -- 滞止区辉光：弧内侧一小片更亮的压缩区
+    -- 滞止区辉光：弧内侧压缩区（v2026.07.30.4 放大）
     local gx, gy = pt(0, band * 0.5)
-    draw.sprite("glow", gx, gy, half * 2.8, half * 1.5, 0,
+    draw.sprite("glow", gx, gy, half * 5.5, half * 2.6, 0,
                 a0 * 0.34, 0.9, 0.95, 1.0)
+    -- 两翼末梢羽状辉光：高强度时弧肩两侧各一团大范围淡辉
+    local skirt = clamp((a0 - 0.35) / 0.65, 0, 1)
+    if skirt > 0.01 then
+      for sgn = -1, 1, 2 do
+        local wx, wy = pt(S * 0.55 * sgn, band * 0.8)
+        draw.sprite("glow", wx, wy, half * 7, half * 3.2, 0,
+                    a0 * skirt * 0.16, 0.82, 0.90, 1.0)
+      end
+    end
   end
 end

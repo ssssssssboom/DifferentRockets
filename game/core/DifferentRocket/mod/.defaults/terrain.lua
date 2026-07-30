@@ -1,4 +1,4 @@
--- v2026.07.25.1
+-- v2026.07.30
 -- ============================================================================
 -- terrain.lua — planet terrain generation (PLAYER-EDITABLE)
 -- ============================================================================
@@ -86,20 +86,24 @@ specialTerrains = {
 --   flattenPad.enabled     master switch (true)
 --   flattenPad.angleDeg    pad center angle in degrees (90 = spawn site)
 --   flattenPad.halfWidthM  half-width of the leveled area in meters of
---                          surface arc (120; round 21: was 24 — a 48 m pad
---                          on the ~0.4-grade natural slope next to the 91-93
---                          deg mountain band left the spawn area sloped).
+--                          surface arc (12000; round 24: was 120 — when the
+--                          pad target became exact datum 0, a 240 m blend
+--                          would have dug a ~2 km deep crater with vertical
+--                          walls around the spawn site; 12 km keeps the
+--                          smoothstep rim at a ~14 deg max slope).
 --                          Heights blend back to the
---                          natural terrain with a smoothstep across this
---                          half-width, so pad center is perfectly level and
---                          the rim joins the slopes tangentially.
+--                          unflattened terrain with a smoothstep across this
+--                          half-width; round 24: the pad center is at EXACT
+--                          datum (height precisely 0, ground-to-center ==
+--                          nominal radius), overriding noise AND
+--                          specialTerrains, and the rim joins tangentially.
 -- Meter->angle conversion needs planet radii; keep padRadii in sync with
 -- the radius= values in planets.lua (planets missing from the table are
 -- simply not flattened).
 flattenPad = {
   enabled = true,
   angleDeg = 90.0,
-  halfWidthM = 120.0,
+  halfWidthM = 12000.0,
 }
 local padRadii = {
   Sun = 69634200.0, Smercury = 243970.0, Smenus = 605180.0,
@@ -109,7 +113,6 @@ local padRadii = {
   Smaturn = 6026800.0, ["Titan Jr"] = 257600.0,
   Smuranus = 2555900.0, Smeptune = 2476400.0,
 }
-local padHeightCache = {} -- planetName -> natural height at the pad center
 -- ============================================================================
 -- Called by the chunk generator for BOTH the visible crust and the collision
 -- heightfield (one function, always in sync). Signature:
@@ -148,9 +151,10 @@ local padHeightCache = {} -- planetName -> natural height at the pad center
 -- mountain band 91-93 deg rose 4.8 km in a single sample = the "cliff/step"
 -- players reported) and the 4-octave noise's finest feature (~6 deg) was much
 -- WIDER than the 2 deg band, leaving the mesa top flat. Now: 7 octaves
--- (finest ~0.6 deg features) and every band boundary is smoothstep-blended
--- over up to 1.2 deg (capped at half the band width) toward the neighboring
--- band, so edges are ramps and narrow bands stay rugged.
+-- (finest ~0.6 deg features) and every band edge smoothsteps over up to 1.2
+-- deg (capped at half the band width) INSIDE the band (round 24: the blend
+-- no longer straddles the edge — band influence is strictly confined to
+-- [startAngle, endAngle]), so edges are ramps and narrow bands stay rugged.
 -- Round 21: the single-nearest-boundary blend was replaced by continuous
 -- per-band membership weights inside baseTerrainHeight below (see there).
 
@@ -207,17 +211,17 @@ local function baseTerrainHeight(planetName, angleRad)
   end
 
   -- Round 21 fix (spawn-pad crack): the old code blended across only the
-  -- SINGLE nearest band boundary. Exactly midway between two boundaries
-  -- (the Smearth spawn site at 90 deg sits at the midpoint of the ocean
-  -- band's 89 deg end and the mountain band's 91 deg start) the "nearest"
-  -- boundary flips and the two sides blend DIFFERENT band pairs with
-  -- different rims — a ~65-80 m height discontinuity that the 24 m pad
-  -- flatten could not cover. Now every band contributes a smooth
-  -- membership weight (0 outside past the rim, 1 inside past the rim,
-  -- smoothstep across both edges) and the result is the weighted mix of
-  -- all band heights plus the remaining default-band share — continuous
-  -- everywhere, including boundary-overlap zones, and identical to the old
-  -- heights deep inside any band.
+  -- SINGLE nearest band boundary; exactly midway between two boundaries the
+  -- "nearest" boundary flips and the two sides blend DIFFERENT band pairs —
+  -- a ~65-80 m height discontinuity at the Smearth spawn site (90 deg).
+  -- Round 24 fix (strict band confinement): the round-21 membership weight
+  -- was smooth01(d/rim*0.5+0.5), which is 0.5 AT the boundary and >0 up to
+  -- `rim` degrees OUTSIDE [startAngle, endAngle] — mountain/ocean bands
+  -- leaked beyond their authored range. Now the weight is 0 AT and OUTSIDE
+  -- every edge and rises to 1 over `rim` degrees INSIDE the band: every
+  -- band's influence — including its transition zone — is strictly confined
+  -- to [startAngle, endAngle]; outside, the height is exactly the default
+  -- band (which itself joins continuously at the edge since w=0 there).
   local h, wsum = 0.0, 0.0
   for _, r in ipairs(info.ranges) do
     local s = r.startAngle % 360
@@ -226,7 +230,7 @@ local function baseTerrainHeight(planetName, angleRad)
     if rim > 1e-6 then
       local dS = (deg - s + 540) % 360 - 180  -- >0 inside (CCW of start edge)
       local dE = (e - deg + 540) % 360 - 180  -- >0 inside (CW of end edge)
-      local w = smooth01(dS / rim * 0.5 + 0.5) * smooth01(dE / rim * 0.5 + 0.5)
+      local w = smooth01(dS / rim) * smooth01(dE / rim)
       if w > 0 then
         h = h + w * bandHeight(r.minHeight, r.maxHeight)
         wsum = wsum + w
@@ -238,8 +242,13 @@ local function baseTerrainHeight(planetName, angleRad)
   return h + wdef * bandHeight(info.minHeight, info.maxHeight) + micro
 end
 
-function terrainHeight(planetName, angleRad)
-  local h = baseTerrainHeight(planetName, angleRad)
+-- Round 24 (v2026.07.30): the pad now flattens toward EXACT datum — height
+-- precisely 0 at the pad angle (ground distance to planet center == nominal
+-- radius), overriding natural noise AND specialTerrains. The smoothstep
+-- factor s is exactly 0 at the pad angle and exactly 1 at/ beyond the rim,
+-- so heights blend back to whatever the unflattened terrain is across
+-- halfWidthM with a tangential join.
+local function padFlatten(planetName, angleRad, h)
   if not flattenPad.enabled then return h end
   local radius = padRadii[planetName]
   if radius == nil or radius <= 0 then return h end
@@ -253,16 +262,14 @@ function terrainHeight(planetName, angleRad)
   local t = math.abs(dA) / halfA
   if t >= 1 then return h end
 
-  -- natural height at the pad center (cached; deterministic anyway)
-  local cacheKey = planetName .. "@" .. tostring(flattenPad.angleDeg)
-  local hc = padHeightCache[cacheKey]
-  if hc == nil then
-    hc = baseTerrainHeight(planetName, padA)
-    padHeightCache[cacheKey] = hc
-  end
-  -- smoothstep blend: 0 at pad center (level), 1 at the rim (natural)
+  -- smoothstep blend: exactly 0 at pad center (datum), 1 at the rim
   local s = t * t * (3 - 2 * t)
-  return hc + (h - hc) * s
+  return h * s
+end
+
+function terrainHeight(planetName, angleRad)
+  local h = baseTerrainHeight(planetName, angleRad)
+  return padFlatten(planetName, angleRad, h)
 end
 
 -- ============================================================================
@@ -275,8 +282,10 @@ end
 --               { name, radius, minHeight, maxHeight, noise, ranges })
 --       x       arc position in meters along the surface, from angle 0
 --
--- Default: natural terrain (terrainHeight above, including pad flattening)
--- with specialTerrains keypoint regions spliced in.
+-- Default: natural terrain (baseTerrainHeight) with specialTerrains keypoint
+-- regions spliced in (each strictly confined to center +/- range), and the
+-- launch-pad datum flatten applied LAST (round 24) so the spawn angle is
+-- exactly height 0 regardless of noise or regions.
 -- ============================================================================
 
 -- Deterministic absolute jitter for special regions, in [-1,1]: 3 octaves of
@@ -298,11 +307,19 @@ end
 
 function surfaceHeight(info, x)
   local R = info.radius
-  local natural = terrainHeight(info.name, x / R)
+  local angleRad = x / R
+  -- Round 24: use the UNFLATTENED natural height here; the pad flatten is
+  -- applied once at the very end so it overrides specialTerrains too —
+  -- the spawn angle's surface height is exactly datum (0) no matter what.
+  local natural = baseTerrainHeight(info.name, angleRad)
+  local h = natural
   local regions = specialTerrains[info.name]
   if regions ~= nil then
     for i, rg in ipairs(regions) do
       local d = math.abs(x - rg.center)
+      -- STRICT confinement (round 24): a region — keypoints, ramps, jitter
+      -- and the natural-blend rim — exists ONLY inside |x - center| < range;
+      -- at and beyond the boundary the height is exactly natural terrain.
       if d < rg.range then
         -- keypoint base: smoothstep interpolation between neighbors. Round 21
         -- fix (item A2): instead of clamping to the endpoint heights outside
@@ -357,9 +374,13 @@ function surfaceHeight(info, x)
           local t = (edge - edge0) / blendFrac
           w = 1.0 - t * t * (3 - 2 * t)
         end
-        return R + natural + (special - natural) * w
+        h = natural + (special - natural) * w
+        break
       end
     end
   end
-  return R + natural
+  -- Round 24: pad flatten LAST (overrides specialTerrains as well), so the
+  -- spawn angle's height above datum is exactly 0 — the ground under the
+  -- freshly spawned ship is at precisely the nominal planet radius.
+  return R + padFlatten(info.name, angleRad, h)
 end

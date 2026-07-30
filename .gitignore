@@ -39,3 +39,6 @@ game/core/assets/Sandboxs/
 rocket-plume-cfd/node_modules/
 rocket-plume-cfd/dist/
 rocket-plume-cfd/vite.log
+game/core/DifferentRocket/Ships/
+game/core/DifferentRocket/Sandboxs/
+game/core/DifferentRocket/save/

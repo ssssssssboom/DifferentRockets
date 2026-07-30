@@ -22,7 +22,7 @@ import java.util.Map;
  */
 public class GameWorld {
 
-    public static final float PHYS_DT = 1f / 60f;
+    public static final float PHYS_DT = 1f / 120f;
     /**
      * Solver iteration counts, FIXED for every ship regardless of size
      * (owner requirement, round 32: physical consistency — the same structure
@@ -671,7 +671,16 @@ public class GameWorld {
             // here forces superWarp() to recompute from the LIVE state on
             // the next super-warp entry.
             wtCount = 0;
-            int steps = Math.max(1, Math.min(8, Math.round(frameDt * warp / PHYS_DT)));
+            // Round 33: PHYS_DT 1/60 -> 1/120. Elastic weld joints (real
+            // frequencyHz semantics restored per owner) must live well below
+            // the Nyquist limit of HALF the step rate: at 60 Hz stepping the
+            // ceiling was ~30 Hz, and a <=28 Hz spring deflected ~26 mm per
+            // weld under the triple-booster's ~100 kN shear couples (visible
+            // ~5 deg lean). At 120 Hz a ~48-56 Hz spring is stably solvable,
+            // cutting static deflection 4x into the invisible range while the
+            // joint stays a genuine spring-damper. Substep cap doubles so a
+            // 60 fps frame still covers warp 4.
+            int steps = Math.max(1, Math.min(16, Math.round(frameDt * warp / PHYS_DT)));
             for (int i = 0; i < steps; i++) {
                 substep(PHYS_DT);
             }

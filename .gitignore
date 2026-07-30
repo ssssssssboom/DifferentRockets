@@ -36,3 +36,6 @@ game/core/assets/save/
 /Show_Rocket
 /Show_sandbox
 game/core/assets/Sandboxs/
+rocket-plume-cfd/node_modules/
+rocket-plume-cfd/dist/
+rocket-plume-cfd/vite.log

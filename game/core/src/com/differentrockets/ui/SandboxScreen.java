@@ -2008,6 +2008,27 @@ public class SandboxScreen extends ScreenAdapter {
             game.shapes.circle((float) (p.pos.x - mapCX), (float) (p.pos.y - mapCY),
                     (float) p.radius, 64);
         }
+        // terrain-aware surface outline (fix: landed ships floated above the
+        // map — the circles above are drawn at the DATUM radius, but the real
+        // ground is radius + heightAt(angle) per terrain.lua's surfaceHeight).
+        // Sampled per frame only for planets whose relief is visible at the
+        // current zoom; all math double against (mapCX, mapCY) as usual.
+        for (Planet p : game.world.planets) {
+            double relief = Math.max(Math.abs(p.maxHeight), Math.abs(p.minHeight));
+            if (relief <= 0 || relief / mapCam.viewportHeight < 0.003) continue;
+            Color c = p.mapColor;
+            game.shapes.setColor(c.r, c.g, c.b, 0.95f);
+            final int N = 128;
+            float prevX = 0, prevY = 0;
+            for (int i = 0; i <= N; i++) {
+                double ang = i * (2 * Math.PI) / N;
+                double r = p.radius + p.heightAt(ang);
+                float x = (float) (p.pos.x + Math.cos(ang) * r - mapCX);
+                float y = (float) (p.pos.y + Math.sin(ang) * r - mapCY);
+                if (i > 0) game.shapes.line(prevX, prevY, x, y);
+                prevX = x; prevY = y;
+            }
+        }
         game.shapes.end();
 
         // ship orbit prediction + markers

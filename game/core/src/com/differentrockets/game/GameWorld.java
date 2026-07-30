@@ -131,6 +131,33 @@ public class GameWorld {
     private int wtHint;           // monotone sampling hint (times only grow)
     private final OrbitPredictor warpPred = new OrbitPredictor();
 
+    // ---- grounded super-warp pin (round 30) ----
+    // While the active ship rides a planet at >4x warp its surface-relative
+    // offset is latched ONCE and re-applied exactly every frame — see
+    // superWarp's riding branch for why the old frameVel-tracking gate let
+    // landed ships fall through the crust.
+    private boolean rideLatched;
+    private Planet ridePlanet;
+    private double rideRelX, rideRelY;
+
+    // ---- per-ship super-warp trajectories (round 30) ----
+    // Non-active ships get the SAME precomputed-trajectory treatment as the
+    // active ship (the old chunked semi-implicit Euler drifted and could
+    // tunnel into planets over long warps). Arrays are per-ship and lazily
+    // allocated; dtScale stretches the adaptive step at extreme warp so a
+    // modest sample count still spans several frames.
+    private static final int WARP_TRAJ_MAX = 8192; // 5 × 8192 × 8 B ≈ 320 KB per ship
+    private static final class WarpTraj {
+        final double[] x = new double[WARP_TRAJ_MAX];
+        final double[] y = new double[WARP_TRAJ_MAX];
+        final double[] vx = new double[WARP_TRAJ_MAX];
+        final double[] vy = new double[WARP_TRAJ_MAX];
+        final double[] t = new double[WARP_TRAJ_MAX];
+        int count, warp = -1, parts = -1, hint;
+        boolean impacted;
+    }
+    private final java.util.IdentityHashMap<Ship, WarpTraj> warpTrajs = new java.util.IdentityHashMap<>();
+
     public GameWorld() {
         // round 14 (lone-pod sinking): doSleep MUST be off. A sleeping body
         // ignores forces and is not ejected when the (teleported/kinematic)
@@ -588,9 +615,20 @@ public class GameWorld {
                     s.originVel.add(cv.x, cv.y);
                     s.forEachBody(b -> b.setLinearVelocity(0, 0));
                 } else {
-                    // reactivate: give bodies the ship's frame-relative velocity
-                    s.forEachBody(b -> b.setLinearVelocity((float) s.originVel.x, (float) s.originVel.y));
-                    s.originVel.set(0, 0);
+                    // reactivate: give bodies the ship's frame-relative velocity.
+                    // Round 30 (two-ship lock-up fix, probe13 S2b): dumping the
+                    // FULL originVel into bodies when it exceeds Box2D's
+                    // max-translation clamp (~120 u/s) made Box2D scale the
+                    // velocity back mid-step, silently destroying the excess
+                    // (a -234 u/s reactivation came out as -120). Bodies get
+                    // only the safe share; the remainder stays in originVel,
+                    // which substep() now integrates for physical ships too.
+                    double ovx = s.originVel.x, ovy = s.originVel.y;
+                    double osp = Math.hypot(ovx, ovy);
+                    double keep = osp > BODY_VEL_SAFE ? BODY_VEL_SAFE / osp : 1.0;
+                    final float bvx = (float) (ovx * keep), bvy = (float) (ovy * keep);
+                    s.forEachBody(b -> b.setLinearVelocity(bvx, bvy));
+                    s.originVel.set(ovx - bvx, ovy - bvy);
                 }
                 s.setBodiesActive(!rails);
             }
@@ -685,42 +723,76 @@ public class GameWorld {
      * translated so the active ship sits exactly on the sampled position.
      * Reaching a surface-impact endpoint hands control back to physics
      * (warp = 1) at the impact point with the impact velocity. Parked on
-     * the ground the trajectory is meaningless — the original riding logic
-     * (frame rides the planet, time just runs fast) is kept. Non-active
-     * ships keep their existing chunked rails advance (warpRailsShip) with
-     * the frame's dv compensated once per frame.
+     * the ground the trajectory is meaningless — the ship is PINNED to a
+     * latched surface-relative offset (round 30; the old riding gate let
+     * landed ships slip onto bogus impact trajectories and fall through
+     * the crust). Non-active ships get their own precomputed trajectories
+     * (advanceRailsShipWarp, round 30) instead of the old chunked Euler,
+     * with the frame's dv compensated once per frame.
      */
     private void superWarp(double simDt) {
         if (active == null) { time += simDt; sun.updateRails(time); return; }
+        warpTrajs.keySet().removeIf(k -> !ships.contains(k)); // GC dead ships' caches
         Vec2d acom = active.getUniversePos();
         Planet anp = nearestPlanetTo(acom.x, acom.y);
-        // parked on a surface? the frame rides the planet (unchanged logic)
+        // parked on a surface? the frame rides the planet. Round 30 (probe13
+        // S3): the old gate (alt<50 by BUILT-IN heights && |frameVel-planetVel|<1)
+        // rejected genuinely landed ships — a >0.5 u/s micro-jitter set
+        // landed=false, and lua-terrain vs heightAt mismatches blew the alt
+        // test — so the ship went onto a precomputed trajectory that instantly
+        // impacted, got placed BELOW the terrain, and fell through the crust
+        // at every warp level. The gate now trusts the landed flag (with a
+        // generous built-in-alt ceiling) and the riding branch PINS the ship
+        // to a latched surface spot instead of hoping frameVel tracks the
+        // planet at 250000x.
         boolean riding = false;
         if (anp != null) {
             double dx = acom.x - anp.pos.x, dy = acom.y - anp.pos.y;
-            double aAlt = Math.hypot(dx, dy) - anp.radius - anp.heightAt(Math.atan2(dy, dx));
-            double rvx = frameVel.x - anp.vel.x, rvy = frameVel.y - anp.vel.y;
-            riding = aAlt < 50.0 && Math.hypot(rvx, rvy) < 1.0;
+            double dist = Math.hypot(dx, dy);
+            double aAlt = dist - anp.radius - anp.heightAt(Math.atan2(dy, dx));
+            Vec2d sv = active.getUniverseVel();
+            double srx = sv.x - anp.vel.x, sry = sv.y - anp.vel.y;
+            double srel = Math.hypot(srx, sry);
+            // radial component (>0 = ascending): a rising ship must go onto
+            // its ballistic trajectory, but a ship SLIDING along the ground
+            // (probe13 S3: 5.75 u/s tangential slide set landed=false and the
+            // old gate rejected it -> impact trajectory -> through the crust)
+            // still counts as grounded.
+            double radial = dist > 1e-9 ? (srx * dx + sry * dy) / dist : 0;
+            riding = aAlt < 2000.0 && radial < 1.0
+                    && (active.landed || (aAlt < 60.0 && srel < 8.0));
         }
         if (riding) {
             wtCount = 0; // grounded: no valid trajectory, recompute on liftoff
-            double dvx = anp.vel.x - frameVel.x, dvy = anp.vel.y - frameVel.y;
+            if (!rideLatched || ridePlanet != anp) {
+                Vec2d c = active.getUniversePos();
+                rideRelX = c.x - anp.pos.x;
+                rideRelY = c.y - anp.pos.y;
+                ridePlanet = anp;
+                rideLatched = true;
+            }
+            time += simDt;
+            sun.updateRails(time);
+            // pin: put the active ship exactly back on its latched surface
+            // spot and lock the frame to the planet's velocity (round 30).
+            double tx = ridePlanet.pos.x + rideRelX, ty = ridePlanet.pos.y + rideRelY;
+            Vec2d cur = active.getUniversePos();
+            translateFrame(tx - cur.x, ty - cur.y);
+            double fvx = ridePlanet.vel.x - active.originVel.x;
+            double fvy = ridePlanet.vel.y - active.originVel.y;
+            double dvx = fvx - frameVel.x, dvy = fvy - frameVel.y;
             if (dvx != 0 || dvy != 0) {
                 for (Ship s : ships) {
                     if (s != active) { s.originVel.x -= dvx; s.originVel.y -= dvy; }
                 }
-                frameVel.add(dvx, dvy);
+                frameVel.set(fvx, fvy);
             }
-            time += simDt;
-            sun.updateRails(time);
-            double fx = frameVel.x * simDt, fy = frameVel.y * simDt;
-            origin.add(fx, fy);
             for (Ship s : ships) {
-                s.origin.add(fx, fy);
-                if (s != active) warpRailsShip(s, simDt);
+                if (s != active) advanceRailsShipWarp(s, time, simDt);
             }
             return;
         }
+        rideLatched = false;
 
         // low-frequency (re)compute: on entry, on warp-level change, on
         // staging (parts count), or when <20% of the trajectory remains.
@@ -774,16 +846,18 @@ public class GameWorld {
         double svx = d00 * wtX[lo] + d10 * wtVX[lo] + d01 * wtX[lo + 1] + d11 * wtVX[lo + 1];
         double svy = d00 * wtY[lo] + d10 * wtVY[lo] + d01 * wtY[lo + 1] + d11 * wtVY[lo + 1];
 
-        // advance the clock + planets in chunks while railing non-active ships
+        // advance the clock + planets in chunks (planet rails need the chunked
+        // cadence); ships are placed once per frame from their own precomputed
+        // trajectories below (round 30, item: every ship on a predicted orbit)
         double remain = target - time;
         while (remain > 1e-9) {
             double h = Math.min(remain, warpChunk(simDt));
             remain -= h;
             time += h;
             sun.updateRails(time);
-            for (Ship s : ships) {
-                if (s != active) warpRailsShip(s, h);
-            }
+        }
+        for (Ship s : ships) {
+            if (s != active) advanceRailsShipWarp(s, target, simDt);
         }
 
         // put the active ship exactly on the sampled state
@@ -812,6 +886,101 @@ public class GameWorld {
         double total = wtT[wtCount - 1] - wtT[0];
         if (total <= 0 || time < wtT[0] || time > wtT[wtCount - 1]) return false;
         return (wtT[wtCount - 1] - time) >= 0.2 * total;   // <20% left: rebuild
+    }
+
+    /**
+     * One non-active ship's super-warp advance (round 30): the ship's future
+     * is propagated ONCE by OrbitPredictor.computeWarp into its own per-ship
+     * cache (same velocity-Verlet, same ΣGM/r² law, same terrain-aware impact
+     * test as the active ship and the map line), then placed by cubic-Hermite
+     * sampling at the target time — a pure function of time, zero accumulated
+     * drift, replacing the old chunked semi-implicit Euler (warpRailsShip)
+     * which drifted on long warps. Parked-on-surface ships are pinned to
+     * their planet (the old warpRailsShip parked branch set the velocity but
+     * never moved the origin, so landed distant ships slowly drifted off
+     * their planet). A trajectory that ends in a surface impact hands its
+     * remainder to the chunked integrator, whose hard floor lands the ship.
+     */
+    private void advanceRailsShipWarp(Ship s, double target, double simDt) {
+        Vec2d com = s.getUniversePos();
+        Planet np = nearestPlanetTo(com.x, com.y);
+        if (np != null) {
+            double dx = com.x - np.pos.x, dy = com.y - np.pos.y;
+            double dist = Math.hypot(dx, dy);
+            double alt = dist - np.radius - np.heightAt(Math.atan2(dy, dx));
+            double uvx = s.originVel.x + frameVel.x - np.vel.x;
+            double uvy = s.originVel.y + frameVel.y - np.vel.y;
+            if (alt < 60.0 && Math.hypot(uvx, uvy) < 1.0) {
+                // parked: pin to the current surface-relative offset (round 30)
+                s.origin.x += (np.pos.x + dx) - com.x;
+                s.origin.y += (np.pos.y + dy) - com.y;
+                s.originVel.set(np.vel.x - frameVel.x, np.vel.y - frameVel.y);
+                return;
+            }
+        }
+        WarpTraj tr = warpTrajs.get(s);
+        if (tr == null) { tr = new WarpTraj(); warpTrajs.put(s, tr); }
+        double dtScale = Math.max(1.0, warp / 25000.0);
+        double total = tr.count >= 2 ? tr.t[tr.count - 1] - tr.t[0] : 0;
+        boolean valid = tr.count >= 2 && tr.warp == warp && tr.parts == s.parts.size()
+                && target >= tr.t[0] && total > 0
+                && (tr.t[tr.count - 1] - target) >= 0.2 * total;
+        if (!valid) {
+            tr.count = warpPred.computeWarp(this, s, dtScale, tr.x, tr.y, tr.vx, tr.vy, tr.t);
+            tr.impacted = warpPred.impacted;
+            tr.warp = warp;
+            tr.parts = s.parts.size();
+            tr.hint = 0;
+        }
+        if (tr.count < 2) return; // nothing to propagate: hold position
+        double tt = target;
+        if (tt >= tr.t[tr.count - 1]) {
+            if (tr.impacted) {
+                // hand the endpoint state to the ship, then let the chunked
+                // integrator (with its terrain hard floor) fly the remainder
+                double over = tt - tr.t[tr.count - 1];
+                placeOnWarpTraj(s, tr, tr.t[tr.count - 1]);
+                tr.count = 0; // endpoint consumed; recompute if still flying
+                double rem = over;
+                while (rem > 1e-9) {
+                    double h2 = Math.min(rem, warpChunk(simDt));
+                    rem -= h2;
+                    warpRailsShip(s, h2);
+                }
+                return;
+            }
+            tt = tr.t[tr.count - 1]; // out of samples: clamp, recompute next frame
+        }
+        placeOnWarpTraj(s, tr, tt);
+    }
+
+    /** Hermite-sample a non-active ship's warp trajectory and place the ship. */
+    private void placeOnWarpTraj(Ship s, WarpTraj tr, double tt) {
+        int lo = Math.min(tr.hint, tr.count - 2);
+        if (tt < tr.t[lo] || tt > tr.t[lo + 1]) {
+            int a = 0, b = tr.count - 1;
+            while (b - a > 1) {
+                int m = (a + b) >>> 1;
+                if (tr.t[m] <= tt) a = m; else b = m;
+            }
+            lo = a;
+        }
+        tr.hint = lo;
+        double t0 = tr.t[lo], span = tr.t[lo + 1] - t0;
+        double u = span > 0 ? (tt - t0) / span : 0;
+        double u2 = u * u, u3 = u2 * u;
+        double h00 = 2 * u3 - 3 * u2 + 1, h10 = u3 - 2 * u2 + u;
+        double h01 = -2 * u3 + 3 * u2, h11 = u3 - u2;
+        double sx = h00 * tr.x[lo] + h10 * span * tr.vx[lo] + h01 * tr.x[lo + 1] + h11 * span * tr.vx[lo + 1];
+        double sy = h00 * tr.y[lo] + h10 * span * tr.vy[lo] + h01 * tr.y[lo + 1] + h11 * span * tr.vy[lo + 1];
+        double d00 = (6 * u2 - 6 * u) / span, d10 = 3 * u2 - 4 * u + 1;
+        double d01 = (-6 * u2 + 6 * u) / span, d11 = 3 * u2 - 2 * u;
+        double svx = d00 * tr.x[lo] + d10 * tr.vx[lo] + d01 * tr.x[lo + 1] + d11 * tr.vx[lo + 1];
+        double svy = d00 * tr.y[lo] + d10 * tr.vy[lo] + d01 * tr.y[lo + 1] + d11 * tr.vy[lo + 1];
+        Vec2d cur = s.getUniversePos();
+        s.origin.x += sx - cur.x;
+        s.origin.y += sy - cur.y;
+        s.originVel.set(svx - frameVel.x, svy - frameVel.y);
     }
 
     /** One non-active ship's rails chunk during super-warp (frame-relative). */
@@ -878,6 +1047,20 @@ public class GameWorld {
         if (fx != 0 || fy != 0) {
             origin.add(fx, fy);
             for (Ship s : ships) s.origin.add(fx, fy);
+        }
+        // round 30 (two-ship lock-up fix): a PHYSICAL ship may carry velocity
+        // in originVel (velocityReanchor's clamp guard folds >100 u/s there,
+        // and rails->physical reactivation keeps the >safe remainder there —
+        // both to keep bodies under Box2D's max-translation clamp). Nobody
+        // integrated that channel for physical ships, so the ship's position
+        // froze relative to the frame (glued to the active ship) while its
+        // displayed speed kept growing. Integrate it here; rails ships do it
+        // inside integrateRails instead.
+        for (Ship s : ships) {
+            if (!s.onRails && (s.originVel.x != 0 || s.originVel.y != 0)) {
+                s.origin.x += s.originVel.x * h;
+                s.origin.y += s.originVel.y * h;
+            }
         }
         for (Ship s : ships) {
             if (s.onRails) s.integrateRails(h);

@@ -1,4 +1,4 @@
--- v2026.07.30.1
+-- v2026.07.30.2
 -- ============================================================================
 -- flame.lua — 引擎尾焰渲染：气压驱动的羽流膨胀 + 风场剪切（玩家可改）
 -- ============================================================================
@@ -328,14 +328,17 @@ function drawShock(sctx)
     local band = 0.22 * half * (1 + 0.4 / mach)          -- 激波层厚度
     local S = half * 4                                    -- 横向绘制范围
     local K = 12
-    -- 弧形状：中心脱体 δ，两翼按抛物线+线性渐近（趋马赫线）后掠
-    local function upAt(s)
+    -- 弧形状（v2026.07.30.2 方向修正）：顶点在迎风最前（脱体 δ），两翼向
+    -- 【下游回扫】——近轴抛物线过渡、远场渐近马赫线（每单位横向后退 1/tanμ），
+    -- 裹住箭体肩部。旧版两翼错画成继续向前（上风侧）卷，看起来整支箭的
+    -- 激波上下颠倒。
+    local function backAt(s)
       local a = math.abs(s)
-      return stand + (s * s) / (half * 1.6) + a * 0.2 / math.max(tanMu, 0.2)
+      return (s * s) / (half * 3.0) + a * 0.8 / math.max(tanMu, 0.25)
     end
     local function pt(s, extra)
-      return x0 + px * s + ux * (upAt(s) + extra),
-             y0 + py * s + uy * (upAt(s) + extra)
+      return x0 + px * s + ux * (stand + extra - backAt(s)),
+             y0 + py * s + uy * (stand + extra - backAt(s))
     end
     for k = 0, K - 1 do
       local s0 = -S + (2 * S * k / K)

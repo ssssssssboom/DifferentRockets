@@ -1,6 +1,6 @@
--- v2026.07.21
+-- v2026.07.30
 -- ============================================================================
--- flame.lua — 引擎尾焰渲染：贴图核心 + 粒子尾流（玩家可改）
+-- flame.lua — 引擎尾焰渲染：气压驱动的羽流膨胀 + 风场剪切（玩家可改）
 -- ============================================================================
 -- 每台运转中的引擎每帧调用一次。绘图 API（立即模式，由 Java 端合批）：
 --
@@ -11,7 +11,6 @@
 --         "glow"  软径向光斑（核心、马赫环、真空羽流）
 --         "smoke" 噪声烟团（中段烟羽）
 --         "spark" 硬质亮点（火花）
---       r,g,b 省略时为纯白。
 --   flame.emit{ tex="glow", x=, y=, vx=, vy=, life=, size0=, size1=,
 --               r=, g=, b=, a0=, a1=, drag= }
 --       发射一个世界坐标粒子（加法混合）。粒子池上限 600，满了回收最旧的。
@@ -21,13 +20,13 @@
 --       因此 4x warp 下速率稳定。
 --
 --   drawFlame(ctx) — 你要改的就是这个函数。ctx 字段：
---       ctx.x, ctx.y          喷口世界坐标（米）
+--       ctx.x, ctx.y          喷口世界坐标
 --       ctx.dirX, ctx.dirY    尾焰喷出方向的单位向量
 --       ctx.angle             喷口角度（弧度）
---       ctx.nozzleW           喷口宽度（米）
+--       ctx.nozzleW           喷口宽度
 --       ctx.throttle          焰级 0..1+（跟随油门）
 --       ctx.engineSize        PartList.xml 里引擎的 size 属性
---       ctx.engineHeight      引擎可见高度（米）
+--       ctx.engineHeight      引擎可见高度
 --       ctx.time              任务时间（秒）——做动画用
 --       ctx.dt                本帧模拟时长（秒，含 warp）——做发射预算用
 --       ctx.partId            每台引擎的稳定 id——做按引擎累积状态用
@@ -35,17 +34,20 @@
 --       ctx.ion               fuelType == 2 时为 true
 --       ctx.pressure          喷口处环境气压（1.0=海平面，0=真空）
 --       ctx.density           喷口处大气密度（kg/m³）
+--       ctx.mach              船体相对当地大气的马赫数（v2026.07.30 新增）
+--       ctx.windX, ctx.windY  来流方向单位向量（= -相对风，新增）
+--       ctx.relSpeed          相对气流速度（长度单位/秒，新增）
 --
--- 本默认脚本的分层结构（按气压过渡）：
---   * 任意高度：三角形激波锥铺底 + 轴向 glow 精灵串作准直核心，
---     核心颜色随真空度从橙白渐变到蓝白（橙→蓝移）；
---   * 海平面（pressure≈1）：核心下方出现 4 枚马赫环亮斑（glow 精灵），
---     p<0.12（约 15 km）完全消失；短命火花沿焰向喷溅；
---   * 中气压（p≈0.05..0.6）：喷口下游抛出带 drag 的烟团（smoke 贴图，
---     边减速边胀大变淡），模拟平流层凝结羽；
---   * 高空/真空：核心精灵变宽变淡、颜色偏蓝，额外发射 ±35° 稀疏
---     宽扇微粒（极淡蓝白长寿命），喷流欠膨胀；
---   * 离子引擎：细长蓝羽 + 稀疏高速蓝色火花，无烟。
+-- 物理模型（v2026.07.30 升级）：
+--   * 膨胀比：喷流半角随真空度张开（欠膨胀），低空收窄（过膨胀）——
+--     高空/真空中羽流大幅扩散变宽，低空收窄并带马赫环；
+--   * 马赫环：数量与亮度随气压上升（海平面 6 枚），同时受来流马赫数
+--     加成（超音速时环更亮更紧凑）；
+--   * 风场剪切：羽流下游被相对风吹弯——锥体末端与粒子速度按
+--     (dir*喷速 - wind*来流速度*卷吸系数) 合成，卷吸系数随密度衰减，
+--     真空中无介质、羽流不弯；
+--   * 船体激波锥由 Java 端绘制（SandboxScreen.drawShockCones，
+--     锥角 sin(μ)=1/M，气压低时淡出），本文件只管发动机羽流。
 -- 文件出错时回退到内置默认尾焰。保存即热重载（约 1 秒检查一次），无需重启。
 -- ============================================================================
 
@@ -57,10 +59,11 @@ end
 
 local function rr(a, b) return a + (b - a) * math.random() end
 
--- 从喷口沿 dir 方向、长度 len*lenF、根部半宽 half*widF 的锥（三角形）
-local function cone(ctx, len, half, lenF, widF, r, g, b, a)
-  local cx = ctx.x + ctx.dirX * len * lenF
-  local cy = ctx.y + ctx.dirY * len * lenF
+-- 从喷口沿 dir 方向、长度 len*lenF、根部半宽 half*widF 的锥（三角形），
+-- 末端按 (shx,shy) 剪切（风场弯曲）
+local function cone(ctx, len, half, lenF, widF, r, g, b, a, shx, shy)
+  local cx = ctx.x + ctx.dirX * len * lenF + (shx or 0) * lenF
+  local cy = ctx.y + ctx.dirY * len * lenF + (shy or 0) * lenF
   local px = -ctx.dirY * half * widF
   local py =  ctx.dirX * half * widF
   draw.triangle(ctx.x, ctx.y, cx + px, cy + py, cx - px, cy - py, r, g, b, a)
@@ -79,8 +82,6 @@ local function budget(id, stream, rate, dt)
   return n
 end
 
--- 粒子累积过多时（热重载等）防止表无限增长：条目数其实受引擎数限制，无需清理
-
 function drawFlame(ctx)
   local lvl = math.min(1, ctx.throttle)
   if lvl <= 0.01 then return end
@@ -94,10 +95,20 @@ function drawFlame(ctx)
   local engH = ctx.engineHeight
   local nw = ctx.nozzleW
   local engS = math.max(0.4, ctx.engineSize or 1)
-  local speed = engH * (6 + 7 * lvl)      -- 喷流速度（米/秒，视觉量级）
-  local len = engH * (1.0 + 2.2 * lvl) * (1 + 0.9 * vac ^ 1.3)
+  local speed = engH * (6 + 7 * lvl)      -- 喷流速度（视觉量级）
+  local len = engH * (1.0 + 2.2 * lvl) * (1 + 1.4 * vac ^ 1.2) -- 真空更长
   local half = nw * 0.5
   local phase = ctx.x * 0.37 + ctx.y * 0.11
+
+  -- 来流（v2026.07.30）：风剪切量 = 来流速度/喷速，卷吸随密度衰减；
+  -- 真空中无介质 -> 羽流不弯
+  local mach = ctx.mach or 0
+  local wx, wy = ctx.windX or 0, ctx.windY or 0
+  local rel = ctx.relSpeed or 0
+  local shear = clamp(rel / math.max(speed, 1), 0, 0.9) * (1 - vac * vac)
+  local shx, shy = wx * shear * len, wy * shear * len
+  -- 粒子风速增量（下风拖拽）
+  local wvx, wvy = wx * rel * 0.35 * (1 - vac * vac), wy * rel * 0.35 * (1 - vac * vac)
 
   -- 核心颜色：海平面橙白 -> 真空蓝白
   local coreR = 1.0
@@ -107,13 +118,13 @@ function drawFlame(ctx)
   -- ===================== 离子引擎：细蓝羽 + 高速蓝火花 =====================
   if ctx.ion then
     local iw = 1 + 0.8 * vac
-    cone(ctx, len, half, 1.0, 2.5 * iw, 0.45, 0.70, 1.0, 0.16)
-    cone(ctx, len, half, 0.8, 1.7 * iw, 0.55, 0.80, 1.0, 0.45)
+    cone(ctx, len, half, 1.0, 2.5 * iw, 0.45, 0.70, 1.0, 0.16, shx, shy)
+    cone(ctx, len, half, 0.8, 1.7 * iw, 0.55, 0.80, 1.0, 0.45, shx * 0.8, shy * 0.8)
     -- 准直蓝核心精灵
     for i = 0, 2 do
       local f = 0.18 + 0.25 * i
       local s = nw * (1.3 - 0.25 * i)
-      draw.sprite("glow", ctx.x + dx * len * f, ctx.y + dy * len * f,
+      draw.sprite("glow", ctx.x + dx * len * f + shx * f, ctx.y + dy * len * f + shy * f,
                   s, s, 0, 0.5 * lvl, 0.60, 0.85, 1.0)
     end
     -- 稀疏高速火花
@@ -123,7 +134,7 @@ function drawFlame(ctx)
       local ca, sa = math.cos(a), math.sin(a)
       local ex, ey = dx * ca - dy * sa, dx * sa + dy * ca
       flame.emit{ tex = "spark", x = ctx.x, y = ctx.y,
-                  vx = ex * speed * rr(1.6, 2.6), vy = ey * speed * rr(1.6, 2.6),
+                  vx = ex * speed * rr(1.6, 2.6) + wvx, vy = ey * speed * rr(1.6, 2.6) + wvy,
                   life = rr(0.3, 0.7), size0 = nw * 0.22, size1 = nw * 0.04,
                   r = 0.55, g = 0.75, b = 1.0, a0 = 0.7, a1 = 0 }
     end
@@ -132,34 +143,41 @@ function drawFlame(ctx)
 
   -- ===================== 化学引擎 =====================
 
-  -- 1) 铺底三角形：外层激波锥（真空中大幅张开变淡）
-  local expand = 1 + 5 * vac ^ 0.7
-  cone(ctx, len, half, 1.0, 2.5 * expand, 0.40, 0.60, 1.00, 0.15 * (1 - 0.75 * vac))
+  -- 1) 铺底三角形：外层羽流边界（真空中大幅张开变淡 = 欠膨胀）
+  local expand = 1 + 6 * vac ^ 0.7
+  cone(ctx, len, half, 1.0, 2.5 * expand, 0.40, 0.60, 1.00, 0.15 * (1 - 0.75 * vac), shx, shy)
+  -- 过膨胀挤压（低空）：核心比喷口还窄一点
+  if atmo > 0.3 then
+    cone(ctx, len, half, 0.55, 0.9 + 0.5 * vac, 1.0, 0.85, 0.6, 0.10 * atmo, shx * 0.55, shy * 0.55)
+  end
   -- 中压散射光晕：峰值 p≈0.3
   local scatter = math.exp(-((p - 0.3) / 0.18) ^ 2)
   if scatter > 0.05 then
-    cone(ctx, len, half, 0.9, 2.1 * (1 + 1.5 * vac), 1.00, 0.75, 0.50, 0.18 * scatter)
+    cone(ctx, len, half, 0.9, 2.1 * (1 + 1.5 * vac), 1.00, 0.75, 0.50, 0.18 * scatter, shx * 0.9, shy * 0.9)
   end
 
-  -- 2) 贴图核心：轴向 glow 精灵串（准直、亮、随油门呼吸）
+  -- 2) 贴图核心：轴向 glow 精灵串（准直、亮、随油门呼吸，随风微弯）
   local shimmer = 1 + 0.06 * math.sin(ctx.time * 11 + phase)
   local nseg = 4
   for i = 0, nseg - 1 do
     local f = (i + 0.5) / nseg
-    local cx = ctx.x + dx * len * f
-    local cy = ctx.y + dy * len * f
+    local cx = ctx.x + dx * len * f + shx * f
+    local cy = ctx.y + dy * len * f + shy * f
     local s = nw * (1.9 - 1.1 * f) * (1 + 0.9 * vac) * shimmer
     draw.sprite("glow", cx, cy, s, s, 0,
                 (0.85 - 0.55 * f) * lvl, coreR, coreG, coreB)
   end
 
-  -- 3) 马赫环：气压够高时核心下方的亮斑串；p=1 最强，p<0.12 消失
-  local md = clamp((p - 0.12) / 0.5, 0, 1)
+  -- 3) 马赫环：气压够高时核心下方的亮斑串；超音速来流让环更亮更紧凑，
+  --    海平面 6 枚，p<0.12（约 15 km）消失
+  local md = clamp((p - 0.12) / 0.5, 0, 1) * clamp(0.7 + 0.3 * math.min(mach, 1.5), 0, 1.15)
   if md > 0.01 then
-    for i = 0, 3 do
-      local f = (0.40 + 0.11 * i) * len
-      local s = nw * (1.15 - 0.13 * i)
-      draw.sprite("glow", ctx.x + dx * f, ctx.y + dy * f,
+    local ndia = 4 + math.floor(2 * clamp(p, 0, 1))
+    local spacing = 0.11 / (1 + 0.25 * math.min(mach, 2))
+    for i = 0, ndia - 1 do
+      local f = (0.40 + spacing * i) * len
+      local s = nw * (1.15 - 0.10 * i)
+      draw.sprite("glow", ctx.x + dx * f + shx * (f / len), ctx.y + dy * f + shy * (f / len),
                   s * 1.5, s, 0, 0.9 * md * lvl, 1, 1, 0.95)
     end
   end
@@ -168,7 +186,7 @@ function drawFlame(ctx)
   do
     local n = budget(id, 2, (30 + 70 * lvl) * engS, dt)
     for _ = 1, n do
-      local spread = 0.04 + 0.28 * vac          -- 真空中散开
+      local spread = 0.04 + 0.34 * vac          -- 真空中散开
       local a = rr(-spread, spread)
       local ca, sa = math.cos(a), math.sin(a)
       local ex, ey = dx * ca - dy * sa, dx * sa + dy * ca
@@ -176,9 +194,9 @@ function drawFlame(ctx)
       local s0 = nw * rr(0.9, 1.5)
       flame.emit{ tex = "glow", x = ctx.x + px * rr(-half, half) * 0.5,
                   y = ctx.y + py * rr(-half, half) * 0.5,
-                  vx = ex * v, vy = ey * v,
+                  vx = ex * v + wvx, vy = ey * v + wvy,
                   life = rr(0.15, 0.32 + 0.5 * vac),
-                  size0 = s0, size1 = s0 * (0.3 + 1.4 * vac),
+                  size0 = s0, size1 = s0 * (0.3 + 1.6 * vac),
                   r = coreR, g = coreG, b = coreB,
                   a0 = 0.45 + 0.25 * atmo, a1 = 0 }
     end
@@ -193,7 +211,7 @@ function drawFlame(ctx)
       local ex, ey = dx * ca - dy * sa, dx * sa + dy * ca
       local v = speed * rr(0.9, 1.5)
       flame.emit{ tex = "spark", x = ctx.x, y = ctx.y,
-                  vx = ex * v, vy = ey * v,
+                  vx = ex * v + wvx, vy = ey * v + wvy,
                   life = rr(0.18, 0.42), size0 = nw * 0.28, size1 = nw * 0.05,
                   r = 1.0, g = 0.85, b = 0.55, a0 = 0.9, a1 = 0 }
     end
@@ -204,11 +222,11 @@ function drawFlame(ctx)
   if smokeBand > 0.08 then
     local n = budget(id, 4, 7 * engS * smokeBand, dt)
     for _ = 1, n do
-      local bx = ctx.x + dx * len * rr(0.5, 0.9)
-      local by = ctx.y + dy * len * rr(0.5, 0.9)
+      local bx = ctx.x + dx * len * rr(0.5, 0.9) + shx * 0.7
+      local by = ctx.y + dy * len * rr(0.5, 0.9) + shy * 0.7
       flame.emit{ tex = "smoke", x = bx, y = by,
-                  vx = dx * speed * rr(0.2, 0.4) + px * rr(-1, 1) * speed * 0.05,
-                  vy = dy * speed * rr(0.2, 0.4) + py * rr(-1, 1) * speed * 0.05,
+                  vx = dx * speed * rr(0.2, 0.4) + px * rr(-1, 1) * speed * 0.05 + wvx * 1.5,
+                  vy = dy * speed * rr(0.2, 0.4) + py * rr(-1, 1) * speed * 0.05 + wvy * 1.5,
                   drag = 1.5, life = rr(1.0, 2.0),
                   size0 = nw * rr(1.6, 2.4), size1 = nw * rr(5, 8),
                   r = 0.8, g = 0.8, b = 0.85, a0 = 0.20, a1 = 0 }
@@ -226,7 +244,7 @@ function drawFlame(ctx)
       flame.emit{ tex = "glow", x = ctx.x, y = ctx.y,
                   vx = ex * v, vy = ey * v,
                   life = rr(0.5, 1.1),
-                  size0 = nw * rr(0.8, 1.3), size1 = nw * rr(3.5, 6),
+                  size0 = nw * rr(0.8, 1.3), size1 = nw * rr(4, 7),
                   r = 0.70, g = 0.82, b = 1.0, a0 = 0.06, a1 = 0 }
     end
   end

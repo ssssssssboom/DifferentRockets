@@ -813,9 +813,48 @@ public class Ship {
         forEachBody(b -> b.setActive(active));
     }
 
+    /**
+     * Windward leading edge (round 28 shock-cone rendering): the hull corner
+     * with the greatest projection ALONG the oncoming airflow (wx,wy = unit
+     * wind vector) is the shock origin (nose tip / leading edge); the second
+     * return value is the hull's max perpendicular offset from the wind axis
+     * through that tip (the half-width the cone must envelop). Corners come
+     * from each part's width/height box (good enough for a visual cone).
+     * Returns false when the ship has no live bodies.
+     */
+    public boolean windwardEdge(float wx, float wy, Vector2 outTip, float[] outHalf) {
+        float best = -Float.MAX_VALUE;
+        float tipPerp = 0f;
+        float minPerp = Float.MAX_VALUE, maxPerp = -Float.MAX_VALUE;
+        boolean any = false;
+        for (Part p : parts) {
+            if (p.body == null) continue;
+            // manual local->world (corner = pos + rot(angle) * local) — avoids
+            // depending on Box2D's native getWorldPoint on the hot render path
+            float ang = p.body.getAngle();
+            float ca = (float) Math.cos(ang), sa = (float) Math.sin(ang);
+            Vector2 bp = p.body.getPosition();
+            float hw = p.type.width / 2f, hh = p.type.height / 2f;
+            for (int ci = 0; ci < 4; ci++) {
+                float lx = (ci == 0 || ci == 3) ? -hw : hw;
+                float ly = (ci < 2) ? -hh : hh;
+                float cx = bp.x + lx * ca - ly * sa;
+                float cy = bp.y + lx * sa + ly * ca;
+                float proj = cx * wx + cy * wy;
+                float perp = cx * wy - cy * wx; // signed offset from the wind axis
+                if (!any || proj > best) { best = proj; outTip.set(cx, cy); tipPerp = perp; }
+                if (perp < minPerp) minPerp = perp;
+                if (perp > maxPerp) maxPerp = perp;
+                any = true;
+            }
+        }
+        if (!any) return false;
+        outHalf[0] = Math.max(maxPerp - tipPerp, tipPerp - minPerp);
+        return true;
+    }
+
     /** The part that provides control input/heading reference: the pod, else the first part. */
-    public Part controlPart() {
-        for (Part p : parts) if ("pod".equals(p.type.type)) return p;
+    public Part controlPart() {        for (Part p : parts) if ("pod".equals(p.type.type)) return p;
         return parts.isEmpty() ? null : parts.get(0);
     }
 

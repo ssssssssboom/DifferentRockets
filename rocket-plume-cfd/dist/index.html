@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>火箭尾焰羽流 CFD 教学演示</title>
+  <style>
+    :root {
+      --bg: #faf7f2;
+      --panel: #fffdf9;
+      --ink: #3a342c;
+      --muted: #8a7f70;
+      --accent: #c05f33;
+      --accent-soft: #e8d9c8;
+      --line: #e5ddd0;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      line-height: 1.6;
+    }
+    .wrap { max-width: 1080px; margin: 0 auto; padding: 32px 24px 48px; }
+    header h1 { font-size: 22px; font-weight: 600; margin: 0 0 4px; letter-spacing: 0.5px; }
+    header p { margin: 0 0 20px; color: var(--muted); font-size: 14px; }
+    .stage {
+      position: relative;
+      background: #1d1a16;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      overflow: hidden;
+      box-shadow: 0 6px 24px rgba(90, 70, 50, 0.10);
+    }
+    canvas#view { display: block; width: 100%; height: auto; image-rendering: auto; }
+    .controls {
+      display: flex; flex-wrap: wrap; gap: 18px 28px; align-items: center;
+      background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+      padding: 18px 22px; margin-top: 18px;
+    }
+    .slider-block { flex: 1 1 320px; min-width: 280px; }
+    .slider-block label { display: flex; justify-content: space-between; font-size: 14px; margin-bottom: 6px; }
+    #ratioVal { font-weight: 600; color: var(--accent); }
+    input[type="range"] { width: 100%; accent-color: var(--accent); }
+    #regime { font-size: 13px; color: var(--muted); }
+    .btns { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+    button, select {
+      font: inherit; font-size: 13px; color: var(--ink);
+      background: #fff; border: 1px solid var(--line); border-radius: 7px;
+      padding: 7px 14px; cursor: pointer; transition: background .15s;
+    }
+    button:hover, select:hover { background: var(--accent-soft); }
+    .check { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--muted); }
+    .notes { margin-top: 26px; font-size: 14px; color: var(--muted); }
+    .notes h2 { font-size: 15px; color: var(--ink); margin: 22px 0 6px; }
+    .notes ul { margin: 6px 0; padding-left: 20px; }
+    #stats { font-size: 12px; color: var(--muted); margin-top: 8px; font-variant-numeric: tabular-nums; }
+  </style>
+  <script type="module" crossorigin src="/assets/index-CxjrPzEd.js"></script>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <h1>火箭尾焰羽流 CFD 教学演示</h1>
+      <p>二维无粘 Euler 求解器 · 实时演化 · 拖动压比滑块观察过膨胀 / 设计 / 欠膨胀羽流形态</p>
+    </header>
+
+    <div class="stage">
+      <canvas id="view" width="960" height="480"></canvas>
+    </div>
+    <div id="stats"></div>
+
+    <div class="controls">
+      <div class="slider-block">
+        <label>环境气压（压比 p<sub>e</sub>/p<sub>a</sub>）<span id="ratioVal">1.00</span></label>
+        <input id="ratio" type="range" min="0.2" max="5" step="0.01" value="1.0" />
+        <div id="regime">近设计工况：出口压力 ≈ 环境压力，羽流近似平直喷出。</div>
+      </div>
+      <div class="btns">
+        <button id="pauseBtn">暂停</button>
+        <button id="resetBtn">重置流场</button>
+        <select id="viewSel">
+          <option value="schlieren">数值纹影 |∇ρ|</option>
+          <option value="mach">Mach 数云图</option>
+          <option value="pressure">压力云图</option>
+          <option value="tracer">羽流示踪（被动标量）</option>
+        </select>
+        <label class="check"><input id="annotChk" type="checkbox" checked /> 结构标注</label>
+      </div>
+    </div>
+
+    <div class="notes">
+      <h2>怎么看这张图</h2>
+      <ul>
+        <li><b>欠膨胀（p<sub>e</sub>/p<sub>a</sub> &gt; 1.25）</b>：出口压力高于环境，气流在出口继续膨胀，出现膨胀扇与周期性的 Mach 盘 / 桶状激波胞格结构，羽流张开。</li>
+        <li><b>近设计（0.8 ~ 1.25）</b>：出口压力与环境匹配，激波胞格最弱，羽流近似平直。</li>
+        <li><b>过膨胀（p<sub>e</sub>/p<sub>a</sub> &lt; 0.8）</b>：环境压力挤压羽流，桶状激波向内收缩，靠近出口处出现强斜激波与 Mach 盘。</li>
+      </ul>
+      <h2>数值方法（教学简化）</h2>
+      <ul>
+        <li>理想气体 γ = 1.25，二维平面无粘 Euler 方程，结构均匀网格 320 × 160。</li>
+        <li>有限体积法 + Rusanov 数值通量（一阶），显式推进，CFL ≈ 0.4 自适应步长，每帧多步子步进。</li>
+        <li>左边界中部为喷管出口（Me ≈ 3.0，p<sub>e</sub> 由滑块决定），其余左边界为固壁；下边界对称；右/上为远场开口边界。</li>
+        <li>为稳定性保留了一阶格式的数值耗散，激波厚度被人为抹宽，属教学取舍。</li>
+      </ul>
+    </div>
+  </div>
+</body>
+</html>

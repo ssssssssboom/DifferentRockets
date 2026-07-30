@@ -141,6 +141,20 @@ public final class FlameScript {
                                 float nozzleW, float throttle, float engineSize, float engineHeight,
                                 double time, int fuelType, double pressure, double density,
                                 int partId) {
+        drawPart(x, y, dirX, dirY, angle, nozzleW, throttle, engineSize, engineHeight,
+                time, fuelType, pressure, density, partId, 0, 0, 0, 0);
+    }
+
+    /**
+     * Round 28: extra ctx for the upgraded plume — mach = ship speed relative
+     * to the local atmosphere in Mach units; (windX,windY) = oncoming-flow
+     * unit vector; relSpeed = airflow speed (length units/s). Scripts that
+     * don't read them are unaffected (defaults 0).
+     */
+    public static void drawPart(float x, float y, float dirX, float dirY, float angle,
+                                float nozzleW, float throttle, float engineSize, float engineHeight,
+                                double time, int fuelType, double pressure, double density,
+                                int partId, double mach, double windX, double windY, double relSpeed) {
         Globals g = script.globals();
         if (g == null || callFailed) return;
         ctx.set("x", x); ctx.set("y", y);
@@ -159,6 +173,10 @@ public final class FlameScript {
         // Mach diamonds / plume expansion. Old scripts simply ignore these.
         ctx.set("pressure", pressure);
         ctx.set("density", density);
+        ctx.set("mach", mach);
+        ctx.set("windX", windX);
+        ctx.set("windY", windY);
+        ctx.set("relSpeed", relSpeed);
         try {
             g.get("drawFlame").call(ctx);
         } catch (LuaError e) {

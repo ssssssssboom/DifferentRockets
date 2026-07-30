@@ -500,12 +500,8 @@ public class GameWorld {
             if (s.onRails) {
                 s.originVel.add(-dvx, -dvy);
             } else {
-                for (Part p : s.parts) {
-                    if (p.body != null) {
-                        p.body.setLinearVelocity(p.body.getLinearVelocity().x - (float) dvx,
-                                p.body.getLinearVelocity().y - (float) dvy);
-                    }
-                }
+                s.forEachBody(b -> b.setLinearVelocity(b.getLinearVelocity().x - (float) dvx,
+                        b.getLinearVelocity().y - (float) dvy));
             }
         }
         updateRailsFlags();
@@ -528,20 +524,47 @@ public class GameWorld {
      * Transfer the active ship's COM velocity into the frame so body velocities
      * stay small (relative) and never hit Box2D's max-translation clamp.
      */
+    /**
+     * Transfer the active ship's COM velocity into the frame so body velocities
+     * stay small (relative) and never hit Box2D's max-translation clamp.
+     * Round 28 (debris-acceleration leak): OTHER ships' bodies accumulate the
+     * per-frame subtraction too — a debris piece 120+ u/s slower than the
+     * active ship hit Box2D's max-translation clamp (2 u/substep at 60 Hz),
+     * and Box2D responds by SCALING the offending velocity back to the clamp,
+     * which silently destroyed the already-credited frameVel subtraction:
+     * from then on the debris' universe velocity grew with every burn of the
+     * active ship. Fix: any non-rails ship whose frame-relative COM speed
+     * approaches the clamp folds that velocity into its own originVel (the
+     * same slot rails ships use — getUniverseVel/drag/freeze all account for
+     * it), keeping every body well under the clamp at all times.
+     */
+    private static final float BODY_VEL_SAFE = 100f; // fold to originVel above this (clamp = 120 u/s)
+
     private void velocityReanchor() {
         if (active == null) return;
         Vector2 cv = active.velocity(tmpV);
-        if (cv.len2() < 1e-4f) return;
-        for (Ship s : ships) {
-            if (s.onRails) {
-                s.originVel.sub(tmp2d.set(cv.x, cv.y));
-            } else {
-                s.forEachBody(b -> b.setLinearVelocity(
-                        b.getLinearVelocity().x - cv.x,
-                        b.getLinearVelocity().y - cv.y));
+        if (cv.len2() >= 1e-4f) {
+            for (Ship s : ships) {
+                if (s.onRails) {
+                    s.originVel.sub(tmp2d.set(cv.x, cv.y));
+                } else {
+                    s.forEachBody(b -> b.setLinearVelocity(
+                            b.getLinearVelocity().x - cv.x,
+                            b.getLinearVelocity().y - cv.y));
+                }
             }
+            frameVel.add(cv.x, cv.y);
         }
-        frameVel.add(cv.x, cv.y);
+        // clamp guard: fold oversized frame-relative velocities into originVel
+        for (Ship s : ships) {
+            if (s.onRails || s.parts.isEmpty()) continue;
+            Vector2 bv = s.velocity(tmpV);
+            if (bv.len2() < BODY_VEL_SAFE * BODY_VEL_SAFE) continue;
+            s.originVel.add(bv.x, bv.y);
+            s.forEachBody(b -> b.setLinearVelocity(
+                    b.getLinearVelocity().x - bv.x,
+                    b.getLinearVelocity().y - bv.y));
+        }
     }
 
     private final Vec2d tmp2d = new Vec2d();
@@ -558,9 +581,11 @@ public class GameWorld {
             if (rails != s.onRails) {
                 s.onRails = rails;
                 if (rails) {
-                    // freeze: store frame-relative velocity, park the bodies rigidly
+                    // freeze: store frame-relative velocity, park the bodies rigidly.
+                    // ADD into originVel: velocityReanchor may already have folded
+                    // clamp-guard velocity there while the ship was physical.
                     Vector2 cv = s.velocity(tmpV);
-                    s.originVel.set(cv.x, cv.y);
+                    s.originVel.add(cv.x, cv.y);
                     s.forEachBody(b -> b.setLinearVelocity(0, 0));
                 } else {
                     // reactivate: give bodies the ship's frame-relative velocity

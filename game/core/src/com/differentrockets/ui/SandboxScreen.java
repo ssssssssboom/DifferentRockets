@@ -1362,6 +1362,7 @@ public class SandboxScreen extends ScreenAdapter {
         game.batch.end();
 
         drawFlames();
+        drawShockCones();
 
         // selected-part highlight (task D3): the selected part's sprite is
         // tinted light blue directly in drawShip — no more blue circle
@@ -1574,6 +1575,8 @@ public class SandboxScreen extends ScreenAdapter {
         }
         for (Ship s : game.world.ships) {
             if (s.onRails) continue;
+            // ship-level airflow state (round 28): plume bending + Mach data
+            double[] flow = airflow(s);
             for (Part p : s.parts) {
                 if (p.body == null || p.type.engine == null || p.flameLevel <= 0.01f) continue;
                 float lvl = Math.min(1f, p.flameLevel);
@@ -1589,7 +1592,8 @@ public class SandboxScreen extends ScreenAdapter {
                 FlameScript.drawPart(nozzle.x, nozzle.y, dx, dy, ang, nozzleW, lvl,
                         p.type.engine.size, p.type.height, game.world.time, p.type.engine.fuelType,
                         game.world.pressureAt(ux, uy), game.world.densityAt(ux, uy),
-                        System.identityHashCode(p));
+                        System.identityHashCode(p),
+                        flow[0], flow[1], flow[2], flow[3]);
             }
         }
         game.shapes.begin(ShapeRenderer.ShapeType.Filled);
@@ -1601,9 +1605,95 @@ public class SandboxScreen extends ScreenAdapter {
         FlameFx.render(game.batch);
     }
 
+    /**
+     * Ship airflow state (round 28): {mach, windX, windY, relSpeed} — wind is
+     * the ONCOMING-flow unit vector (opposite the atmosphere-relative
+     * velocity), relSpeed in physics length-units/s, Mach against a constant
+     * 340 u/s sound speed (physics.lua has no temperature model). All zeros
+     * outside an atmosphere.
+     */
+    private static final double SOUND_SPEED = 340.0;
+    private final double[] flowTmp = new double[4];
+
+    private double[] airflow(Ship s) {
+        flowTmp[0] = flowTmp[1] = flowTmp[2] = flowTmp[3] = 0;
+        Vec2d uv = s.getUniverseVel();
+        Vec2d up = s.getUniversePos();
+        Planet np = game.world.nearestPlanetTo(up.x, up.y);
+        if (np == null || !np.hasAtmosphere()) return flowTmp;
+        double rvx = uv.x - np.vel.x, rvy = uv.y - np.vel.y;
+        double sp = Math.hypot(rvx, rvy);
+        if (sp < 1e-6) return flowTmp;
+        flowTmp[0] = sp / SOUND_SPEED;
+        flowTmp[1] = -rvx / sp;
+        flowTmp[2] = -rvy / sp;
+        flowTmp[3] = sp;
+        return flowTmp;
+    }
+
+    /**
+     * Mach / vapor cone (round 28): when the ship is supersonic in enough air,
+     * draw a translucent shock cone from the windward leading tip (Ship.
+     * windwardEdge) with the physical Mach angle sin(mu) = 1/M. The cone
+     * strengthens from M1.0..1.5 and fades out as pressure drops (vacuum =
+     * no shock). Drawn additively-ish (normal blend, low alpha).
+     */
+    private final Vector2 coneTip = new Vector2();
+    private final float[] coneHalf = new float[1];
+
+    private void drawShockCones() {
+        boolean any = false;
+        for (Ship s : game.world.ships) {
+            if (s.onRails) continue;
+            double[] f = airflow(s);
+            double mach = f[0];
+            if (mach <= 1.02) continue;
+            Vec2d up = s.getUniversePos();
+            double pressure = game.world.pressureAt(up.x, up.y);
+            if (pressure <= 0.003) continue; // effectively vacuum: no shock
+            float wx = (float) f[1], wy = (float) f[2];
+            if (!s.windwardEdge(wx, wy, coneTip, coneHalf)) continue;
+            double mu = Math.asin(1.0 / mach);
+            float tan = (float) Math.tan(mu);
+            float half = Math.max(0.5f, coneHalf[0]);
+            // long enough to envelop the hull, capped for zoomed-out sanity
+            float len = Math.min(half / tan * 1.5f + half * 2f, half * 10f + 30f);
+            float aM = (float) Math.min(1, (mach - 1.0) / 0.5);   // ramps in past M1
+            float aP = (float) Math.min(1, pressure / 0.25);      // altitude fade
+            float a = 0.16f * aM * aP;
+            if (a <= 0.004f) continue;
+            if (!any) {
+                any = true;
+                Gdx.gl.glEnable(GL20.GL_BLEND);
+                Gdx.gl.glBlendFunc(GL20.GL_SRC_ALPHA, GL20.GL_ONE_MINUS_SRC_ALPHA);
+                game.shapes.setProjectionMatrix(cam.combined);
+                game.shapes.begin(ShapeRenderer.ShapeType.Filled);
+            }
+            float dx = -wx, dy = -wy;                    // downstream
+            float px = -dy, py = dx;                     // perpendicular
+            float spread = len * tan;
+            // cone surface: two faint fins, one per side of the wind axis
+            game.shapes.setColor(0.85f, 0.92f, 1f, a);
+            game.shapes.triangle(coneTip.x, coneTip.y,
+                    coneTip.x + dx * len + px * spread, coneTip.y + dy * len + py * spread,
+                    coneTip.x + dx * len * 0.45f, coneTip.y + dy * len * 0.45f);
+            game.shapes.triangle(coneTip.x, coneTip.y,
+                    coneTip.x + dx * len - px * spread, coneTip.y + dy * len - py * spread,
+                    coneTip.x + dx * len * 0.45f, coneTip.y + dy * len * 0.45f);
+            // brighter cone outline (the shock front itself)
+            game.shapes.setColor(1f, 1f, 1f, a * 1.8f);
+            game.shapes.triangle(coneTip.x, coneTip.y,
+                    coneTip.x + dx * len + px * spread, coneTip.y + dy * len + py * spread,
+                    coneTip.x + dx * (len - 0.4f) + px * (spread * 0.92f), coneTip.y + dy * (len - 0.4f) + py * (spread * 0.92f));
+            game.shapes.triangle(coneTip.x, coneTip.y,
+                    coneTip.x + dx * len - px * spread, coneTip.y + dy * len - py * spread,
+                    coneTip.x + dx * (len - 0.4f) - px * (spread * 0.92f), coneTip.y + dy * (len - 0.4f) - py * (spread * 0.92f));
+        }
+        if (any) game.shapes.end();
+    }
+
     /** Built-in 3-layer plume (fallback when mod/flame.lua is missing or broken). */
-    private void drawFlamesBuiltin() {
-        game.shapes.begin(ShapeRenderer.ShapeType.Filled);
+    private void drawFlamesBuiltin() {        game.shapes.begin(ShapeRenderer.ShapeType.Filled);
         for (Ship s : game.world.ships) {
             if (s.onRails) continue;
             for (Part p : s.parts) {
@@ -2013,6 +2103,10 @@ public class SandboxScreen extends ScreenAdapter {
         for (int i = 0; i < predictor.count; i++) {
             if (mapTargetPlanet != null) {
                 planetPosAt(mapTargetPlanet, predictor.ts[i], tpos);
+            } else if (targetPredictor.count >= 2) {
+                // moving ship anchor: interpolated onto the active timestamps
+                tpos[0] = lerpTargetX(predictor.ts[i]);
+                tpos[1] = lerpTargetY(predictor.ts[i]);
             } else {
                 Vec2d tp = mapTargetShip.getUniversePos();
                 tpos[0] = tp.x; tpos[1] = tp.y;
@@ -2146,19 +2240,26 @@ public class SandboxScreen extends ScreenAdapter {
     }
 
     /**
-     * Task 5: gray orbit line for the tapped TARGET ship (map view). Uses the
-     * second propagator (targetPredictor) filled in renderMap at the same 15
-     * Hz cadence and drawn with the SAME anchor-frame + double-precision
-     * screen projection rules as drawOrbitPrediction — the active ship's
-     * green line is untouched. OrbitPredictor itself needed no changes: its
-     * compute(world, ship, anchorIdx) entry already handles any ship.
+     * Task 5 (revised semantics): the gray line is the ACTIVE ship's predicted
+     * trajectory RE-ANCHORED to the target ship — i.e. the active ship's
+     * motion relative to the target, exactly like the planet anchor-frame
+     * switch but with the target ship as the anchor:
+     *   gray[i] = activePath(ts[i]) − targetPath(ts[i]) + targetShip.posNow
+     * The active path comes from the main predictor (its green line is drawn
+     * unchanged in the planet frame); the target path comes from
+     * targetPredictor (filled in renderMap at the same 15 Hz cadence), and
+     * because the two propagators use different adaptive step schedules the
+     * target position is LINEARLY INTERPOLATED onto the active path's
+     * timestamps. A target with no propagable path (landed/empty) acts as a
+     * static anchor at its current position. Same double-precision screen
+     * projection rules as drawOrbitPrediction. OrbitPredictor unchanged.
      */
     private void drawTargetOrbit() {
         if (mapTargetShip == null) return;
-        int n = targetPredictor.count;
-        if (n < 2 || targetPredictor.anchor < 0) return;
-        Planet a0 = game.world.planets.get(targetPredictor.anchor);
-        double baseX = a0.pos.x, baseY = a0.pos.y;
+        int n = predictor.count;
+        if (n < 2) return;
+        Vec2d anchorNow = mapTargetShip.getUniversePos();
+        tLerpHint = 0; // ts walk is ascending within one draw pass
         int stride = Math.max(1, (n + 1999) / 2000);
         int drawn = (n + stride - 1) / stride;
         if (drawn < 2) return;
@@ -2171,14 +2272,42 @@ public class SandboxScreen extends ScreenAdapter {
         float prevX = 0, prevY = 0;
         for (int i = 0; i < drawn; i++) {
             int idx = Math.min(i * stride, n - 1);
-            double wx = targetPredictor.xs[idx] - targetPredictor.fx[idx] + baseX;
-            double wy = targetPredictor.ys[idx] - targetPredictor.fy[idx] + baseY;
+            // target ship position at this point's time (moving anchor)
+            double tax, tay;
+            if (targetPredictor.count >= 2) {
+                tax = lerpTargetX(predictor.ts[idx]);
+                tay = lerpTargetY(predictor.ts[idx]);
+            } else {
+                tax = anchorNow.x; tay = anchorNow.y;
+            }
+            double wx = predictor.xs[idx] - tax + anchorNow.x;
+            double wy = predictor.ys[idx] - tay + anchorNow.y;
             float sx = (float) ((wx - mapCX) / mapCam.viewportWidth * sw + sw / 2);
             float sy = (float) ((wy - mapCY) / mapCam.viewportHeight * sh + sh / 2);
             if (i > 0) game.shapes.line(prevX, prevY, sx, sy);
             prevX = sx; prevY = sy;
         }
         game.shapes.end();
+    }
+
+    // target-path interpolation scratch (drawTargetOrbit walks ts ascending)
+    private int tLerpHint;
+
+    /** Linear interpolation over targetPredictor's (ts, xs | ys) at time t. */
+    private double lerpTargetX(double t) { return lerpTarget(t, true); }
+    private double lerpTargetY(double t) { return lerpTarget(t, false); }
+    private double lerpTarget(double t, boolean x) {
+        int m = targetPredictor.count;
+        double[] vs = x ? targetPredictor.xs : targetPredictor.ys;
+        double[] ts = targetPredictor.ts;
+        if (t <= ts[0]) return vs[0];
+        if (t >= ts[m - 1]) return vs[m - 1];
+        int lo = Math.min(Math.max(tLerpHint, 0), m - 2);
+        if (t < ts[lo]) lo = 0;
+        while (lo < m - 2 && ts[lo + 1] < t) lo++;
+        tLerpHint = lo;
+        double f = (t - ts[lo]) / (ts[lo + 1] - ts[lo]);
+        return vs[lo] + (vs[lo + 1] - vs[lo]) * f;
     }
 
     // ---------------------------------------------------------------- telemetry

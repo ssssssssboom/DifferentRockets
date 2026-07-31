@@ -1,4 +1,4 @@
--- v2026.07.31.3
+-- v2026.07.31.4
 -- ============================================================================
 -- joints.lua — 连接（焊接点）规则（玩家可改）
 -- ============================================================================
@@ -12,7 +12,8 @@
 --       { x, y            连接点在零件局部坐标中的位置（米）
 --         fuelLine        是否燃油管路点（true/false）
 --         edge            0=普通单点 1=左边 2=右边 3=顶边 4=底边（整条边可连）
---         breakForce      该连接点的断裂力上限（千牛）；不可断的点省略此键 }
+--         breakForce      该连接点的断裂力上限（千牛）；不可断的点省略此键
+--         breakTorque     该连接点的断裂扭矩上限（千牛·米，v2026.07.31.4 起）}
 --
 -- 返回表（键都可省略，省略即用默认值）：
 --   frequencyHz    焊接弹簧频率（赫兹，真实弹性语义）。48 为默认
@@ -34,8 +35,13 @@
 --                  0.067°、扰动 0.65 秒收敛、无回摆）。安全上限约 1.5，
 --                  2.0 会数值失稳（发散抖动）。
 --   angularDamping 两零件的角速度阻尼（每秒衰减比例，0=不衰减）。
+--   linearDampingRatio  线向锚点黏性阻尼比（v2026.07.31.4 新增，默认 0=
+--                  关闭）。probe23 矩阵实测：>0 时锚点杠杆臂反馈把焊缝
+--                  反作用力放大千倍以上（数值失稳）——仅调试用，不要开启。
 --   breakForce     断裂力上限（千牛）。省略时取两连接点中较小的那个；
 --                  想造永不分离的连接可填 1e18。
+--   breakTorque    断裂扭矩上限（千牛·米，v2026.07.31.4 新增）。省略时取
+--                  两连接点中较小的那个；力/扭矩任一通道持续 5 帧超限即断。
 --
 -- 下面这个默认实现还原了内置规则，可在此基础上改造，例如：
 --   * 按零件类型定软硬    if partA:getTypeId() == "strut-1" then ... end
@@ -65,10 +71,15 @@
 -- 稳态 0.067°、overshoot 1.00、5.4° 冲击 0.65 秒收敛、无回摆（regrow=1.00）；
 -- ζ=2.0 失稳，安全域 ζ<=1.5。angularFrequencyHz 为 frequencyHz 的显式别名。
 -- 断裂检测不变（getReactionForce 超 breakForce 持续 5 帧即断）。
+-- Round 34 (v2026.07.31.4)：新增扭矩断裂通道（breakTorque，与力通道并列、
+-- 同样 5 帧判据）与线向锚点阻尼键 linearDampingRatio（默认 0，probe23 实测
+-- 开启即失稳，仅保留作调试）。PartList.xml 全部连接点已统一标定
+-- breakForce=2000 kN / breakTorque=2500 kN·m（正常相位峰值约 4-5 倍）。
 local DEFAULT_FREQ = 48.0     -- frequencyHz 默认：48 Hz 硬弹簧（round 33: 0 -> 48）
 local DEFAULT_DAMP = 1.0      -- dampingRatio 默认：临界阻尼
 local DEFAULT_ANGDAMP = 1.0   -- angularDamping 默认：每秒衰减比例（was 0.6）
 local DEFAULT_ANGVISC = 1.0   -- angularDampingRatio 默认：显式黏性角阻尼（round 33b）
+local DEFAULT_LINVISC = 0.0   -- linearDampingRatio 默认：关闭（round 34：开启即失稳）
 
 function jointParams(partA, attachA, partB, attachB)
     -- 两侧零件在 onLoad 里通过 part:setJointParams{...} 设置的覆盖值
@@ -94,6 +105,9 @@ function jointParams(partA, attachA, partB, attachB)
         -- 角速度阻尼：任一侧有覆盖就用覆盖，否则用全局默认
         angularDamping = oA.angularDamping or oB.angularDamping
                          or DEFAULT_ANGDAMP,
-        -- breakForce 省略 → 取两连接点的较小值（见文件头说明）
+        -- 线向锚点阻尼（round 34，默认 0 关闭，见文件头警告）
+        linearDampingRatio = oA.linearDampingRatio or oB.linearDampingRatio
+                             or DEFAULT_LINVISC,
+        -- breakForce/breakTorque 省略 → 取两连接点的较小值（见文件头说明）
     }
 end

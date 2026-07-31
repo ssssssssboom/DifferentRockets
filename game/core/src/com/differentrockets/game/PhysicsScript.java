@@ -125,17 +125,18 @@ public final class PhysicsScript {
     // the damper at zeta<=1.5. Higher frequency (64) is even stiffer but
     // leaves less stability margin for player-modded stacks.
     private static final double DEF_JOINT_FREQ = 48.0, DEF_JOINT_DAMP = 1.0,
-            DEF_ANG_DAMP = 1.0, DEF_ANG_VISC = 1.0;
+            DEF_ANG_DAMP = 1.0, DEF_ANG_VISC = 1.0, DEF_LIN_VISC = 0.0; // probe 23 decides LIN_VISC
 
     /**
      * Weld-joint parameters from Lua (`joints = {frequencyHz=.., dampingRatio=..,
-     * angularDamping=.., angularFrequencyHz=.., angularDampingRatio=..}`),
-     * falling back to the tuned defaults per key.
+     * angularDamping=.., angularFrequencyHz=.., angularDampingRatio=..,
+     * linearDampingRatio=..}`), falling back to the tuned defaults per key.
      */
     public static double jointParam(String key) {
         double def = "frequencyHz".equals(key) ? DEF_JOINT_FREQ
                 : "dampingRatio".equals(key) ? DEF_JOINT_DAMP
                 : "angularFrequencyHz".equals(key) ? DEF_JOINT_FREQ
+                : "linearDampingRatio".equals(key) ? DEF_LIN_VISC
                 : "angularDampingRatio".equals(key) ? DEF_ANG_VISC : DEF_ANG_DAMP;
         Globals g = bound;
         if (g == null) return def;
@@ -169,6 +170,7 @@ public final class PhysicsScript {
             case "angularDamping": return DEF_ANG_DAMP;
             case "angularFrequencyHz": return DEF_JOINT_FREQ;
             case "angularDampingRatio": return DEF_ANG_VISC;
+            case "linearDampingRatio": return DEF_LIN_VISC;
             default: return 0;
         }
     }

@@ -33,6 +33,8 @@ public class PartType {
         public boolean fuelLine;
         public float breakAngle = 180f;
         public float breakForce = Float.MAX_VALUE;
+        /** round 34 task 2: reaction-TORQUE break limit (kN*m); MAX = unbreakable. */
+        public float breakTorque = Float.MAX_VALUE;
         public int group;
         public boolean flipX;
         public int order;
@@ -223,6 +225,7 @@ public class PartType {
                             ap.fuelLine = ae.getBooleanAttribute("fuelLine", false);
                             ap.breakAngle = ae.getFloatAttribute("breakAngle", 180f);
                             ap.breakForce = (float) Xml.getDouble(ae, "breakForce", Double.MAX_VALUE);
+                            ap.breakTorque = (float) Xml.getDouble(ae, "breakTorque", Double.MAX_VALUE);
                             ap.group = ae.getIntAttribute("group", 0);
                             ap.flipX = ae.getBooleanAttribute("flipX", false);
                             ap.order = ae.getIntAttribute("order", 0);

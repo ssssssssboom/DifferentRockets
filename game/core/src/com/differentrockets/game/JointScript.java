@@ -37,7 +37,11 @@ public final class JointScript {
         public double angularFrequencyHz = Double.NaN;
         /** explicit viscous bushing ratio (round 33b); NaN = physics.lua/default. */
         public double angularDampingRatio = Double.NaN;
+        /** explicit LINEAR viscous bushing ratio (round 34); NaN = physics.lua/default. */
+        public double linearDampingRatio = Double.NaN;
         public float breakForce = -1f;   // <0 = caller default (min of attach points)
+        /** round 34 task 2: torque break limit (kN*m); <0 = caller default. */
+        public float breakTorque = -1f;
         public boolean fromLua;
     }
 
@@ -64,8 +68,10 @@ public final class JointScript {
             out.dampingRatio = (float) t.get("dampingRatio")
                     .optdouble(PhysicsScript.jointParam("dampingRatio"));
             out.breakForce = (float) t.get("breakForce").optdouble(-1.0);
+            out.breakTorque = (float) t.get("breakTorque").optdouble(-1.0);
             out.angularFrequencyHz = t.get("angularFrequencyHz").optdouble(Double.NaN);
             out.angularDampingRatio = t.get("angularDampingRatio").optdouble(Double.NaN);
+            out.linearDampingRatio = t.get("linearDampingRatio").optdouble(Double.NaN);
             double angDamp = t.get("angularDamping").optdouble(Double.NaN);
             if (!Double.isNaN(angDamp)) {
                 // per-connection angular damping applies to both bodies

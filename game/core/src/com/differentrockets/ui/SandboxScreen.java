@@ -10,6 +10,7 @@ import com.badlogic.gdx.graphics.GL20;
 import com.badlogic.gdx.graphics.OrthographicCamera;
 import com.badlogic.gdx.graphics.Pixmap;
 import com.badlogic.gdx.graphics.Texture;
+import com.badlogic.gdx.graphics.g2d.GlyphLayout;
 import com.badlogic.gdx.graphics.g2d.TextureRegion;
 import com.badlogic.gdx.graphics.glutils.ShapeRenderer;
 import com.badlogic.gdx.math.Vector2;
@@ -95,6 +96,19 @@ public class SandboxScreen extends ScreenAdapter {
     private float ringX, ringY, ringR;
     private final com.badlogic.gdx.math.Matrix4 ringMat = new com.badlogic.gdx.math.Matrix4();
     private int slewDir;                          // -1/0/+1 while turn buttons/keys held
+
+    // RCS pad (RCS task): bottom turn-pad container + left-column toggle
+    private Table turnPad;
+    private TextButton rcsBtn;
+    // map planet-label hit rects (screen space, y-up) for tap-to-select
+    private static final int MAX_LABELS = 128;
+    private final Planet[] labelPlanet = new Planet[MAX_LABELS];
+    private final float[] labelX = new float[MAX_LABELS];
+    private final float[] labelY = new float[MAX_LABELS];
+    private final float[] labelW = new float[MAX_LABELS];
+    private final float[] labelH = new float[MAX_LABELS];
+    private int labelCount;
+    private final GlyphLayout layout = new GlyphLayout();
 
     // tap-to-activate (item 6b)
     private Part selectedPart;
@@ -283,7 +297,19 @@ public class SandboxScreen extends ScreenAdapter {
         });
         Table leftTop = new Table();
         leftTop.add(menuBtn).width(240).height(128).pad(2).row();
-        leftTop.add(mapBtn).width(240).height(128).pad(2);
+        leftTop.add(mapBtn).width(240).height(128).pad(2).row();
+        // RCS master toggle (RCS task): only visible while the active ship
+        // actually has RCS parts (visibility polled in render())
+        rcsBtn = big(new TextButton("RCS:off", game.ui.skin));
+        rcsBtn.addListener(new ClickListener() {
+            @Override public void clicked(InputEvent e, float x, float y) {
+                SteeringIO.rcsEnabled = !SteeringIO.rcsEnabled;
+                rcsBtn.setText(SteeringIO.rcsEnabled ? "RCS:on" : "RCS:off");
+                rebuildTurnPad();
+            }
+        });
+        rcsBtn.setVisible(false);
+        leftTop.add(rcsBtn).width(240).height(128).pad(2);
 
         // throttle: 10-segment bar from the Runtime atlas, right edge
         // (round 11 item 10 — ThrottleControl track + ThrottleLevel sprites);
@@ -300,11 +326,10 @@ public class SandboxScreen extends ScreenAdapter {
             @Override public void clicked(InputEvent e, float x, float y) { activateSelected(); }
         });
 
-        // heading slew: "<" rotates the nose left (target heading increases)
-        // (user feedback: the 7 bottom buttons stay at the ORIGINAL 1x size —
-        //  only the top bars/throttle/ring keep the sandbox 2x upscale)
-        TextButton leftBtn = holdBtn("<", 1);
-        TextButton rightBtn = holdBtn(">", -1);
+        // heading slew pad (RCS-aware): non-RCS = "<" ">" only; RCS enabled =
+        // 2x3 grid (< UP > / ROTL DOWN ROTR). Rebuilt when the RCS toggle flips.
+        turnPad = new Table();
+        rebuildTurnPad();
 
         TextButton zoomIn = new TextButton("+", game.ui.skin);
         zoomIn.addListener(new ClickListener() {
@@ -352,8 +377,7 @@ public class SandboxScreen extends ScreenAdapter {
         bottomB.add(activateBtn).width(170).height(110).pad(6).padLeft(16);
         bottomB.add(stageBtn).width(200).height(110).pad(6);
         bottomB.add().expandX();
-        bottomB.add(leftBtn).width(120).height(96).pad(4);
-        bottomB.add(rightBtn).width(120).height(96).pad(4);
+        bottomB.add(turnPad).pad(4);
         bottomB.add().expandX();
         TextButton backBtn = new TextButton("BACK", game.ui.skin);
         backBtn.addListener(new ClickListener() {
@@ -391,30 +415,84 @@ public class SandboxScreen extends ScreenAdapter {
         return b;
     }
 
-    private TextButton holdBtn(String label, final int dir) {
-        // turn buttons (semantics revision): while HELD the steering ring is
-        // deactivated (target heading UNCHANGED — SteeringIO.targetHeadingRad
-        // is never touched here) and buttonTurn carries the direction at full
-        // deflection: "<" (dir=+1, nose left) = -1, ">" (dir=-1) = +1.
-        // control.lua reads buttonTurn and swings every gimbaled engine to
-        // its own max angle (and the wheel script uses the same signal).
-        // On release buttonTurn returns to 0 and the ring's previous
-        // activation state is restored.
+    // holdField codes for holdBtn: 0=none, 1=holdLeft, 2=holdRight,
+    // 3=holdUp, 4=holdDown, 5=rotLeft, 6=rotRight
+    private void setHold(int field, boolean v) {
+        switch (field) {
+            case 1: SteeringIO.holdLeft = v; break;
+            case 2: SteeringIO.holdRight = v; break;
+            case 3: SteeringIO.holdUp = v; break;
+            case 4: SteeringIO.holdDown = v; break;
+            case 5: SteeringIO.rotLeft = v; break;
+            case 6: SteeringIO.rotRight = v; break;
+        }
+    }
+
+    /**
+     * Hold-style pad button. While HELD the steering ring is deactivated
+     * (target heading UNCHANGED — SteeringIO.targetHeadingRad is never
+     * touched here); the deactivation is STICKY — releasing the button does
+     * NOT re-activate the ring (user request). buttonTurn carries full
+     * deflection for turn-type buttons (-1 left, +1 right; control.lua swings
+     * every gimbaled engine to its max angle, the wheel script reads the same
+     * signal); UP/DOWN pass buttonTurn=0 and only set their RCS hold flags.
+     * holdField additionally raises one of the SteeringIO RCS hold booleans
+     * (holdLeft/.../rotRight) for the RCS pad contract.
+     */
+    private TextButton holdBtn(String label, final int buttonTurn, final int holdField) {
         TextButton b = new TextButton(label, game.ui.skin);
         b.addListener(new ClickListener() {
-            boolean prevRingActive;
             @Override public boolean touchDown(InputEvent e, float x, float y, int pointer, int button) {
-                prevRingActive = SteeringIO.ringActive;
-                game.world.deactivateRing(); // task 1: ring off + target dropped
-                SteeringIO.buttonTurn = dir > 0 ? -1 : 1; // contract: -1 left, +1 right (held)
+                setHold(holdField, true);
+                if (buttonTurn != 0) {
+                    game.world.deactivateRing(); // sticky: ring stays off after release
+                    SteeringIO.buttonTurn = buttonTurn;
+                }
                 return true;
             }
             @Override public void touchUp(InputEvent e, float x, float y, int pointer, int button) {
-                SteeringIO.buttonTurn = 0; // released: no deflection
-                SteeringIO.ringActive = prevRingActive;
+                setHold(holdField, false);
+                if (buttonTurn != 0) SteeringIO.buttonTurn = 0; // released: no deflection
             }
         });
         return b;
+    }
+
+    private TextButton holdBtn(String label, final int dir) {
+        return holdBtn(label, dir > 0 ? -1 : 1, dir > 0 ? 1 : 2);
+    }
+
+    /**
+     * RCS task: rebuild the bottom-center turn pad. Non-RCS mode: the classic
+     * "<" / ">" pair. RCS mode: a 2x3 grid — top row "<", "UP", ">";
+     * bottom row "ROTL", "DOWN", "ROTR". "<"/"ROTL" both carry buttonTurn=-1
+     * (engine gimbals / wheel torque respond identically), ">"/"ROTR" = +1;
+     * UP/DOWN carry no buttonTurn, only their SteeringIO hold flags.
+     */
+    private void rebuildTurnPad() {
+        if (turnPad == null) return;
+        turnPad.clear();
+        if (SteeringIO.rcsEnabled) {
+            turnPad.add(holdBtn("<", -1, 1)).width(120).height(52).pad(2);
+            turnPad.add(holdBtn("UP", 0, 3)).width(120).height(52).pad(2);
+            turnPad.add(holdBtn(">", 1, 2)).width(120).height(52).pad(2).row();
+            turnPad.add(holdBtn("ROTL", -1, 5)).width(120).height(52).pad(2);
+            turnPad.add(holdBtn("DOWN", 0, 4)).width(120).height(52).pad(2);
+            turnPad.add(holdBtn("ROTR", 1, 6)).width(120).height(52).pad(2);
+        } else {
+            turnPad.add(holdBtn("<", -1, 1)).width(120).height(96).pad(4);
+            turnPad.add(holdBtn(">", 1, 2)).width(120).height(96).pad(4);
+        }
+    }
+
+    /** True while the active ship carries at least one RCS part. */
+    private boolean rcsAvailable() {
+        Ship a = game.world == null ? null : game.world.active;
+        if (a == null) return false;
+        for (Part p : a.parts) {
+            if (p.type != null && p.type.rcs != null) return true;
+        }
+        return false;
     }
 
     /**
@@ -795,6 +873,26 @@ public class SandboxScreen extends ScreenAdapter {
                 stageLabel.setText("Target " + bestShip.name);
             }
             return;
+        }
+        // planet LABEL hit-test first (map label task): the constant-size
+        // name tags are much easier to tap than the body itself at system
+        // zoom. Label rects live in y-up screen space (as drawn in renderMap).
+        float tapUpY = (float) sh - screenY;
+        for (int i = 0; i < labelCount; i++) {
+            float pad = 10f * BS;
+            if (screenX >= labelX[i] - pad && screenX <= labelX[i] + labelW[i] + pad
+                    && tapUpY >= labelY[i] - pad && tapUpY <= labelY[i] + labelH[i] + pad) {
+                Planet p = labelPlanet[i];
+                if (mapTargetPlanet == p) {
+                    mapTargetPlanet = null;
+                    stageLabel.setText("");
+                } else {
+                    mapTargetPlanet = p;
+                    mapTargetShip = null;
+                    stageLabel.setText("Target " + p.name);
+                }
+                return;
+            }
         }
         for (Planet p : game.world.planets) {
             double d = Math.hypot(p.pos.x - wx, p.pos.y - wy);
@@ -1260,6 +1358,16 @@ public class SandboxScreen extends ScreenAdapter {
         if (SteeringIO.ringActive) {
             SteeringIO.targetHeadingRad = game.world.getTargetHeading();
         }
+        // RCS availability poll: the toggle only shows while the active ship
+        // has RCS parts; losing them mid-flight (staging/destruction) drops
+        // RCS mode and restores the classic < > pad
+        boolean rcsOk = rcsAvailable();
+        if (rcsBtn != null) rcsBtn.setVisible(rcsOk);
+        if (!rcsOk && SteeringIO.rcsEnabled) {
+            SteeringIO.rcsEnabled = false;
+            if (rcsBtn != null) rcsBtn.setText("RCS:off");
+            rebuildTurnPad();
+        }
         // particle FX advance in simulated time (freeze while paused, warp-aware)
         lastSimDt = game.world.paused ? 0f : fd * game.world.warp;
         FlameFx.update(lastSimDt);
@@ -1570,6 +1678,7 @@ public class SandboxScreen extends ScreenAdapter {
         boolean lua = FlameScript.begin(lastSimDt);
         if (!lua) {
             drawFlamesBuiltin();
+            drawRcsJets();
             FlameFx.render(game.batch);
             return;
         }
@@ -1602,7 +1711,44 @@ public class SandboxScreen extends ScreenAdapter {
         // textured pass: script sprites (core glow / Mach diamonds) + pooled
         // exhaust particles; both render additively with their own batch scope
         FlameScript.flushSprites(game.batch);
+        drawRcsJets();
         FlameFx.render(game.batch);
+    }
+
+    /**
+     * RCS jet puffs (round 34 task 3): every jet a part's Lua queued via
+     * emitJet this frame becomes a short burst of small WHITE glow particles
+     * (the FlameFx pool, additive) streaming along the plume direction.
+     * Kept tiny next to engine plumes: ~0.2-0.5 u sprites, 0.25 s life.
+     */
+    private void drawRcsJets() {
+        if (game.world == null) return;
+        for (Ship s : game.world.ships) {
+            if (s.onRails) continue;
+            for (Part p : s.parts) {
+                if (p.body == null || p.rcsJets.isEmpty()) continue;
+                float size = p.type.rcs != null ? p.type.rcs.size : 1f;
+                for (float[] j : p.rcsJets) {
+                    Vector2 w = p.body.getWorldPoint(tmp2.set(j[3], j[4]));
+                    float lvl = Math.min(1.5f, Math.max(0.1f, j[0]));
+                    float budget = (float) (60.0 * lastSimDt * lvl);
+                    int n = (int) budget + (Math.random() < budget - (int) budget ? 1 : 0);
+                    for (int k = 0; k < n; k++) {
+                        float sp = (float) (5 + Math.random() * 4) * size;
+                        float jx = (float) (Math.random() - 0.5) * 0.35f;
+                        float jy = (float) (Math.random() - 0.5) * 0.35f;
+                        // plume dir (j[1],j[2]) + slight perpendicular jitter
+                        float vx = (j[1] + -j[2] * jx) * sp;
+                        float vy = (j[2] + j[1] * jy) * sp;
+                        float s0 = (0.10f + (float) Math.random() * 0.12f) * size * lvl;
+                        FlameFx.emit(FlameFx.TEX_GLOW, w.x, w.y, vx, vy,
+                                3.0f, 0.22f + (float) Math.random() * 0.1f,
+                                s0, s0 * 2.2f,
+                                1f, 1f, 1f, 0.85f, 0f);
+                    }
+                }
+            }
+        }
     }
 
     /**
@@ -1791,6 +1937,10 @@ public class SandboxScreen extends ScreenAdapter {
             game.shapes.setColor(1f, 1f, 1f, 0.6f);
             game.shapes.circle(ringPtX(cur), ringPtY(cur), 6f, 12);
             game.shapes.end();
+            // guidance arrows (cyan velocity / pink target-relative / amber
+            // target-ship bearing) stay visible on the inactive ring too —
+            // only the green target-heading marker is hidden
+            drawRingGuidance();
             Gdx.gl.glLineWidth(1f);
             return;
         }
@@ -1841,17 +1991,6 @@ public class SandboxScreen extends ScreenAdapter {
         game.shapes.setColor(0.3f, 1f, 0.45f, 0.95f);
         game.shapes.line(ringPtX(tgt), ringPtY(tgt),
                 ringX + (ringPtX(tgt) - ringX) * 1.14f, ringY + (ringPtY(tgt) - ringY) * 1.14f);
-        // velocity ticks: cyan = planet-relative (always), pink = target-relative
-        if (pSpd > 0.5) {
-            game.shapes.setColor(0.35f, 0.85f, 1f, 0.95f);
-            game.shapes.line(ringX + (ringPtX(pHead) - ringX) * 0.90f, ringY + (ringPtY(pHead) - ringY) * 0.90f,
-                    ringX + (ringPtX(pHead) - ringX) * 1.05f, ringY + (ringPtY(pHead) - ringY) * 1.05f);
-        }
-        if (relToTarget && tSpd > 0.5) {
-            game.shapes.setColor(1f, 0.45f, 0.80f, 0.95f);
-            game.shapes.line(ringX + (ringPtX(tHead) - ringX) * 0.90f, ringY + (ringPtY(tHead) - ringY) * 0.90f,
-                    ringX + (ringPtX(tHead) - ringX) * 1.05f, ringY + (ringPtY(tHead) - ringY) * 1.05f);
-        }
         game.shapes.end();
 
         // center cross
@@ -1862,15 +2001,81 @@ public class SandboxScreen extends ScreenAdapter {
         game.shapes.circle(ringX + (ringPtX(tgt) - ringX) * 1.14f, ringY + (ringPtY(tgt) - ringY) * 1.14f, 8f, 12);
         game.shapes.setColor(1f, 1f, 1f, 0.95f);
         game.shapes.circle(ringPtX(cur), ringPtY(cur), 6f, 12);
-        // velocity arrowheads on the ring — item 3 (cyan + pink, D6 revised)
+        game.shapes.end();
+
+        // guidance arrows (cyan velocity / pink target-relative velocity /
+        // amber target-ship bearing + distance) — shared with the inactive
+        // ring (task: vectors visible in BOTH ring states)
+        drawRingGuidance();
+        Gdx.gl.glLineWidth(1f);
+    }
+
+    /**
+     * Ring guidance vectors, drawn whether the ring is ACTIVE or INACTIVE
+     * (user request: the inactive ring only hides the green target-heading
+     * marker — the velocity/target arrows stay visible):
+     *   cyan  = planet-relative velocity (always, above 0.5 m/s);
+     *   pink  = target-relative velocity (map target ship or planet);
+     *   amber = bearing to the selected TARGET SHIP (mapTargetShip only),
+     *           with the relative distance as a number outside the ring.
+     */
+    private void drawRingGuidance() {
+        Ship actShip = game.world.active;
+        if (actShip == null) return;
+        Vec2d sv = actShip.getUniverseVel();
+        Planet vcp = game.world.currentPlanet();
+        double pvx = sv.x - (vcp != null ? vcp.vel.x : 0);
+        double pvy = sv.y - (vcp != null ? vcp.vel.y : 0);
+        double pSpd = Math.hypot(pvx, pvy);
+        double pHead = Math.atan2(-pvx, pvy); // ring heading convention
+        boolean relToTarget = mapTargetShip != null || mapTargetPlanet != null;
+        double tvx = 0, tvy = 0;
+        if (mapTargetShip != null) {
+            Vec2d tv = mapTargetShip.getUniverseVel();
+            tvx = sv.x - tv.x; tvy = sv.y - tv.y;
+        } else if (mapTargetPlanet != null) {
+            tvx = sv.x - mapTargetPlanet.vel.x; tvy = sv.y - mapTargetPlanet.vel.y;
+        }
+        double tSpd = Math.hypot(tvx, tvy);
+        double tHead = Math.atan2(-tvx, tvy);
+        // amber: bearing + distance to the target ship
+        boolean amber = mapTargetShip != null;
+        double posHead = 0, tgtDist = 0;
+        if (amber) {
+            Vec2d ap = actShip.getUniversePos();
+            Vec2d tp = mapTargetShip.getUniversePos();
+            double ddx = tp.x - ap.x, ddy = tp.y - ap.y;
+            tgtDist = Math.hypot(ddx, ddy);
+            posHead = Math.atan2(-ddx, ddy);
+        }
+
+        game.shapes.begin(ShapeRenderer.ShapeType.Line);
+        if (pSpd > 0.5) {
+            game.shapes.setColor(0.35f, 0.85f, 1f, 0.95f);
+            game.shapes.line(ringX + (ringPtX(pHead) - ringX) * 0.90f, ringY + (ringPtY(pHead) - ringY) * 0.90f,
+                    ringX + (ringPtX(pHead) - ringX) * 1.05f, ringY + (ringPtY(pHead) - ringY) * 1.05f);
+        }
+        if (relToTarget && tSpd > 0.5) {
+            game.shapes.setColor(1f, 0.45f, 0.80f, 0.95f);
+            game.shapes.line(ringX + (ringPtX(tHead) - ringX) * 0.90f, ringY + (ringPtY(tHead) - ringY) * 0.90f,
+                    ringX + (ringPtX(tHead) - ringX) * 1.05f, ringY + (ringPtY(tHead) - ringY) * 1.05f);
+        }
+        if (amber) {
+            game.shapes.setColor(1f, 0.65f, 0.20f, 0.95f);
+            game.shapes.line(ringX + (ringPtX(posHead) - ringX) * 0.90f, ringY + (ringPtY(posHead) - ringY) * 0.90f,
+                    ringX + (ringPtX(posHead) - ringX) * 1.05f, ringY + (ringPtY(posHead) - ringY) * 1.05f);
+        }
+        game.shapes.end();
+
+        game.shapes.begin(ShapeRenderer.ShapeType.Filled);
         if (pSpd > 0.5) velArrow(pHead, 0.35f, 0.85f, 1f);
         if (relToTarget && tSpd > 0.5) velArrow(tHead, 1f, 0.45f, 0.80f);
+        if (amber) velArrow(posHead, 1f, 0.65f, 0.20f);
         game.shapes.end();
-        Gdx.gl.glLineWidth(1f);
 
-        // numeric speed readouts outside the ring: cyan planet-relative at
-        // its heading, pink target-relative slightly further out (D6 revised)
-        boolean anyLabel = pSpd > 0.5 || (relToTarget && tSpd > 0.5);
+        // numeric readouts outside the ring: cyan speed at 1.22R, pink speed
+        // at 1.42R, amber target-ship distance at 1.32R
+        boolean anyLabel = pSpd > 0.5 || (relToTarget && tSpd > 0.5) || amber;
         if (anyLabel) {
             game.batch.setProjectionMatrix(ringMat);
             game.batch.begin();
@@ -1886,6 +2091,12 @@ public class SandboxScreen extends ScreenAdapter {
                 float tx = ringX + (float) -Math.sin(tHead) * ringR * 1.42f;
                 float ty = ringY + (float) Math.cos(tHead) * ringR * 1.42f;
                 game.font.draw(game.batch, fmt(tSpd) + " m/s", tx, ty);
+            }
+            if (amber) {
+                game.font.setColor(1f, 0.65f, 0.20f, 0.95f);
+                float tx = ringX + (float) -Math.sin(posHead) * ringR * 1.32f;
+                float ty = ringY + (float) Math.cos(posHead) * ringR * 1.32f;
+                game.font.draw(game.batch, fmt(tgtDist), tx, ty);
             }
             game.font.getData().setScale(game.ui.fontScale);
             game.font.setColor(Color.WHITE);
@@ -2066,13 +2277,24 @@ public class SandboxScreen extends ScreenAdapter {
         game.batch.begin();
         game.font.getData().setScale(BS);
         game.font.setColor(1f, 1f, 1f, 0.85f);
+        labelCount = 0;
         for (Planet p : game.world.planets) {
-            // skip labels for bodies too small to see at this zoom
-            if (p.radius / mapCam.viewportHeight < 0.0025) continue;
+            // labels are fixed screen size at ANY zoom (round 15) and always
+            // shown — they are also the tap targets for selecting the body,
+            // so even a sub-pixel moon stays selectable via its name
             float sx = (float) ((p.pos.x + p.radius - mapCX) / mapCam.viewportWidth * msw + msw / 2);
             float sy = (float) ((p.pos.y - mapCY) / mapCam.viewportHeight * msh + msh / 2);
             if (sx < -200 || sx > msw + 200 || sy < -50 || sy > msh + 50) continue;
             game.font.draw(game.batch, p.name, sx + 6, sy + 4);
+            if (labelCount < MAX_LABELS) {
+                layout.setText(game.font, p.name);
+                labelPlanet[labelCount] = p;
+                labelX[labelCount] = sx + 6;
+                labelY[labelCount] = sy + 4 - layout.height; // text extends downward (y-up space)
+                labelW[labelCount] = layout.width;
+                labelH[labelCount] = layout.height;
+                labelCount++;
+            }
         }
         game.font.setColor(0.6f, 1f, 0.7f, 0.9f);
         for (Ship s : game.world.ships) {

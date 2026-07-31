@@ -84,6 +84,20 @@ public class Part {
     public float flameGimbalDeg;
 
     /**
+     * RCS jets for this frame (round 34 task 3, set via Lua emitJet): each
+     * entry {size, dirX, dirY, localX, localY} — dir is the PLUME direction
+     * (world unit vector), local is the nozzle offset in body-local metres.
+     * Cleared per script tick alongside flameLevel; rendered as small white
+     * particle puffs by SandboxScreen.drawRcsJets.
+     */
+    public final List<float[]> rcsJets = new ArrayList<>();
+
+    /** Queue one RCS jet puff for this frame (see rcsJets). */
+    public void emitJet(float size, float dirX, float dirY, float localX, float localY) {
+        rcsJets.add(new float[]{size, dirX, dirY, localX, localY});
+    }
+
+    /**
      * ACTUAL gimbal deflection (deg), driven per physics tick by the engine
      * Lua's PID actuator (round 9): the target is turnCommand*turnDeg, the
      * PID + rate limiter moves this toward the target, and thrust uses THIS

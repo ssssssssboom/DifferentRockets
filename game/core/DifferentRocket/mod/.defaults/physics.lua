@@ -1,4 +1,4 @@
--- v2026.07.31.3
+-- v2026.07.31.4
 -- ============================================================================
 -- physics.lua — physics laws (PLAYER-EDITABLE)
 -- ============================================================================
@@ -102,8 +102,27 @@ steering = { kp = 1.8, ki = 0.5, kd = 1.2 }
 -- soft weld = linearly rigid + angularly soft) and an explicit viscous
 -- angular damper (angularDampingRatio, default 1.0) that actually removes
 -- bending-mode energy — the joint's built-in damping could not (probe 21).
+-- Round 34 (v2026.07.31.4): break-system calibration + squeeze push-apart.
+-- Probe-23 matrix (triple-booster, 4 phases: spawn/30%/100%/coast): normal
+-- weld peaks F<=390 kN, Tq<=520 kNm across solver iterations 24/4, 12/4,
+-- 8/2 — iterations barely move peaks, 24/4 stays. A LINEAR anchor damper
+-- (linearDampingRatio > 0) exploded reaction forces 1000x+ (anchor lever-arm
+-- feedback) — it ships DISABLED (0.0). PartList.xml now gives EVERY attach
+-- point breakForce=2000 kN / breakTorque=2500 kNm (~4-5x normal peaks):
+-- normal flight never breaks (probe-23 both configs), a free-fall hard
+-- landing (impact ~2e5 kN / ~1.9e6 kNm) snaps every weld as it should.
 joints = { frequencyHz = 48.0, dampingRatio = 1.0, angularDamping = 1.0,
-           angularFrequencyHz = 48.0, angularDampingRatio = 1.0 }
+           angularFrequencyHz = 48.0, angularDampingRatio = 1.0,
+           linearDampingRatio = 0.0 }
+
+-- Squeeze push-apart (round 34, SimpleRockets-style): when two NON-welded
+-- parts of the same ship press into each other, a force ramps up along the
+-- contact normal to push them apart instead of letting them interpenetrate
+-- and explode the welds. forceRate = kN/s ramp per second of sustained
+-- contact; maxForce = cap in kN (kept below breakForce so the push itself
+-- can never snap a weld). Both default 0 (feature off) if this table is
+-- absent.
+crush = { forceRate = 500.0, maxForce = 1500.0 }
 
 -- Per-part override (round 9): a part's own Lua script may call
 --   part:setJointParams{frequencyHz=…, dampingRatio=…, angularDamping=…}

@@ -128,6 +128,9 @@ public class ModApi {
      *   active     bool — ring mode on (engines track targetRad)
      *   buttonTurn int  — -1/0/+1 while a turn button is held (overrides ring)
      *   targetRad  num  — ring target heading (radians, body-angle convention)
+     * Round 34 task 3 (RCS pad): holdUp/holdDown/holdLeft/holdRight and
+     * rotLeft/rotRight booleans (true while the pad button is held) plus the
+     * rcsEnabled master switch — all gated to the ACTIVE ship like the rest.
      * The engine control law lives in mod/control.lua (controlLaw(part));
      * angle errors must be wrapped to [-pi, pi] (see control.lua).
      */
@@ -141,7 +144,34 @@ public class ModApi {
         t.set("active", org.luaj.vm2.LuaValue.valueOf(ownShip && SteeringIO.ringActive));
         t.set("buttonTurn", ownShip ? SteeringIO.buttonTurn : 0);
         t.set("targetRad", SteeringIO.targetHeadingRad);
+        t.set("holdUp", org.luaj.vm2.LuaValue.valueOf(ownShip && SteeringIO.holdUp));
+        t.set("holdDown", org.luaj.vm2.LuaValue.valueOf(ownShip && SteeringIO.holdDown));
+        t.set("holdLeft", org.luaj.vm2.LuaValue.valueOf(ownShip && SteeringIO.holdLeft));
+        t.set("holdRight", org.luaj.vm2.LuaValue.valueOf(ownShip && SteeringIO.holdRight));
+        t.set("rotLeft", org.luaj.vm2.LuaValue.valueOf(ownShip && SteeringIO.rotLeft));
+        t.set("rotRight", org.luaj.vm2.LuaValue.valueOf(ownShip && SteeringIO.rotRight));
+        t.set("rcsEnabled", org.luaj.vm2.LuaValue.valueOf(ownShip && SteeringIO.rcsEnabled));
         return t;
+    }
+
+    /** Ship centre of mass, box-local coords (same frame as getX/getY). */
+    public double getShipComX() { return part.ship != null ? part.ship.centerOfMass(comTmp).x : getX(); }
+    public double getShipComY() { return part.ship != null ? part.ship.centerOfMass(comTmp).y : getY(); }
+    private final com.badlogic.gdx.math.Vector2 comTmp = new com.badlogic.gdx.math.Vector2();
+
+    /** Editor Flip X mirror flag (round 34: RCS nozzle sidedness). */
+    public boolean isFlippedX() { return part.flippedX; }
+    /** Editor Flip Y mirror flag. */
+    public boolean isFlippedY() { return part.flippedY; }
+
+    /**
+     * Queue an RCS jet puff for this frame (round 34 task 3): size ~0..1.5,
+     * dirX/dirY = PLUME direction (world unit vector, opposite the thrust),
+     * localX/localY = nozzle offset in body-local metres. Rendered by
+     * SandboxScreen.drawRcsJets as small white particles.
+     */
+    public void emitJet(double size, double dirX, double dirY, double localX, double localY) {
+        part.emitJet((float) size, (float) dirX, (float) dirY, (float) localX, (float) localY);
     }
 
     /**

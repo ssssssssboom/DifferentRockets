@@ -32,9 +32,11 @@ public class Ship {
         public Part a, b;
         public boolean fuelEdge;
         public float breakForce = Float.MAX_VALUE;
+        /** round 34 task 2: reaction-TORQUE break limit (kN*m); MAX = unbreakable. */
+        public float breakTorque = Float.MAX_VALUE;
         /** index of each side's attach point in its part's attachDefs (-1 = unknown). */
         public int attachIndexA = -1, attachIndexB = -1;
-        /** consecutive frames spent over breakForce (debounce, see checkJointBreaks). */
+        /** consecutive frames spent over breakForce/breakTorque (debounce). */
         public int overFrames;
         /**
          * Round 33b (angular-viscous bushing): TRUE viscous damping torque
@@ -46,6 +48,17 @@ public class Ship {
          * mode energy. cVisc = angularDampingRatio * 2 * omega_ang * I_red.
          */
         public float cVisc;
+        /**
+         * Round 34 task 2 (linear-viscous bushing): viscous damping FORCE at
+         * the weld anchor against the relative LINEAR velocity of the two
+         * anchor points. The soft weld's linear channel is a rigid 2x2
+         * constraint with no damping at all, so cross-part impact energy
+         * (landing, squeeze) rattles forever; this bushing bleeds it.
+         * cViscLin = linearDampingRatio * 2 * omega_ang * m_red.
+         */
+        public float cViscLin;
+        /** cached world anchor (set at weld time; joints are rigidly placed). */
+        public final com.badlogic.gdx.math.Vector2 anchor = new com.badlogic.gdx.math.Vector2();
     }
 
     public final GameWorld world;
@@ -81,6 +94,14 @@ public class Ship {
     public final Vec2d originVel = new Vec2d();
     public boolean onRails = false;
     public boolean landed = false;
+    /**
+     * round 34: parked by velocityReanchor while touching kinematic terrain at
+     * a frame-relative speed above the fold threshold (bodies deactivated,
+     * whole frame-relative velocity carried in originVel). Wakes when
+     * |originVel| drops below GameWorld.WAKE_VEL. Cleared on rails transitions
+     * and when the player switches to this ship.
+     */
+    public boolean groundParked = false;
     public String name = "Ship";
 
     private final Vec2d tmp = new Vec2d();
@@ -222,7 +243,7 @@ public class Ship {
         // with the HIGHER frequencyHz wins — the stiffer side rules the
         // connection — and its dampingRatio comes along.
         JointScript.Params jp = new JointScript.Params();
-        float breakForce;
+        float breakForce, breakTorque;
         if (JointScript.resolve(a, apA, b, apB, jp)) {
             jd.frequencyHz = jp.frequencyHz;
             jd.dampingRatio = jp.dampingRatio;
@@ -231,6 +252,7 @@ public class Ship {
             // rate; joints.lua may name it explicitly via angularFrequencyHz.
             if (!Double.isNaN(jp.angularFrequencyHz)) jd.frequencyHz = (float) jp.angularFrequencyHz;
             breakForce = jp.breakForce > 0 ? jp.breakForce : Math.min(apA.breakForce, apB.breakForce);
+            breakTorque = jp.breakTorque > 0 ? jp.breakTorque : Math.min(apA.breakTorque, apB.breakTorque);
             debugLastWeldSource = "lua";
         } else {
             Part stiff = null;
@@ -245,6 +267,7 @@ public class Ship {
             jd.dampingRatio = (float) (stiff != null && !Double.isNaN(stiff.jointDampRatio)
                     ? stiff.jointDampRatio : PhysicsScript.jointParam("dampingRatio"));
             breakForce = Math.min(apA.breakForce, apB.breakForce);
+            breakTorque = Math.min(apA.breakTorque, apB.breakTorque);
             debugLastWeldSource = "fallback";
         }
         // debug toggle (probe): force every weld's frequency, e.g. -Dr.weldHz=0
@@ -266,6 +289,8 @@ public class Ship {
         l.b = b;
         l.fuelEdge = apA.fuelLine && apB.fuelLine;
         l.breakForce = breakForce;
+        l.breakTorque = breakTorque;
+        l.anchor.set(worldAnchor);
         l.attachIndexA = a.attachDefs().indexOf(apA);
         l.attachIndexB = b.attachDefs().indexOf(apB);
         // round 33b explicit viscous angular bushing across this weld. The
@@ -284,24 +309,108 @@ public class Ship {
         float iA = a.body.getInertia(), iB = b.body.getInertia();
         double iRed = (iA + iB) > 0 ? (double) iA * iB / (iA + iB) : 0;
         l.cVisc = (float) (zeta * 2.0 * (2 * Math.PI * Math.max(0, jd.frequencyHz)) * iRed);
+        // round 34 task 2 linear bushing: same zeta form against anchor-point
+        // relative LINEAR velocity, reduced MASS. Default 0 (probe matrix
+        // decides whether it earns a nonzero default).
+        double zetaLin = !Double.isNaN(jp.linearDampingRatio) ? jp.linearDampingRatio
+                : PhysicsScript.jointParam("linearDampingRatio");
+        String linOv = System.getProperty("dr.weldViscLin"); // debug toggle (probe)
+        if (linOv != null) {
+            try { zetaLin = Double.parseDouble(linOv); } catch (NumberFormatException ignore) {}
+        }
+        float mA = a.body.getMass(), mB = b.body.getMass();
+        double mRed = (mA + mB) > 0 ? (double) mA * mB / (mA + mB) : 0;
+        l.cViscLin = (float) (zetaLin * 2.0 * (2 * Math.PI * Math.max(0, jd.frequencyHz)) * mRed);
         links.add(l);
     }
 
     /**
-     * Apply the explicit viscous angular dampers (round 33b, cVisc above) once
-     * per physics SUBSTEP from GameWorld.substep, alongside the thrust/frame
-     * forces. Torque on each body opposes its rotation relative to the mate.
+     * Apply the explicit viscous dampers (round 33b angular, round 34 linear)
+     * once per physics SUBSTEP from GameWorld.substep, alongside the
+     * thrust/frame forces. Each opposing pair of torques/forces is internal
+     * to the welded pair (momentum-neutral).
      */
     public void applyJointDampers() {
         for (Link l : links) {
-            if (l.cVisc <= 0) continue;
+            if (l.cVisc <= 0 && l.cViscLin <= 0) continue;
             if (!l.a.body.isActive() || !l.b.body.isActive()) continue;
-            float dw = l.b.body.getAngularVelocity() - l.a.body.getAngularVelocity();
-            float torque = l.cVisc * dw;
-            l.a.body.applyTorque(torque, true);
-            l.b.body.applyTorque(-torque, true);
+            if (l.cVisc > 0) {
+                float dw = l.b.body.getAngularVelocity() - l.a.body.getAngularVelocity();
+                float torque = l.cVisc * dw;
+                l.a.body.applyTorque(torque, true);
+                l.b.body.applyTorque(-torque, true);
+            }
+            if (l.cViscLin > 0) {
+                Vector2 va = l.a.body.getLinearVelocityFromWorldPoint(l.anchor);
+                Vector2 vb = l.b.body.getLinearVelocityFromWorldPoint(l.anchor);
+                float fx = l.cViscLin * (vb.x - va.x), fy = l.cViscLin * (vb.y - va.y);
+                l.a.body.applyForce(fx, fy, l.anchor.x, l.anchor.y, true);
+                l.b.body.applyForce(-fx, -fy, l.anchor.x, l.anchor.y, true);
+            }
         }
     }
+
+    // ------------------------------------------------------------ crush (round 34 task 2)
+
+    /** live same-ship non-mate part contacts -> seconds spent squeezing. */
+    private final Map<com.badlogic.gdx.physics.box2d.Contact, Float> crush =
+            new java.util.LinkedHashMap<>();
+
+    /** Contact listener callback (GameWorld.crush): register a squeeze contact. */
+    void setCrush(Part pa, Part pb, com.badlogic.gdx.physics.box2d.Contact c, boolean begin) {
+        // direct weld mates never collide (collideConnected=false), but guard
+        // anyway: a mated pair is a joint, not a squeeze.
+        for (Link l : links) {
+            if ((l.a == pa && l.b == pb) || (l.a == pb && l.b == pa)) return;
+        }
+        if (begin) crush.put(c, 0f); else crush.remove(c);
+    }
+
+    /**
+     * SimpleRockets-style crush response: two parts of the SAME ship squeezed
+     * together get a separating force that grows LINEARLY with squeeze time
+     * until they pop apart — replacing the contact solver's one-frame impulse
+     * spike (the "squeeze explosion" that snaps welds on landing). Applied
+     * per substep alongside the joint dampers. forceRate (kN per second of
+     * squeeze) lives in physics.lua `crush = {forceRate=.., maxForce=..}`;
+     * 0 disables. probe 23 calibrates the default.
+     */
+    public void applyCrushForces(float h) {
+        if (crush.isEmpty()) return;
+        double rate = PhysicsScript.tableNumber("crush", "forceRate");
+        double fmax = PhysicsScript.tableNumber("crush", "maxForce");
+        String ov = System.getProperty("dr.crushRate"); // debug toggle (probe)
+        if (ov != null) {
+            try { rate = Double.parseDouble(ov); } catch (NumberFormatException ignore) {}
+        }
+        if (rate <= 0) return;
+        if (fmax <= 0) fmax = 5000; // kN safety cap
+        List<com.badlogic.gdx.physics.box2d.Contact> dead = null;
+        for (Map.Entry<com.badlogic.gdx.physics.box2d.Contact, Float> e : crush.entrySet()) {
+            com.badlogic.gdx.physics.box2d.Contact c = e.getKey();
+            Object ua = c.getFixtureA().getBody().getUserData();
+            Object ub = c.getFixtureB().getBody().getUserData();
+            if (!(ua instanceof Part) || !(ub instanceof Part)) { if (dead == null) dead = new ArrayList<>(); dead.add(c); continue; }
+            Part pa = (Part) ua, pb = (Part) ub;
+            if (pa.ship != this || pb.ship != this || pa.body == null || pb.body == null
+                    || !c.isTouching()) { if (dead == null) dead = new ArrayList<>(); dead.add(c); continue; }
+            float t = e.getValue() + h;
+            e.setValue(t);
+            double kn = Math.min(fmax, rate * t);
+            com.badlogic.gdx.physics.box2d.WorldManifold wm = c.getWorldManifold();
+            float nx = wm.getNormal().x, ny = wm.getNormal().y; // from A to B
+            Vector2[] pts = wm.getPoints();
+            float px = pts.length > 0 ? pts[0].x : (pa.body.getPosition().x + pb.body.getPosition().x) * 0.5f;
+            float py = pts.length > 0 ? pts[0].y : (pa.body.getPosition().y + pb.body.getPosition().y) * 0.5f;
+            float fx = (float) (kn * 1000) * nx, fy = (float) (kn * 1000) * ny;
+            pa.body.applyForce(-fx, -fy, px, py, true); // push A back along -normal
+            pb.body.applyForce(fx, fy, px, py, true);   // push B forward along +normal
+        }
+        if (dead != null) for (com.badlogic.gdx.physics.box2d.Contact c : dead) crush.remove(c);
+    }
+
+    /** Structural edits invalidate squeeze bookkeeping (parts moved to a new ship). */
+    void clearCrush() { crush.clear(); }
 
     public void removeJointsOf(Part p) {
         List<Link> dead = new ArrayList<>();
@@ -364,10 +473,20 @@ public class Ship {
     public void checkJointBreaks(float invDt) {
         List<Link> dead = new ArrayList<>();
         for (Link l : links) {
-            if (l.breakForce == Float.MAX_VALUE) continue;
-            Vector2 f = l.joint.getReactionForce(invDt);
-            float kn = f.len() / 1000f; // reaction force in kN
-            if (kn > l.breakForce) {
+            if (l.breakForce == Float.MAX_VALUE && l.breakTorque == Float.MAX_VALUE) continue;
+            boolean over = false;
+            if (l.breakForce != Float.MAX_VALUE) {
+                Vector2 f = l.joint.getReactionForce(invDt);
+                over = f.len() / 1000f > l.breakForce; // reaction force in kN
+            }
+            // round 34 task 2: torque channel (bending overload) — the soft
+            // weld is angularly elastic, so bending shows up as reaction
+            // torque even when the linear force stays small.
+            if (!over && l.breakTorque != Float.MAX_VALUE) {
+                float tq = Math.abs(l.joint.getReactionTorque(invDt)) / 1000f; // kN*m
+                over = tq > l.breakTorque;
+            }
+            if (over) {
                 if (++l.overFrames >= BREAK_DEBOUNCE_FRAMES) dead.add(l);
             } else {
                 l.overFrames = 0;
@@ -401,6 +520,7 @@ public class Ship {
             ncomp++;
         }
         if (ncomp < 2) return;
+        clearCrush(); // round 34: contacts re-resolve under the new ship split
         // main component = the one containing a pod, else the largest
         int mainComp = 0;
         int bestScore = -1;
@@ -797,7 +917,7 @@ public class Ship {
 
     public void updateScripts(double dt) {
         frameForces.clear(); // scripts re-register their continuous forces below
-        for (Part p : parts) p.flameLevel = 0f;
+        for (Part p : parts) { p.flameLevel = 0f; p.rcsJets.clear(); }
         for (Part p : parts) p.callOnUpdate(dt);
         // stage flags persist until the end of the frame so Lua onUpdate can read them
         for (Part p : parts) p.stageActivatedThisFrame = false;
@@ -819,6 +939,7 @@ public class Ship {
         for (Part p : parts) {
             if (p.body != null && "engine".equals(p.type.type)) {
                 p.flameLevel = 0f;
+                p.rcsJets.clear();
                 p.callOnUpdate(dt);
             }
         }

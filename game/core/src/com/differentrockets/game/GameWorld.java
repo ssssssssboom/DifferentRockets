@@ -111,6 +111,10 @@ public class GameWorld {
         inputThrottle = 0;
         SteeringIO.ringActive = false;
         SteeringIO.buttonTurn = 0;
+        // RCS pad: drop any held buttons on entry (the toggle itself persists)
+        SteeringIO.holdUp = SteeringIO.holdDown = false;
+        SteeringIO.holdLeft = SteeringIO.holdRight = false;
+        SteeringIO.rotLeft = SteeringIO.rotRight = false;
     }
 
     // steering ring (item 4): PI heading controller
@@ -182,6 +186,29 @@ public class GameWorld {
         terrain = new TerrainSystem(this);
         PhysicsScript.ensureBound(this);
         TerrainScript.ensureBound(this);
+        // round 34 task 2 (crush push-apart): track same-ship non-mate part
+        // contacts so Ship.applyCrushForces can ramp a gentle separating
+        // force (SimpleRockets-style) instead of letting squeezed parts
+        // explode through the contact solver.
+        boxWorld.setContactListener(new com.badlogic.gdx.physics.box2d.ContactListener() {
+            @Override public void beginContact(com.badlogic.gdx.physics.box2d.Contact c) { crush(c, true); }
+            @Override public void endContact(com.badlogic.gdx.physics.box2d.Contact c) { crush(c, false); }
+            @Override public void preSolve(com.badlogic.gdx.physics.box2d.Contact c,
+                                           com.badlogic.gdx.physics.box2d.Manifold m) {}
+            @Override public void postSolve(com.badlogic.gdx.physics.box2d.Contact c,
+                                            com.badlogic.gdx.physics.box2d.ContactImpulse i) {}
+        });
+    }
+
+    /** Contact-listener helper: register/unregister a same-ship non-mate part contact. */
+    private void crush(com.badlogic.gdx.physics.box2d.Contact c, boolean begin) {
+        Object ua = c.getFixtureA().getBody().getUserData();
+        Object ub = c.getFixtureB().getBody().getUserData();
+        if (!(ua instanceof Part) || !(ub instanceof Part)) return;
+        Part pa = (Part) ua, pb = (Part) ub;
+        Ship s = pa.ship;
+        if (s == null || s != pb.ship) return;
+        s.setCrush(pa, pb, c, begin);
     }
 
     public void setTime(double t) {
@@ -444,6 +471,13 @@ public class GameWorld {
         // a stage split): its engines keep that setting until we switch back
         if (active != null && active != s) active.latchedThrottle = inputThrottle;
         active = s;
+        if (s.groundParked) { // round 34: hand control back with honest velocities
+            final float wvx = (float) s.originVel.x, wvy = (float) s.originVel.y;
+            s.forEachBody(b -> b.setLinearVelocity(wvx, wvy));
+            s.originVel.set(0, 0);
+            s.groundParked = false;
+            s.setBodiesActive(true);
+        }
         reanchorToActive();
         updateRailsFlags();
         // round 20 item 6 (switch ship): the steering target and the
@@ -597,13 +631,69 @@ public class GameWorld {
         // clamp guard: fold oversized frame-relative velocities into originVel
         for (Ship s : ships) {
             if (s.onRails || s.parts.isEmpty()) continue;
+            // ground-parked ship (round 34): bodies deactivated while the
+            // frame outruns the terrain-contact speed domain (see below).
+            // Wake once the implied frame-relative velocity is safely under
+            // the fold threshold so contacts behave again.
+            if (s.groundParked) {
+                if (s.originVel.len2() < WAKE_VEL * WAKE_VEL) {
+                    final float wvx = (float) s.originVel.x, wvy = (float) s.originVel.y;
+                    s.forEachBody(b -> b.setLinearVelocity(wvx, wvy));
+                    s.originVel.set(0, 0);
+                    s.groundParked = false;
+                    s.setBodiesActive(true);
+                } else {
+                    continue; // stays parked; substep integrates originVel
+                }
+            }
             Vector2 bv = s.velocity(tmpV);
             if (bv.len2() < BODY_VEL_SAFE * BODY_VEL_SAFE) continue;
+            if (touchingKinematic(s)) {
+                // round 34 (probe22 root cause of detached-debris stutter):
+                // folding a ship that TOUCHES the kinematic terrain is a
+                // double-count — the ground contact re-imposes the terrain's
+                // frame velocity on the bodies within ONE substep, so the
+                // same velocity got folded into originVel every frame and the
+                // debris ran away to >2000 u/s in a per-frame staircase.
+                // Park instead: carry the whole frame-relative velocity in
+                // originVel (universe velocity conserved) and deactivate the
+                // bodies — no contacts, no leak, smooth planet-carry via the
+                // substep origin integration. Wakes above.
+                s.originVel.add(bv.x, bv.y);
+                s.forEachBody(b -> b.setLinearVelocity(0, 0));
+                s.setBodiesActive(false);
+                s.groundParked = true;
+                continue;
+            }
             s.originVel.add(bv.x, bv.y);
+            final float fbx = bv.x, fby = bv.y;
             s.forEachBody(b -> b.setLinearVelocity(
-                    b.getLinearVelocity().x - bv.x,
-                    b.getLinearVelocity().y - bv.y));
+                    b.getLinearVelocity().x - fbx,
+                    b.getLinearVelocity().y - fby));
         }
+    }
+
+    /** Parked ground ships wake below this frame-relative speed (u/s). */
+    private static final float WAKE_VEL = 90f;
+
+    /** Any live contact between this ship's bodies and a KINEMATIC (terrain) body? */
+    private boolean touchingKinematic(Ship s) {
+        for (com.badlogic.gdx.physics.box2d.Contact c : boxWorld.getContactList()) {
+            if (!c.isTouching()) continue;
+            com.badlogic.gdx.physics.box2d.Body ba = c.getFixtureA().getBody();
+            com.badlogic.gdx.physics.box2d.Body bb = c.getFixtureB().getBody();
+            com.badlogic.gdx.physics.box2d.Body other = null;
+            boolean hit = false;
+            for (Part p : s.parts) {
+                if (p.body == ba) { hit = true; other = bb; break; }
+                if (p.body == bb) { hit = true; other = ba; break; }
+            }
+            if (hit && other != null
+                    && other.getType() == com.badlogic.gdx.physics.box2d.BodyDef.BodyType.KinematicBody) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private final Vec2d tmp2d = new Vec2d();
@@ -619,6 +709,7 @@ public class GameWorld {
                     || (s != active && s.getUniversePos().dist(ap) > RAILS_DISTANCE);
             if (rails != s.onRails) {
                 s.onRails = rails;
+                s.groundParked = false; // round 34: rails machinery takes over the parking role
                 if (rails) {
                     // freeze: store frame-relative velocity, park the bodies rigidly.
                     // ADD into originVel: velocityReanchor may already have folded
@@ -699,7 +790,12 @@ public class GameWorld {
             // post-step housekeeping
             if (active != null) {
                 float invDt = 1f / PHYS_DT;
-                active.checkJointBreaks(invDt);
+                // round 34 task 2: break checks for EVERY physical ship, not
+                // just the active one — debris under real overload breaks too.
+                // snapshot: a broken weld splits the ship and mutates `ships`
+                for (Ship s : new java.util.ArrayList<>(ships)) {
+                    if (!s.onRails && !s.groundParked) s.checkJointBreaks(invDt);
+                }
                 reanchorToActive();
                 velocityReanchor();
                 updateLanded();
@@ -714,7 +810,7 @@ public class GameWorld {
             simDt = frameDt * warp;
             superWarp(simDt);
             if (active != null) {
-                for (Part p : active.parts) p.flameLevel = 0f;
+                for (Part p : active.parts) { p.flameLevel = 0f; p.rcsJets.clear(); }
                 updateLanded();
             }
         }
@@ -1063,6 +1159,7 @@ public class GameWorld {
             if (!s.onRails) {
                 s.applyFrameForces();
                 s.applyJointDampers(); // round 33b explicit angular viscous bushing
+                s.applyCrushForces(h); // round 34 task 2 squeeze push-apart
             }
         }
         boxWorld.step(h, VEL_ITER, POS_ITER);
@@ -1082,6 +1179,20 @@ public class GameWorld {
         // inside integrateRails instead.
         for (Ship s : ships) {
             if (!s.onRails && (s.originVel.x != 0 || s.originVel.y != 0)) {
+                // round 34: a ground-parked ship (velocityReanchor parks
+                // terrain-contacting debris instead of folding) has no
+                // contact friction — decay originVel toward the terrain's
+                // frame velocity so it slides to a stop like the real thing.
+                if (s.groundParked) {
+                    Vec2d up = s.getUniversePos();
+                    Planet np = nearestPlanetTo(up.x, up.y);
+                    if (np != null) {
+                        double gvx = np.vel.x - frameVel.x, gvy = np.vel.y - frameVel.y;
+                        double k = Math.min(1.0, 3.0 * h);
+                        s.originVel.x += (gvx - s.originVel.x) * k;
+                        s.originVel.y += (gvy - s.originVel.y) * k;
+                    }
+                }
                 s.origin.x += s.originVel.x * h;
                 s.origin.y += s.originVel.y * h;
             }

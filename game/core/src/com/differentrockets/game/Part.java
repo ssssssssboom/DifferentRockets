@@ -305,9 +305,10 @@ public class Part {
         if (body == null) return;
         double kg = type.massKg();
         if (type.tank != null) {
-            // tank dry mass uses the same 500 kg unit as PartType.mass;
-            // fuel units are already kg
-            kg = type.tank.dryMassTons * 500.0 + fuel;
+            // tank dry mass uses the same 50 kg unit as PartType.mass
+            // (SR TankObject::GetMass, .data:0x2542d8 = 50.0f); fuel mass is
+            // fuel units * 0.1 (SR: 6000 fuel = 12 XML mass = 600 kg)
+            kg = type.tank.dryMassTons * 50.0 + fuel * 0.1;
         }
         float m = (float) Math.max(0.05, kg);
         // SR RE §1/#10 (PartObject::CreatePhysics @ 0x1d28b4): moment of

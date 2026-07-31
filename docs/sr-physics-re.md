@@ -430,3 +430,21 @@
 8. `PartObject::PhysicsStep` 末尾 `vtbl[0x70]` 钩子语义（基类近空，子类用途未查）。
 9. `LocalPhysics` 构造的 10000.0 double 参数的确切存储字段与用途（范围判定之外的用途）。
 10. DetacherObject 常量 2500.0（`[+0x218]`）与 0.25（`[+0x210]`）的消费点（`DetacherObject::Update @ 0x1cb368` 未展开）。
+
+## 单位公约（round 37 起生效）
+
+DifferentRockets 采用 SR 原生单位，**SR 逆向得到的常量直接落地，禁止任何换算**：
+
+- **质量**：`质量 kg = XML mass × 50`。出处：`PartObject::GetMass` / `TankObject::GetMass`
+  共用 float 常量 50.0f（libNativeModule.so `.data:0x2542d8`，经 GOT `0x253a6c` 引用）。
+  实现：`PartType.massKg() = massTons * 50.0`。
+- **推力**：`推力 N = power × 8500`。出处：double 常量 8500.0（`@0x1cdb78`）。
+  实现：`mods/engine-*.lua` / `ion-0.lua` 的 `thrust = part:getEnginePower() * 8.5e3 * frac`。
+- **燃料质量**：`燃料 kg = fuel × 0.1`（SR 满油箱 6000 fuel = 12 XML 质量单位 = 600 kg）。
+  实现：`Part.updateMass()` 的 `dryMassTons * 50.0 + fuel * 0.1`。
+- **冲击阈值**：PartList.xml `explode="N"` 为法向冲量 N·s **原值原生适用**
+  （常见 1500/2500），`PartType.impactDestroy = explode × 0.36` 仍是估计值。
+
+迁移规则（round 37 一次性执行）：所有显式力/力矩常量 ÷10，所有质量 ×0.1，
+速度/角度/加速度不动 —— 迁移前后动力学完全一致（TWR、48 s 燃烧、
+20 m/s 轮地极速、断裂余量均不变）。

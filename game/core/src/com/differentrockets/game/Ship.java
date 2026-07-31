@@ -391,9 +391,11 @@ public class Ship {
      * together get a separating force that grows LINEARLY with squeeze time
      * until they pop apart — replacing the contact solver's one-frame impulse
      * spike (the "squeeze explosion" that snaps welds on landing). Applied
-     * per substep alongside the joint dampers. forceRate (kN per second of
-     * squeeze) lives in physics.lua `crush = {forceRate=.., maxForce=..}`;
-     * 0 disables. probe 23 calibrates the default.
+     * per substep alongside the joint dampers. forceRate (1000-N units per
+     * second of squeeze) lives in physics.lua `crush = {forceRate=.., maxForce=..}`;
+     * 0 disables. probe 23 calibrates the default. Round 37 unit migration:
+     * the lua values were /10 with all other force constants (500->50,
+     * 1500->150); the x1000 below keeps the applied N identical.
      */
     public void applyCrushForces(float h) {
         if (crush.isEmpty()) return;
@@ -404,7 +406,7 @@ public class Ship {
             try { rate = Double.parseDouble(ov); } catch (NumberFormatException ignore) {}
         }
         if (rate <= 0) return;
-        if (fmax <= 0) fmax = 5000; // kN safety cap
+        if (fmax <= 0) fmax = 500; // safety cap (500 kN after the /10 migration)
         List<com.badlogic.gdx.physics.box2d.Contact> dead = null;
         for (Map.Entry<com.badlogic.gdx.physics.box2d.Contact, Float> e : crush.entrySet()) {
             com.badlogic.gdx.physics.box2d.Contact c = e.getKey();

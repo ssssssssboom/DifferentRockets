@@ -1508,6 +1508,9 @@ public class GameWorld {
                         double fmag = 0.5 * rho * speed2 * cd * area;
                         // parts shadowed by upstream structure feel less drag
                         fmag *= p.dragExposure;
+                        // round 37 unit convention: forces /10 alongside masses
+                        // (mass = XML*50 now) so the deceleration is unchanged.
+                        fmag *= 0.1;
                         p.body.applyForceToCenter(
                                 (float) (-fmag * rvx / speed),
                                 (float) (-fmag * rvy / speed), false);
@@ -1528,6 +1531,9 @@ public class GameWorld {
                     double vol = p.type.width * p.type.height;
                     double glen = g.len();
                     double fb = np.waterDensity * vol * Math.max(0, p.type.buoyancy) * submersion * glen;
+                    // round 37 unit convention: force /10 alongside masses so
+                    // the float/sink balance is unchanged.
+                    fb *= 0.1;
                     // buoyancy acts radially outward (opposite local gravity)
                     p.body.applyForceToCenter((float) (dx / rr * fb), (float) (dy / rr * fb), false);
                     // SR #7 (round 36, PartObject::SimulateWater @ 0x1d2e20):

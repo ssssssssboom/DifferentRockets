@@ -1,4 +1,4 @@
--- v2026.07.31.4
+-- v2026.07.31.5
 -- ============================================================================
 -- physics.lua — physics laws (PLAYER-EDITABLE)
 -- ============================================================================
@@ -69,9 +69,11 @@ steering = { kp = 1.8, ki = 0.5, kd = 1.2 }
 --                  force > breakForce, reaction torque > breakTorque, or
 --                  angle deviation > breakAngle.
 -- Round 34 (v2026.07.31.4): break-system calibration + squeeze push-apart.
--- PartList.xml gives EVERY attach point breakForce=2000 kN / breakTorque=
--- 2500 kNm (~4-5x normal peaks): normal flight never breaks, a free-fall
--- hard landing (impact ~2e5 kN / ~1.9e6 kNm) snaps every weld as it should.
+-- PartList.xml gives EVERY attach point breakForce=200 (1000-N) /
+-- breakTorque=250 (1000-Nm) (~4-5x normal peaks; round 37: all force/torque
+-- constants /10 with the SR mass unit): normal flight never breaks, a
+-- free-fall hard landing (impact ~2e4 kN-equivalent / ~1.9e5) snaps every
+-- weld as it should.
 joints = { frequencyHz = 0.0, dampingRatio = 1.0, angularDamping = 0.0,
            angularFrequencyHz = 0.0, angularDampingRatio = 0.0,
            linearDampingRatio = 0.0, breakAngle = 0.6 }
@@ -79,11 +81,11 @@ joints = { frequencyHz = 0.0, dampingRatio = 1.0, angularDamping = 0.0,
 -- Squeeze push-apart (round 34, SimpleRockets-style): when two NON-welded
 -- parts of the same ship press into each other, a force ramps up along the
 -- contact normal to push them apart instead of letting them interpenetrate
--- and explode the welds. forceRate = kN/s ramp per second of sustained
--- contact; maxForce = cap in kN (kept below breakForce so the push itself
+-- and explode the welds. forceRate = 1000-N/s ramp per second of sustained
+-- contact; maxForce = cap in 1000-N units (kept below breakForce so the push itself
 -- can never snap a weld). Both default 0 (feature off) if this table is
 -- absent.
-crush = { forceRate = 500.0, maxForce = 1500.0 }
+crush = { forceRate = 50.0, maxForce = 150.0 }
 
 -- Per-part override (round 9): a part's own Lua script may call
 --   part:setJointParams{frequencyHz=…, dampingRatio=…, angularDamping=…}

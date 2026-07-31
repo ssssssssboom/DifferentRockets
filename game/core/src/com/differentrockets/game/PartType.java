@@ -33,7 +33,7 @@ public class PartType {
         public boolean fuelLine;
         public float breakAngle = 180f;
         public float breakForce = Float.MAX_VALUE;
-        /** round 34 task 2: reaction-TORQUE break limit (kN*m); MAX = unbreakable. */
+        /** round 34 task 2: reaction-TORQUE break limit (N*m, SR native unit); MAX = unbreakable. */
         public float breakTorque = Float.MAX_VALUE;
         public int group;
         public boolean flipX;
@@ -51,7 +51,7 @@ public class PartType {
     }
 
     public static class EngineDef {
-        public double power;          // -> thrust N = power * 1e6
+        public double power;          // -> thrust N = power * 8500 (SR native unit; binary double 8500.0 @0x1cdb78, applied in mods/engine-*.lua)
         public double consumption;    // fuel units per second at full throttle
         public float size = 1f;
         public float turnDeg;         // gimbal range
@@ -90,9 +90,9 @@ public class PartType {
      */
     public static class WheelDef {
         public float axleRadius = 1.0f;  // XML length units (0.5 m each)
-        public float maxTorque = 4000f;  // N*m at full drive
-        public float maxSpeed = 10f;     // motor target rad/s (tire peripheral = 20 m/s at r=2)
-        public float lockTorque = 8000f; // holding torque while locked/pre-stage
+        public float maxTorque = 400f;   // N*m at full drive (SR native unit; XML carries the same value)
+        public float maxSpeed = 10f;     // motor target rad/s (tire peripheral = 20 m/s at r=2) — speed, unchanged by the unit migration
+        public float lockTorque = 800f;  // holding torque while locked/pre-stage
     }
 
     /** Box2D collision categories: parts/axles, terrain blocks, wheel tires. */
@@ -102,7 +102,7 @@ public class PartType {
     public String name;
     public String sprite;
     public String type;
-    /** XML mass unit = 500 kg (owner calibration: pod mass=1.0 means 500 kg). */
+    /** XML mass unit = 50 kg (SR native unit; see massKg()). */
     public double massTons;
     public float width, height;       // XML length unit = 0.5 m (strut width=16 is 8 m)
     public float buoyancy = 0f;
@@ -122,9 +122,15 @@ public class PartType {
      * Damage field; binary: part+0x60 = destroy, part+0x68 = explode).
      * impactDestroy = impactExplode * 0.36 is an ESTIMATE — the RE report
      * does not give the +0x60/+0x68 ratio.
+     * UNITS (round 37): we now use SR's native unit system — SR's
+     * PartObject::GetMass / TankObject::GetMass compute mass = XML mass * 50.0
+     * (float constant at libNativeModule.so .data:0x2542d8 = 50.0f, referenced
+     * via GOT 0x253a6c, shared by both functions), and our massKg() does the
+     * same. Impulse = mass * velocity, so SR's 1500/2500 thresholds apply
+     * NATIVELY with no conversion: explode="N" -> impactExplode = N.
      */
-    public double impactDestroy = 540.0;  // 1500 * 0.36 default
-    public double impactExplode = 1500.0; // SR PartList common value
+    public double impactDestroy = 540.0;   // 1500 * 0.36 default (estimate)
+    public double impactExplode = 1500.0;  // SR PartList common 1500
 
     public EngineDef engine;
     public TankDef tank;
@@ -135,8 +141,13 @@ public class PartType {
     public final List<ShapeDef> shapes = new ArrayList<>();
     public final List<AttachPoint> attach = new ArrayList<>();
 
-    /** kg = XML mass units * 500 (unit = 500 kg, owner calibration round 27). */
-    public double massKg() { return massTons * 500.0; }
+    /**
+     * kg = XML mass units * 50. SR native unit (round 37): binary evidence —
+     * PartObject::GetMass / TankObject::GetMass use the float constant 50.0f
+     * at libNativeModule.so .data:0x2542d8 via GOT 0x253a6c. See
+     * docs/sr-physics-re.md "单位公约" — SR RE constants land unconverted.
+     */
+    public double massKg() { return massTons * 50.0; }
 
     public boolean isEngine() { return engine != null; }
     public boolean isTank() { return tank != null; }
@@ -171,9 +182,10 @@ public class PartType {
                 t.coverHeight = e.getFloatAttribute("coverHeight", 0f);
                 // SR RE §6: explode="N" on the part element (preferred), or on
                 // the SR-style <Damage explode="N"/> child; default 1500 (SR
-                // PartList common value). destroy = explode * 0.36 (ESTIMATE,
-                // ratio not recovered from the binary). Old saves/PartLists
-                // without either attribute fall back to the defaults above.
+                // PartList common 1500). Round 37 unit convention: our masses
+                // now match SR (massKg = XML*50, .data:0x2542d8), so the raw
+                // SR value applies natively — NO conversion. destroy =
+                // explode * 0.36 (ESTIMATE, ratio not recovered).
                 {
                     double exp = Xml.getDouble(e, "explode", Double.NaN);
                     if (Double.isNaN(exp)) {
@@ -181,7 +193,7 @@ public class PartType {
                         if (dmg != null) exp = Xml.getDouble(dmg, "explode", Double.NaN);
                     }
                     if (!Double.isNaN(exp)) {
-                        t.impactExplode = exp;
+                        t.impactExplode = exp;        // SR native value, no conversion
                         t.impactDestroy = exp * 0.36; // estimate, see field doc
                     }
                 }
@@ -226,9 +238,9 @@ public class PartType {
                     } else if ("Wheel".equals(cn)) {
                         WheelDef d = new WheelDef();
                         d.axleRadius = ch.getFloatAttribute("axleRadius", 1.0f);
-                        d.maxTorque = ch.getFloatAttribute("maxTorque", 4000f);
+                        d.maxTorque = ch.getFloatAttribute("maxTorque", 400f);
                         d.maxSpeed = ch.getFloatAttribute("maxSpeed", 10f);
-                        d.lockTorque = ch.getFloatAttribute("lockTorque", 8000f);
+                        d.lockTorque = ch.getFloatAttribute("lockTorque", 800f);
                         t.wheel = d;
                     } else if ("Shape".equals(cn)) {
                         ShapeDef sd = new ShapeDef();

@@ -294,18 +294,10 @@ public class Part {
         // moment of inertia: approximate as box
         float w = Math.max(0.2f, type.width), h = Math.max(0.2f, type.height);
         md.I = md.mass * (w * w + h * h) / 12f;
-        // Round 32 (solver-stability floor, probe19): a tiny connector (e.g.
-        // the 125 kg side detacher, box I ~= 177) welded between two 6.6 t
-        // tanks must transmit their ~200 kN*m weld torques through its ANGULAR
-        // constraint channel. Box2D's constraint effective mass there is the
-        // part's own inertia, so a tiny-I body is numerically under-converged
-        // even with rigid (0 Hz) welds at 24/4 iterations — the booster stack
-        // held a steady ~0.4-1.6 deg twist. Real connectors resist torque by
-        // material stiffness (mass-independent), so flooring the radius of
-        // gyration at sqrt(25) = 5 u (the typical weld lever-arm scale) is a
-        // better solver model AND physically defensible. x15+ on the detacher
-        // measured noise-level twist; heavy parts are already far above this.
-        md.I = Math.max(md.I, md.mass * 25f);
+        // Round 35 (SimpleRockets model): round 32's artificial inertia floor
+        // (I >= m*25) is REMOVED — SR uses the real box inertia for every
+        // part; the small-body twist it was suppressing is part of the
+        // intended under-converged 6/2 feel.
         md.center.set(0, 0);
         body.setMassData(md);
     }

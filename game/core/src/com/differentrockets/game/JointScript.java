@@ -42,6 +42,10 @@ public final class JointScript {
         public float breakForce = -1f;   // <0 = caller default (min of attach points)
         /** round 34 task 2: torque break limit (kN*m); <0 = caller default. */
         public float breakTorque = -1f;
+        /** round 35 (SimpleRockets model): angle-deviation break threshold in
+         *  radians (|current angle diff - weld-time diff| > breakAngle => break,
+         *  single frame); NaN = caller default (0.6 rad, SR's value). */
+        public double breakAngle = Double.NaN;
         public boolean fromLua;
     }
 
@@ -72,6 +76,7 @@ public final class JointScript {
             out.angularFrequencyHz = t.get("angularFrequencyHz").optdouble(Double.NaN);
             out.angularDampingRatio = t.get("angularDampingRatio").optdouble(Double.NaN);
             out.linearDampingRatio = t.get("linearDampingRatio").optdouble(Double.NaN);
+            out.breakAngle = t.get("breakAngle").optdouble(Double.NaN);
             double angDamp = t.get("angularDamping").optdouble(Double.NaN);
             if (!Double.isNaN(angDamp)) {
                 // per-connection angular damping applies to both bodies

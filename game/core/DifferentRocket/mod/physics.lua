@@ -40,80 +40,41 @@
 -- kept only so old player scripts reading it don't break — nothing reads it.
 steering = { kp = 1.8, ki = 0.5, kd = 1.2 }
 
--- Weld-joint (part connection) tuning. The ship's parts are held together by
--- spring-damper weld joints; these three values control how rigid the rocket
--- feels. All keys are optional — delete one and the default takes over.
---   frequencyHz    spring stiffness of every part-to-part weld (REAL elastic
---                  semantics). Default 48 Hz since v2026.07.31.2: a firm but
---                  genuinely elastic joint. Physics stepping is 120 Hz
---                  (round 33), so the stable ceiling is ~60 Hz — do not
---                  exceed it. Lower = softer. 0 = fully rigid (no-elasticity
---                  fallback; breakForce detection works in both modes).
---   dampingRatio   weld damping: 1.0 = critically damped (no elastic
---                  oscillation), >1 = over-damped.  Below ~0.9 the rocket
---                  visibly wobbles after burns/turns.
+-- Weld-joint (part connection) tuning. SimpleRockets model (round 35,
+-- v2026.07.31.5, SR APK ARM disassembly verified): parts are held together by
+-- FULLY RIGID weld joints (frequencyHz = 0) with NO explicit damping; the
+-- fixed 1/60 s step with 6 velocity / 2 position solver iterations leaves
+-- the rigid constraints under-converged, and that residual deformation IS
+-- the soft / wobbly rocket feel. Iteration counts are player-tunable via
+-- -Dr.velIter= / -Dr.posIter= (lower = softer, higher = stiffer).
+-- All keys are optional — delete one and the default takes over.
+--   frequencyHz    weld spring stiffness. Default 0 = fully rigid (SR).
+--                  >0 reverts to soft-spring welds (old behavior, experiments
+--                  only).
+--   dampingRatio   Box2D soft-weld damping ratio; only matters when
+--                  frequencyHz > 0.
 --   angularFrequencyHz    explicit name for the angular spring rate (equals
---                  frequencyHz — v2026.07.31.3 source fact: this engine's
---                  soft weld is LINEARLY rigid; elasticity only exists in
---                  the angular channel, so frequencyHz IS the angular
---                  spring rate).
---   angularDampingRatio   explicit viscous angular damping (v2026.07.31.3,
---                  the REAL vibration killer). Every physics substep applies
---                  tau=-+c*dw across each weld with c = zeta*2*omega*I_red.
---                  Default 1.0 = critical. Probe 21 at 48 Hz: full-throttle
---                  steady-state bend 0.067 deg, overshoot 1.00, a 5.4 deg
---                  impulse kick settles in 0.65 s with zero regrowth. The
---                  joint's own dampingRatio above saturates and barely damps
---                  structural bending (>3 s ringing at any value 1.0-1.6).
---                  Safe range: zeta <= 1.5 (2.0 goes numerically unstable).
+--                  frequencyHz).
+--   angularDampingRatio   explicit viscous angular damping (debug key,
+--                  default 0 = OFF in the SR model). Applies tau=-+c*dw per
+--                  substep across each weld with c = zeta*2*omega*I_red.
 --   angularDamping per-part rotational damping (Box2D body property, 0=none).
---                  Round 12: raised 0.08 -> 0.6 because the control.lua law is
---                  pure proportional (gimbal = clamped heading error, no
---                  derivative term), so mechanical damping is the only legal
---                  stabilizer. Round 13: 0.6 -> 2.5. Full-trajectory telemetry
---                  (HDG/ANGVEL in --smoke) showed the ship does NOT settle
---                  exponentially under this law: it enters a +-3..4 deg limit
---                  cycle around the target whose amplitude is set by the
---                  nonlinear plant (fuel burn shifts CoM/inertia), NOT by
---                  damping, and ~11 s into the turn-hold the growing plant
---                  leaves the P-law's region of attraction and the stack
---                  gravity-turns over (HDG runs past -90 deg) at ANY damping
---                  0.6..3.0. What damping DOES control is the phase and the
---                  width of the bounded plateau around the target. Measured
---                  plateaus (per-second |err| around the step-600 check):
---                  2.0 -> passes only at t=10s (neighbours fail); 3.0 -> t=9s
---                  margin 0.1 deg; 2.5 -> every sample t=6..10s within 1.85
---                  deg of the target = ~4 s of phase tolerance, the most
---                  robust window available. Cost: sustained turn rate scales
---                  ~1/damping, so coarse slews feel heavier than the PID era.
--- Round 23 (v2026.07.27): unified to 28 Hz / 1.0 / 1.0 for EVERY connection,
--- matching joints.lua's DEFAULT_* constants; the per-part overrides shipped
--- in earlier rounds (strut-1, dock-1, port-1) were removed.
--- Round 32 (v2026.07.31): frequencyHz 28 -> 0 (fully RIGID weld) after
--- probe 19 root-caused the heavy parallel-booster twist (the 28 Hz spring
--- deflected visibly under ~100 kN shear couples).
--- Round 33 (v2026.07.31.2): frequencyHz 0 -> 48 — real elasticity restored
--- (owner rejected absolute rigidity). Enablers: physics stepping 60->120 Hz
--- (stable domain ~60 Hz), fixed 24/4 solver iterations, and the round-32
--- angular-inertia floor (I>=m*25) which also stiffens the angular spring
--- channel ~17x. Probe 20: triple-booster full-throttle climb -> max weld
--- angle dev 0.067 deg, stretch <0.1 mm, no oscillation; small ships clean.
--- Round 33b (v2026.07.31.3): angular/linear semantics split (source fact:
--- soft weld = linearly rigid + angularly soft) and an explicit viscous
--- angular damper (angularDampingRatio, default 1.0) that actually removes
--- bending-mode energy — the joint's built-in damping could not (probe 21).
+--                  Default 0 in the SR model.
+--   linearDampingRatio  linear anchor viscous damping (debug key, default 0;
+--                  measured numerically unstable when >0 — do not enable).
+--   breakAngle     angle-deviation break threshold in radians (default 0.6,
+--                  SR's value). A weld breaks the first physics frame that
+--                  |current angle diff - weld-time angle diff| exceeds it.
+--                  Break checks are SINGLE-FRAME, three channels: reaction
+--                  force > breakForce, reaction torque > breakTorque, or
+--                  angle deviation > breakAngle.
 -- Round 34 (v2026.07.31.4): break-system calibration + squeeze push-apart.
--- Probe-23 matrix (triple-booster, 4 phases: spawn/30%/100%/coast): normal
--- weld peaks F<=390 kN, Tq<=520 kNm across solver iterations 24/4, 12/4,
--- 8/2 — iterations barely move peaks, 24/4 stays. A LINEAR anchor damper
--- (linearDampingRatio > 0) exploded reaction forces 1000x+ (anchor lever-arm
--- feedback) — it ships DISABLED (0.0). PartList.xml now gives EVERY attach
--- point breakForce=2000 kN / breakTorque=2500 kNm (~4-5x normal peaks):
--- normal flight never breaks (probe-23 both configs), a free-fall hard
--- landing (impact ~2e5 kN / ~1.9e6 kNm) snaps every weld as it should.
-joints = { frequencyHz = 48.0, dampingRatio = 1.0, angularDamping = 1.0,
-           angularFrequencyHz = 48.0, angularDampingRatio = 1.0,
-           linearDampingRatio = 0.0 }
+-- PartList.xml gives EVERY attach point breakForce=2000 kN / breakTorque=
+-- 2500 kNm (~4-5x normal peaks): normal flight never breaks, a free-fall
+-- hard landing (impact ~2e5 kN / ~1.9e6 kNm) snaps every weld as it should.
+joints = { frequencyHz = 0.0, dampingRatio = 1.0, angularDamping = 0.0,
+           angularFrequencyHz = 0.0, angularDampingRatio = 0.0,
+           linearDampingRatio = 0.0, breakAngle = 0.6 }
 
 -- Squeeze push-apart (round 34, SimpleRockets-style): when two NON-welded
 -- parts of the same ship press into each other, a force ramps up along the

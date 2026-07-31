@@ -112,31 +112,29 @@ public final class PhysicsScript {
         return v.isnumber() ? v.todouble() : def;
     }
 
-    // Tuned defaults (round 6): near-critically damped welds, stiffer springs
-    // (20 Hz stays below the 30 Hz Nyquist limit of the 60 Hz physics step);
-    // editable in mod/physics.lua via the `joints` table.
-    // round 27 owner tuning: built-in joint defaults are 20 Hz / 1.0 / 1.0;
-    // physics.lua's joints table (player-editable) overrides these when present.
-    // Round 33b: frequencyHz IS the angular spring rate (this Box2D build's
-    // soft weld is linear-rigid + angular-soft — see b2WeldJoint source);
-    // angularDampingRatio feeds the explicit viscous bushing (Ship.Link.cVisc).
-    // Probe 21 tuning: 48 Hz / zeta=1.0 -> steady 0.067 deg, decay 0.65 s,
-    // overshoot 1.00, no regrowth; zeta=2.0 at 24 Hz went unstable, so keep
-    // the damper at zeta<=1.5. Higher frequency (64) is even stiffer but
-    // leaves less stability margin for player-modded stacks.
-    private static final double DEF_JOINT_FREQ = 48.0, DEF_JOINT_DAMP = 1.0,
-            DEF_ANG_DAMP = 1.0, DEF_ANG_VISC = 1.0, DEF_LIN_VISC = 0.0; // probe 23 decides LIN_VISC
+    // Round 35 (SimpleRockets model, SR APK ARM disassembly verified):
+    // built-in joint defaults are RIGID welds — frequencyHz 0 — with NO
+    // explicit damping anywhere. The "soft / wobbly" feel comes from the
+    // 6/2-iteration solver being under-converged at the fixed 1/60 step, not
+    // from springs or dampers. The damping keys stay editable (debug only)
+    // but default to 0; breakAngle (rad) is the SR angle-deviation break
+    // channel (|current - weld-time angle diff| > threshold, single frame).
+    private static final double DEF_JOINT_FREQ = 0.0, DEF_JOINT_DAMP = 1.0,
+            DEF_ANG_DAMP = 0.0, DEF_ANG_VISC = 0.0, DEF_LIN_VISC = 0.0,
+            DEF_BREAK_ANGLE = 0.6;
 
     /**
      * Weld-joint parameters from Lua (`joints = {frequencyHz=.., dampingRatio=..,
      * angularDamping=.., angularFrequencyHz=.., angularDampingRatio=..,
-     * linearDampingRatio=..}`), falling back to the tuned defaults per key.
+     * linearDampingRatio=.., breakAngle=..}`), falling back to the tuned
+     * defaults per key.
      */
     public static double jointParam(String key) {
         double def = "frequencyHz".equals(key) ? DEF_JOINT_FREQ
                 : "dampingRatio".equals(key) ? DEF_JOINT_DAMP
                 : "angularFrequencyHz".equals(key) ? DEF_JOINT_FREQ
                 : "linearDampingRatio".equals(key) ? DEF_LIN_VISC
+                : "breakAngle".equals(key) ? DEF_BREAK_ANGLE
                 : "angularDampingRatio".equals(key) ? DEF_ANG_VISC : DEF_ANG_DAMP;
         Globals g = bound;
         if (g == null) return def;
@@ -171,6 +169,7 @@ public final class PhysicsScript {
             case "angularFrequencyHz": return DEF_JOINT_FREQ;
             case "angularDampingRatio": return DEF_ANG_VISC;
             case "linearDampingRatio": return DEF_LIN_VISC;
+            case "breakAngle": return DEF_BREAK_ANGLE;
             default: return 0;
         }
     }

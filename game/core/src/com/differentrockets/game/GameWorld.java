@@ -22,20 +22,21 @@ import java.util.Map;
  */
 public class GameWorld {
 
-    public static final float PHYS_DT = 1f / 120f;
+    // SimpleRockets physics model (round 35, APK ARM disassembly verified):
+    // fixed 1/60 step, 6 velocity / 2 position iterations, rigid 0 Hz weld
+    // joints. The solver's UNDER-CONVERGENCE residual at 6/2 IS the soft /
+    // wobbly rocket feel — there is no spring and no explicit damper anywhere.
+    public static final float PHYS_DT = 1f / 60f;
     /**
      * Solver iteration counts, FIXED for every ship regardless of size
-     * (owner requirement, round 32: physical consistency — the same structure
-     * must behave identically whether it flies alone or next to a big ship).
-     * 24/4 is what the heavy parallel-booster probe (10 parts, closed weld
-     * loops, 53:1 weld mass ratios) needs to fully converge the sequential-
-     * impulse solver: at the old flat 8/3 the under-converged 28 Hz welds
-     * buzzed with 3.5 MN reaction oscillation and >1 unit of weld stretch
-     * while parked; at 24/4 every metric drops to noise level. Small ships
-     * pay the same cost for uniformity.
+     * (physical consistency: the same structure must behave identically
+     * whether it flies alone or next to a big ship). 6/2 = SimpleRockets
+     * values. LOWER iterations = SOFTER rockets (under-converged rigid welds
+     * deform more); higher = stiffer. Players can tune the feel with
+     * -Dr.velIter= / -Dr.posIter= (e.g. 8/3 stiffer, 4/1 very soft).
      */
-    public static final int VEL_ITER = Integer.getInteger("dr.velIter", 24),
-            POS_ITER = Integer.getInteger("dr.posIter", 4);
+    public static final int VEL_ITER = Integer.getInteger("dr.velIter", 6),
+            POS_ITER = Integer.getInteger("dr.posIter", 2);
     public static final double RAILS_DISTANCE = 20000.0; // beyond this ships go on rails
 
     /**
@@ -762,15 +763,12 @@ public class GameWorld {
             // here forces superWarp() to recompute from the LIVE state on
             // the next super-warp entry.
             wtCount = 0;
-            // Round 33: PHYS_DT 1/60 -> 1/120. Elastic weld joints (real
-            // frequencyHz semantics restored per owner) must live well below
-            // the Nyquist limit of HALF the step rate: at 60 Hz stepping the
-            // ceiling was ~30 Hz, and a <=28 Hz spring deflected ~26 mm per
-            // weld under the triple-booster's ~100 kN shear couples (visible
-            // ~5 deg lean). At 120 Hz a ~48-56 Hz spring is stably solvable,
-            // cutting static deflection 4x into the invisible range while the
-            // joint stays a genuine spring-damper. Substep cap doubles so a
-            // 60 fps frame still covers warp 4.
+            // Round 35 (SimpleRockets model): PHYS_DT back to 1/60. SR runs a
+            // fixed 60 Hz step with 6/2 solver iterations and RIGID (0 Hz)
+            // weld joints; the under-converged rigid constraints deform
+            // elastically on their own, which is SR's soft-rocket feel.
+            // Substep cap stays 16 so a 60 fps frame still covers warp 4
+            // with generous headroom.
             int steps = Math.max(1, Math.min(16, Math.round(frameDt * warp / PHYS_DT)));
             for (int i = 0; i < steps; i++) {
                 substep(PHYS_DT);

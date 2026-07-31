@@ -36,8 +36,18 @@ public class Ship {
         public float breakTorque = Float.MAX_VALUE;
         /** index of each side's attach point in its part's attachDefs (-1 = unknown). */
         public int attachIndexA = -1, attachIndexB = -1;
-        /** consecutive frames spent over breakForce/breakTorque (debounce). */
-        public int overFrames;
+        /**
+         * Round 35 (SimpleRockets model): the two bodies' angle difference
+         * (a.angle - b.angle) recorded at weld time. checkJointBreaks breaks
+         * the link the moment the LIVE difference deviates from this by more
+         * than breakAngle — SR's angle channel, single-frame criterion.
+         */
+        public float initialAngleDiff;
+        /**
+         * Angle-deviation break threshold in radians (SR default ~0.6).
+         * From joints.lua breakAngle or the built-in default.
+         */
+        public float breakAngle = 0.6f;
         /**
          * Round 33b (angular-viscous bushing): TRUE viscous damping torque
          * applied per substep against the relative angular velocity of the
@@ -321,6 +331,16 @@ public class Ship {
         float mA = a.body.getMass(), mB = b.body.getMass();
         double mRed = (mA + mB) > 0 ? (double) mA * mB / (mA + mB) : 0;
         l.cViscLin = (float) (zetaLin * 2.0 * (2 * Math.PI * Math.max(0, jd.frequencyHz)) * mRed);
+        // Round 35 (SimpleRockets model): a rigid weld (0 Hz) must carry NO
+        // explicit damping — the omega scale factor already zeros both
+        // bushings at freq 0, but force it explicitly so a stray zeta
+        // override can never re-enable the damper layer on rigid links.
+        if (jd.frequencyHz <= 0) { l.cVisc = 0; l.cViscLin = 0; }
+        // SR angle-break channel: remember the weld-time angle difference.
+        l.initialAngleDiff = a.body.getAngle() - b.body.getAngle();
+        l.breakAngle = (float) (!Double.isNaN(jp.breakAngle) ? jp.breakAngle
+                : PhysicsScript.jointParam("breakAngle"));
+        if (l.breakAngle <= 0) l.breakAngle = 0.6f; // SR default
         links.add(l);
     }
 
@@ -460,37 +480,39 @@ public class Ship {
     }
 
     /**
-     * Destroy joints whose reaction force exceeds their breakForce. The overload
-     * must PERSIST for BREAK_DEBOUNCE_FRAMES consecutive frames: a single-frame
-     * spike is almost always a position-correction impulse (spawn settling,
-     * ground-contact jitter amplified by stiff 35 Hz strut joints), not a real
-     * structural overload — probe showed 170-250 kN one-frame spikes on a
-     * healthy pad spawn, while genuine overloads (hard landing, over-stacked
-     * weight) hold the force high for many frames.
+     * SimpleRockets break model (round 35, SR APK ARM disassembly verified):
+     * SINGLE-FRAME criterion, checked every physics step, THREE channels —
+     * any one tripping destroys the link immediately:
+     *   1. force:  |getReactionForce(invDt)|  > breakForce   (kN)
+     *   2. torque: |getReactionTorque(invDt)| > breakTorque  (kN*m)
+     *   3. angle:  |current angle diff - weld-time angle diff| > breakAngle
+     *      (rad, SR default ~0.6)
+     * No debounce / persistence window — SR breaks on the first over-limit
+     * frame. Spawn-settling spikes are gone now that welds are rigid 0 Hz
+     * and the old soft-spring jitter they fed on no longer exists.
      */
-    static final int BREAK_DEBOUNCE_FRAMES = 5; // ~83 ms at 60 fps
-
     public void checkJointBreaks(float invDt) {
         List<Link> dead = new ArrayList<>();
         for (Link l : links) {
-            if (l.breakForce == Float.MAX_VALUE && l.breakTorque == Float.MAX_VALUE) continue;
+            if (l.breakForce == Float.MAX_VALUE && l.breakTorque == Float.MAX_VALUE
+                    && l.breakAngle == Float.MAX_VALUE) continue;
             boolean over = false;
             if (l.breakForce != Float.MAX_VALUE) {
                 Vector2 f = l.joint.getReactionForce(invDt);
                 over = f.len() / 1000f > l.breakForce; // reaction force in kN
             }
-            // round 34 task 2: torque channel (bending overload) — the soft
-            // weld is angularly elastic, so bending shows up as reaction
-            // torque even when the linear force stays small.
             if (!over && l.breakTorque != Float.MAX_VALUE) {
                 float tq = Math.abs(l.joint.getReactionTorque(invDt)) / 1000f; // kN*m
                 over = tq > l.breakTorque;
             }
-            if (over) {
-                if (++l.overFrames >= BREAK_DEBOUNCE_FRAMES) dead.add(l);
-            } else {
-                l.overFrames = 0;
+            // SR angle channel: rigid welds barely bend in the solver, so a
+            // large live deviation from the weld-time angle difference means
+            // the structure has been genuinely torn.
+            if (!over && l.breakAngle != Float.MAX_VALUE) {
+                float diff = l.a.body.getAngle() - l.b.body.getAngle();
+                over = Math.abs(diff - l.initialAngleDiff) > l.breakAngle;
             }
+            if (over) dead.add(l);
         }
         for (Link l : dead) destroyLink(l);
         if (!dead.isEmpty()) splitIfDisconnected();

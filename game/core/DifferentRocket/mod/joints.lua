@@ -1,7 +1,21 @@
--- v2026.07.31.4
+-- v2026.07.31.5
 -- ============================================================================
 -- joints.lua — 连接（焊接点）规则（玩家可改）
 -- ============================================================================
+-- SimpleRockets 连接模型（round 35，已从 SR 的 APK ARM 汇编逐条核实）：
+--
+--   * 零件连接 = 完全刚性的焊接关节（frequencyHz = 0），没有任何弹簧，
+--     也没有任何显式阻尼。
+--   * 物理固定 1/60 秒步长，求解器 6 次速度迭代 / 2 次位置迭代。
+--     刚性约束在 6/2 迭代下欠收敛，残余变形本身就是 SR 火箭"软/摇摆"
+--     手感的来源——迭代数越低越软，越高越硬。玩家可用 JVM 属性
+--     -Dr.velIter= / -Dr.posIter= 调整（如 8/3 更硬，4/1 非常软）。
+--   * 断裂判据：每个物理帧单帧判定，三通道任一超限立即断：
+--       1) 反作用力  > breakForce（千牛）
+--       2) 反作用扭矩 > breakTorque（千牛·米）
+--       3) 角度偏差  |当前两体夹角 − 焊接时夹角| > breakAngle（弧度，
+--          SR 默认约 0.6）
+--
 -- 每形成一处连接，游戏都会调用 jointParams(partA, attachA, partB, attachB)，
 -- 用返回的表覆盖默认焊接参数。整段函数可删：删除或报错后，游戏退回内置规则
 -- （零件各自 setJointParams 的覆盖值，frequencyHz 高者胜，阻尼比随之）。
@@ -13,73 +27,43 @@
 --         fuelLine        是否燃油管路点（true/false）
 --         edge            0=普通单点 1=左边 2=右边 3=顶边 4=底边（整条边可连）
 --         breakForce      该连接点的断裂力上限（千牛）；不可断的点省略此键
---         breakTorque     该连接点的断裂扭矩上限（千牛·米，v2026.07.31.4 起）}
+--         breakTorque     该连接点的断裂扭矩上限（千牛·米）}
 --
 -- 返回表（键都可省略，省略即用默认值）：
---   frequencyHz    焊接弹簧频率（赫兹，真实弹性语义）。48 为默认
---                  （v2026.07.31.2 起）：有明确弹性的硬弹簧。物理步进已升至
---                  120 Hz（round 33），稳定求解域上限约 60 Hz——不要超过。
---                  越低越软：2-5 松软像橡胶，20-30 中等。0 = 完全刚性
---                  （无弹性的备选；断裂检测两种模式下都按 breakForce 反作用力）。
---   dampingRatio   阻尼比。<1 欠阻尼（回弹），1 临界阻尼，>1 过阻尼（发黏）。
---                  注意（v2026.07.31.3 源码事实）：本引擎 Box2D 软焊接的
---                  frequencyHz/dampingRatio 只作用于【角向】通道——线向
---                  始终是刚性约束，不会变弹；且其内置阻尼公式对重型堆叠的
---                  弯曲模态几乎无效（probe21 实测 ringing >3 秒）。真正消振
---                  请用下面的 angularDampingRatio。
+--   frequencyHz    焊接弹簧频率（赫兹）。默认 0 = 完全刚性（SR 模型）。
+--                  >0 会变回软弹簧焊接（旧行为，仅供实验）；刚性模式下弹性
+--                  手感完全由求解器欠收敛提供，不需要它。
+--   dampingRatio   Box2D 软焊接阻尼比，仅 frequencyHz > 0 时有意义。默认 1。
 --   angularFrequencyHz    角向弹簧频率的显式命名（= frequencyHz，二选一，
---                  同时给出时此键优先）。v2026.07.31.3 新增。
---   angularDampingRatio   显式黏性角阻尼比（v2026.07.31.3 新增，真消振）。
+--                  同时给出时此键优先）。
+--   angularDampingRatio   显式黏性角阻尼比（调试键，默认 0 = 关闭）。
 --                  每个物理子步对两零件施加 τ=∓c·Δω，c = ζ·2ω·I_red。
---                  1.0 = 临界阻尼（默认，probe21：48Hz 下满推力爬升稳态
---                  0.067°、扰动 0.65 秒收敛、无回摆）。安全上限约 1.5，
---                  2.0 会数值失稳（发散抖动）。
---   angularDamping 两零件的角速度阻尼（每秒衰减比例，0=不衰减）。
---   linearDampingRatio  线向锚点黏性阻尼比（v2026.07.31.4 新增，默认 0=
---                  关闭）。probe23 矩阵实测：>0 时锚点杠杆臂反馈把焊缝
---                  反作用力放大千倍以上（数值失稳）——仅调试用，不要开启。
+--                  SR 模型下不使用；仅在实验软弹簧时有用。
+--   angularDamping 两零件的角速度阻尼（每秒衰减比例，默认 0 = 不衰减）。
+--   linearDampingRatio  线向锚点黏性阻尼比（调试键，默认 0 = 关闭；
+--                  实测 >0 在重载下数值失稳，不要开启）。
 --   breakForce     断裂力上限（千牛）。省略时取两连接点中较小的那个；
---                  想造永不分离的连接可填 1e18。
---   breakTorque    断裂扭矩上限（千牛·米，v2026.07.31.4 新增）。省略时取
---                  两连接点中较小的那个；力/扭矩任一通道持续 5 帧超限即断。
+--                  想造永不分离的连接可填 1e18。单帧超限即断。
+--   breakTorque    断裂扭矩上限（千牛·米）。省略时取两连接点中较小的那个。
+--                  单帧超限即断。
+--   breakAngle     断裂角度偏差上限（弧度，默认 0.6，SR 的值）。
+--                  |当前两体夹角 − 焊接时夹角| 单帧超过即断。
 --
 -- 下面这个默认实现还原了内置规则，可在此基础上改造，例如：
 --   * 按零件类型定软硬    if partA:getTypeId() == "strut-1" then ... end
 --   * 按连接点位置定软硬  if attachA.edge ~= 0 then ... end
 --   * 让引擎座更容易断    if attachA.breakForce then ... end
 -- ============================================================================
-
--- Round 22 (v2026.07.26): 通用默认值改为 20 Hz / 1.0 / 1.0，直接写在本
--- 文件里（此前转读 physics.lua 的 `joints` 表，该表仍是旧的 20/1.1/0.6，
--- 已不再是默认链路的一环）。
--- Round 23 (v2026.07.27): 全部连接点性质统一为 28 Hz / 1.0 / 1.0 ——
--- DEFAULT_FREQ 20.0 -> 28.0，physics.lua 的 `joints` 表同步为同一组值，
--- 零件 lua 里的显式覆盖（strut-1 24Hz/1.25、dock-1/port-1 8Hz/0.9）已删除。
--- Round 32 (v2026.07.31): 默认改为 0 Hz（完全刚性焊接）。根因排查（probe19）
--- 证实 28 Hz 软弹簧在重载剪切耦合下产生真实静载变形：侧挂三联助推满推力
--- 爬升时助推器外倾约 5°（弹簧线变形差所致），与求解迭代数无关。
--- Round 33 (v2026.07.31.2): 恢复真实弹性默认 48 Hz / 1.0（用户否决绝对刚性）。
--- 配套：物理步进 60->120 Hz（稳定域上限 ~60 Hz，probe20 实测 48 Hz 满推力
--- 爬升最大角位移 0.067°、拉伸 <0.1 mm、无振荡，28 Hz 在同条件下 0.22°
--- 也及格但余量小）；求解迭代固定 24/4；小零件角惯量下限 I>=m*25（round 32
--- 保留，它同时把角向弹簧刚度放大了 ~17 倍，是弹性回归的关键支撑）。
--- Round 33b (v2026.07.31.3): 拆分角向语义 + 显式黏性角阻尼。源码核实本引擎
--- Box2D 软焊接：线向刚性 2x2 约束，弹性只在角向通道，且其内置阻尼公式
--- （gamma=h(d+h·k)）对重型堆叠弯曲模态无效（probe21：dampingRatio 1.0-1.6
--- 均 ringing >3 秒且越调越差）。新增 angularDampingRatio（默认 1.0，每个
--- 物理子步施加 τ=∓c·Δω，c=ζ·2ω·I_red）：probe21 实测 48Hz/ζ=1.0 满推力
--- 稳态 0.067°、overshoot 1.00、5.4° 冲击 0.65 秒收敛、无回摆（regrow=1.00）；
--- ζ=2.0 失稳，安全域 ζ<=1.5。angularFrequencyHz 为 frequencyHz 的显式别名。
--- 断裂检测不变（getReactionForce 超 breakForce 持续 5 帧即断）。
--- Round 34 (v2026.07.31.4)：新增扭矩断裂通道（breakTorque，与力通道并列、
--- 同样 5 帧判据）与线向锚点阻尼键 linearDampingRatio（默认 0，probe23 实测
--- 开启即失稳，仅保留作调试）。PartList.xml 全部连接点已统一标定
--- breakForce=2000 kN / breakTorque=2500 kN·m（正常相位峰值约 4-5 倍）。
-local DEFAULT_FREQ = 48.0     -- frequencyHz 默认：48 Hz 硬弹簧（round 33: 0 -> 48）
-local DEFAULT_DAMP = 1.0      -- dampingRatio 默认：临界阻尼
-local DEFAULT_ANGDAMP = 1.0   -- angularDamping 默认：每秒衰减比例（was 0.6）
-local DEFAULT_ANGVISC = 1.0   -- angularDampingRatio 默认：显式黏性角阻尼（round 33b）
-local DEFAULT_LINVISC = 0.0   -- linearDampingRatio 默认：关闭（round 34：开启即失稳）
+-- Round 35 (v2026.07.31.5): 完整切换到 SimpleRockets 模型 —— 刚性 0 Hz 焊接
+-- + 60 Hz / 6+2 迭代欠收敛手感；断裂改为单帧三通道（力 / 扭矩 / 角度偏差，
+-- 新增 breakAngle 默认 0.6 rad）；删除 5 帧持续判据；angularDampingRatio /
+-- linearDampingRatio / angularDamping 全部默认 0（保留键供调试）；
+-- Part.java 的人造惯量下限（I>=m*25）同步删除，恢复真实箱型惯量。
+local DEFAULT_FREQ = 0.0      -- frequencyHz 默认：0 = 完全刚性焊接（SR）
+local DEFAULT_DAMP = 1.0      -- dampingRatio 默认：仅软弹簧模式下有意义
+local DEFAULT_ANGDAMP = 0.0   -- angularDamping 默认：不衰减
+local DEFAULT_ANGVISC = 0.0   -- angularDampingRatio 默认：关闭（SR 无显式阻尼）
+local DEFAULT_LINVISC = 0.0   -- linearDampingRatio 默认：关闭（开启即失稳）
 
 function jointParams(partA, attachA, partB, attachB)
     -- 两侧零件在 onLoad 里通过 part:setJointParams{...} 设置的覆盖值
@@ -96,18 +80,16 @@ function jointParams(partA, attachA, partB, attachB)
     end
 
     return {
-        -- 覆盖值缺省时用本文件的通用默认（round 22: 20 / 1.0 / 1.0）
         frequencyHz    = freq or DEFAULT_FREQ,
         dampingRatio   = damp or DEFAULT_DAMP,
-        -- 显式黏性角阻尼（round 33b 真消振）：任一侧有覆盖就用覆盖
+        -- 显式黏性阻尼（调试键，SR 模型默认 0 关闭）：任一侧有覆盖就用覆盖
         angularDampingRatio = oA.angularDampingRatio or oB.angularDampingRatio
                               or DEFAULT_ANGVISC,
-        -- 角速度阻尼：任一侧有覆盖就用覆盖，否则用全局默认
         angularDamping = oA.angularDamping or oB.angularDamping
                          or DEFAULT_ANGDAMP,
-        -- 线向锚点阻尼（round 34，默认 0 关闭，见文件头警告）
         linearDampingRatio = oA.linearDampingRatio or oB.linearDampingRatio
                              or DEFAULT_LINVISC,
         -- breakForce/breakTorque 省略 → 取两连接点的较小值（见文件头说明）
+        -- breakAngle 省略 → 用内置默认 0.6 rad
     }
 end

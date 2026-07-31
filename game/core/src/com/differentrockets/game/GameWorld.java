@@ -37,7 +37,14 @@ public class GameWorld {
      */
     public static final int VEL_ITER = Integer.getInteger("dr.velIter", 6),
             POS_ITER = Integer.getInteger("dr.posIter", 2);
-    public static final double RAILS_DISTANCE = 20000.0; // beyond this ships go on rails
+    // SR #13 (round 36): SR's local-physics radius is 10000.0 m (Runtime::
+    // EnterLocalPhysics @ 0x1ac96c; ShipOrbitNode::EnterPhysicsIfCloseTo-
+    // PlayerShip @ 0x1b9c28 creates Box2D bodies for a non-player ship only
+    // within 10000.0 of the player, literal @ 0x1b9d38) — aligned here: ships
+    // farther than 10 km from the active one go on rails. This also matches
+    // TerrainSystem's ±10 km collider window: a physical non-active ship
+    // beyond that window would fall through ground that has no fixtures.
+    public static final double RAILS_DISTANCE = 10000.0; // beyond this ships go on rails (SR 10 km)
 
     /**
      * Time-warp ladder (round 14 item 7, round 19 rewrite): up to
@@ -192,13 +199,145 @@ public class GameWorld {
         // force (SimpleRockets-style) instead of letting squeezed parts
         // explode through the contact solver.
         boxWorld.setContactListener(new com.badlogic.gdx.physics.box2d.ContactListener() {
-            @Override public void beginContact(com.badlogic.gdx.physics.box2d.Contact c) { crush(c, true); }
+            @Override public void beginContact(com.badlogic.gdx.physics.box2d.Contact c) {
+                crush(c, true);
+                impactBegin(c); // round 36: universe closing-speed estimate (channel 2)
+            }
             @Override public void endContact(com.badlogic.gdx.physics.box2d.Contact c) { crush(c, false); }
             @Override public void preSolve(com.badlogic.gdx.physics.box2d.Contact c,
                                            com.badlogic.gdx.physics.box2d.Manifold m) {}
             @Override public void postSolve(com.badlogic.gdx.physics.box2d.Contact c,
-                                            com.badlogic.gdx.physics.box2d.ContactImpulse i) {}
+                                            com.badlogic.gdx.physics.box2d.ContactImpulse i) {
+                impact(c, i); // round 36: SR impulse damage (flag-only in callback)
+            }
         });
+    }
+
+    /**
+     * SR impact damage (docs/sr-physics-re.md §6, LocalPhysics::PostSolve @
+     * 0x197734 + PartObject::OnCollision @ 0x1d1534): take the MAX normal
+     * impulse of the contact (N*s, per-substep) and compare it against each
+     * involved part's dual thresholds — impulse > impactExplode explodes,
+     * impulse > impactDestroy removes outright. SR semantics: the callback
+     * ONLY SETS FLAGS on the part (SR flags 0x1c9/0x1ca); the actual
+     * removal/explosion runs after the substep in processPendingPartDamage
+     * (SR defers to the next substep's PartObject::PhysicsStep, 0x1d2350 —
+     * mutating bodies/joints inside a Box2D callback would corrupt the
+     * world). canExplode=false parts (strut/parachute/dock-1) never explode:
+     * an explode-level impulse demotes to the destroy path.
+     */
+    private void impact(com.badlogic.gdx.physics.box2d.Contact c,
+                        com.badlogic.gdx.physics.box2d.ContactImpulse i) {
+        float maxN = 0;
+        float[] ni = i.getNormalImpulses();
+        for (float v : ni) if (v > maxN) maxN = v;
+        if (maxN <= 0) return;
+        Object ua = c.getFixtureA().getBody().getUserData();
+        Object ub = c.getFixtureB().getBody().getUserData();
+        if (ua == ub && ua != null) return; // same part self-contact (wheel axle/tire) — SR skips
+        impactFlag(ua, maxN);
+        impactFlag(ub, maxN);
+    }
+
+    private void impactFlag(Object userData, float impulse) {
+        if (!(userData instanceof Part)) return; // terrain side: nothing to kill
+        Part p = (Part) userData;
+        if (impulse > p.type.impactExplode) {
+            if (p.type.canExplode) p.pendingExplode = true;
+            else p.pendingDestroy = true; // canExplode=false: destroy-only path
+        } else if (impulse > p.type.impactDestroy) {
+            p.pendingDestroy = true;
+        }
+    }
+
+    /**
+     * Channel-2 impact estimate (round 36, probe36): beginContact closing
+     * speed along the contact normal, impulse ≈ m·vN — the perfectly
+     * inelastic one-substep stop, i.e. SR's PostSolve max-normal-impulse for
+     * a hard hit. Needed because velocities above BODY_VEL_SAFE are parked in
+     * frameVel/originVel (clamp guard) and static terrain carries no solver
+     * velocity at all (Box2D 2.3 ignores SetLinearVelocity on static bodies),
+     * so the raw PostSolve impulse UNDERESTIMATES exactly the high-speed
+     * impacts that must explode. Computed in universe-consistent terms
+     * (frameVel cancels in the difference): part side = bodyVel +
+     * ship.originVel, terrain side = planet.vel − frameVel (static chunks
+     * are pinned to the terrain planet by the per-substep re-base).
+     */
+    private void impactBegin(com.badlogic.gdx.physics.box2d.Contact c) {
+        com.badlogic.gdx.physics.box2d.Body ba = c.getFixtureA().getBody();
+        com.badlogic.gdx.physics.box2d.Body bb = c.getFixtureB().getBody();
+        Object ua = ba.getUserData(), ub = bb.getUserData();
+        if (!(ua instanceof Part) && !(ub instanceof Part)) return;
+        if (ua == ub) return; // same part self-contact (wheel axle/tire)
+        double vax, vay, vbx, vby;
+        if (ua instanceof Part) {
+            com.badlogic.gdx.math.Vector2 v = ba.getLinearVelocity();
+            Ship s = ((Part) ua).ship;
+            vax = v.x + (s != null ? s.originVel.x : 0);
+            vay = v.y + (s != null ? s.originVel.y : 0);
+        } else { // terrain chunk: pinned to the terrain planet
+            Planet tp = terrain.currentPlanet();
+            vax = tp != null ? tp.vel.x - frameVel.x : 0;
+            vay = tp != null ? tp.vel.y - frameVel.y : 0;
+        }
+        if (ub instanceof Part) {
+            com.badlogic.gdx.math.Vector2 v = bb.getLinearVelocity();
+            Ship s = ((Part) ub).ship;
+            vbx = v.x + (s != null ? s.originVel.x : 0);
+            vby = v.y + (s != null ? s.originVel.y : 0);
+        } else {
+            Planet tp = terrain.currentPlanet();
+            vbx = tp != null ? tp.vel.x - frameVel.x : 0;
+            vby = tp != null ? tp.vel.y - frameVel.y : 0;
+        }
+        com.badlogic.gdx.physics.box2d.WorldManifold wm = c.getWorldManifold();
+        float nx = wm.getNormal().x, ny = wm.getNormal().y; // from A to B
+        double closing = -((vax - vbx) * nx + (vay - vby) * ny); // >0 = approaching
+        if (closing <= 0) return;
+        if (ua instanceof Part) impactFlag(ua, (float) (ba.getMass() * closing));
+        if (ub instanceof Part) impactFlag(ub, (float) (bb.getMass() * closing));
+    }
+
+    /**
+     * Execute the deferred SR impact/water-entry removals after a substep
+     * (SR: next substep's PhysicsStep). Flags are collected across ALL ships
+     * first — a removal can split its ship, moving sibling parts to a new
+     * Ship mid-processing; each removal then resolves against the part's
+     * CURRENT ship. Ships left empty are dropped from the world.
+     */
+    private void processPendingPartDamage() {
+        List<Part> doomed = null, boomed = null;
+        for (Ship s : ships) {
+            for (Part p : s.parts) {
+                if (p.pendingExplode) {
+                    p.pendingExplode = false;
+                    p.pendingDestroy = false;
+                    if (boomed == null) boomed = new ArrayList<>();
+                    boomed.add(p);
+                } else if (p.pendingDestroy) {
+                    p.pendingDestroy = false;
+                    if (doomed == null) doomed = new ArrayList<>();
+                    doomed.add(p);
+                }
+            }
+        }
+        if (doomed == null && boomed == null) return;
+        if (doomed != null) {
+            for (Part p : doomed) {
+                if (p.ship != null) p.ship.removePart(p, false);
+            }
+        }
+        if (boomed != null) {
+            for (Part p : boomed) {
+                if (p.ship != null) p.ship.removePart(p, true);
+            }
+        }
+        for (Ship s : new ArrayList<>(ships)) {
+            if (s.parts.isEmpty()) {
+                ships.remove(s);
+                if (active == s) active = null; // pod gone: no active ship
+            }
+        }
     }
 
     /** Contact-listener helper: register/unregister a same-ship non-mate part contact. */
@@ -505,6 +644,64 @@ public class GameWorld {
         steerPrimed = false;
     }
 
+    /**
+     * Round 36 (static-terrain companion, task 7): terrain chunk bodies are
+     * STATIC now (SR TerrainSection, RE §7) and are NEVER moved by
+     * TerrainSystem — their frame position was baked at creation from
+     * `planet.pos - world.origin`. Ship bodies follow origin re-anchors via
+     * shiftBodies, but nothing re-bases the terrain, so every origin
+     * translation otherwise drifted the COLLIDERS away from the rendered
+     * ground (which re-derives planet.pos - origin every frame). SR's answer
+     * is TerrainSection::Recenter (0x1c3ef8, rebuild); the minimal correct
+     * equivalent here is translating the static bodies by the same delta the
+     * ships got (terrain chunks are the only STATIC bodies in the world —
+     * part bodies are all dynamic and carry a Part userData). Called from
+     * every origin-translation site: translateFrame, reanchorToActive,
+     * teleportActiveToPlanet.
+     */
+    private final com.badlogic.gdx.utils.Array<com.badlogic.gdx.physics.box2d.Body> tmpBodies =
+            new com.badlogic.gdx.utils.Array<>();
+
+    private void shiftTerrainBodies(double dx, double dy) {
+        if (dx == 0 && dy == 0) return;
+        boxWorld.getBodies(tmpBodies);
+        for (int i = 0; i < tmpBodies.size; i++) {
+            com.badlogic.gdx.physics.box2d.Body b = tmpBodies.get(i);
+            if (b.getType() == com.badlogic.gdx.physics.box2d.BodyDef.BodyType.StaticBody) {
+                b.setTransform(b.getPosition().x + (float) dx,
+                        b.getPosition().y + (float) dy, b.getAngle());
+            }
+        }
+    }
+
+    /**
+     * Per-substep static-terrain re-base (task 7, probe36): translate every
+     * static chunk body by the relative drift AND SET its linear velocity to
+     * the drift rate. The velocity matters as much as the position: Box2D's
+     * contact solver reads body B's velocity even for zero-invMass (static /
+     * kinematic) bodies — that is how the old KINEMATIC velocity drive
+     * imparted ground motion into contacts. A bare setTransform teleports
+     * the ground into a falling ship with ZERO contact velocity (probe36 A:
+     * a 31 m/s tank touchdown produced no PostSolve impulse at all); with
+     * the drift velocity set, the contact sees the true closing speed and
+     * impact impulses are physical again. Parked ships see drift ≈
+     * planet.vel − frameVel ≈ 0, so their ground contact is unchanged.
+     */
+    private void rebaseTerrain(double dx, double dy, float h) {
+        boxWorld.getBodies(tmpBodies);
+        float vx = (float) (dx / h), vy = (float) (dy / h);
+        for (int i = 0; i < tmpBodies.size; i++) {
+            com.badlogic.gdx.physics.box2d.Body b = tmpBodies.get(i);
+            if (b.getType() == com.badlogic.gdx.physics.box2d.BodyDef.BodyType.StaticBody) {
+                b.setLinearVelocity(vx, vy);
+                if (dx != 0 || dy != 0) {
+                    b.setTransform(b.getPosition().x + (float) dx,
+                            b.getPosition().y + (float) dy, b.getAngle());
+                }
+            }
+        }
+    }
+
     /** Change the universe position assigned to the physics origin; bodies do NOT move. */
     private void translateFrame(double dx, double dy) {
         if (dx == 0 && dy == 0) return;
@@ -514,6 +711,10 @@ public class GameWorld {
             s.origin.x += dx;
             s.origin.y += dy;
         }
+        // ship bodies stay (their universe position MOVES by +dx — intended);
+        // terrain chunk positions are planet-universe-fixed, so the static
+        // bodies must re-base by the INVERSE of the origin move (task 7).
+        shiftTerrainBodies(-dx, -dy);
     }
 
     /**
@@ -547,6 +748,7 @@ public class GameWorld {
         // density at orbital altitude = mega-drag that killed the orbit).
         origin.x += nx - u.x;
         origin.y += ny - u.y;
+        shiftTerrainBodies(-(nx - u.x), -(ny - u.y)); // static terrain re-base (task 7)
         // Velocity: re-express the ship's planet-relative velocity in the NEW
         // local frame — keep the radial/tangential components, swap the
         // radial direction (else "ascending straight up" over the old planet
@@ -592,6 +794,7 @@ public class GameWorld {
         }
         origin.x += dx;
         origin.y += dy;
+        shiftTerrainBodies(-dx, -dy); // static terrain follows the re-anchor (task 7)
     }
 
     /**
@@ -617,7 +820,18 @@ public class GameWorld {
     private void velocityReanchor() {
         if (active == null) return;
         Vector2 cv = active.velocity(tmpV);
-        if (cv.len2() >= 1e-4f) {
+        // Round 36 (probe36 root cause): fold the active ship's velocity into
+        // the frame ONLY above the Box2D max-translation safety domain. Below
+        // BODY_VEL_SAFE the bodies must KEEP their velocity: static terrain
+        // cannot carry solver velocity (Box2D 2.3's SetLinearVelocity
+        // early-returns for static bodies), so parking the ship's velocity in
+        // frameVel made every ground contact velocity-blind — a 31 m/s drop
+        // produced ZERO PostSolve impulse and ground-slide friction could not
+        // see the slip (probe36 A/B). With the velocity in the bodies, contact
+        // impulses and friction are physical again; >100 u/s still folds to
+        // the frame to dodge the ~120 u/s clamp (high-speed impacts are
+        // covered by the beginContact universe-closing-speed estimate).
+        if (cv.len2() > BODY_VEL_SAFE * BODY_VEL_SAFE) {
             for (Ship s : ships) {
                 if (s.onRails) {
                     s.originVel.sub(tmp2d.set(cv.x, cv.y));
@@ -677,7 +891,10 @@ public class GameWorld {
     /** Parked ground ships wake below this frame-relative speed (u/s). */
     private static final float WAKE_VEL = 90f;
 
-    /** Any live contact between this ship's bodies and a KINEMATIC (terrain) body? */
+    /** Any live contact between this ship's bodies and a TERRAIN body?
+     * Round 36 (task 7): terrain is STATIC now (SR RE §7), not kinematic —
+     * accept both non-dynamic types or the ground-park path in
+     * velocityReanchor would never trigger against the new terrain. */
     private boolean touchingKinematic(Ship s) {
         for (com.badlogic.gdx.physics.box2d.Contact c : boxWorld.getContactList()) {
             if (!c.isTouching()) continue;
@@ -690,7 +907,7 @@ public class GameWorld {
                 if (p.body == bb) { hit = true; other = ba; break; }
             }
             if (hit && other != null
-                    && other.getType() == com.badlogic.gdx.physics.box2d.BodyDef.BodyType.KinematicBody) {
+                    && other.getType() != com.badlogic.gdx.physics.box2d.BodyDef.BodyType.DynamicBody) {
                 return true;
             }
         }
@@ -767,9 +984,12 @@ public class GameWorld {
             // fixed 60 Hz step with 6/2 solver iterations and RIGID (0 Hz)
             // weld joints; the under-converged rigid constraints deform
             // elastically on their own, which is SR's soft-rocket feel.
-            // Substep cap stays 16 so a 60 fps frame still covers warp 4
-            // with generous headroom.
-            int steps = Math.max(1, Math.min(16, Math.round(frameDt * warp / PHYS_DT)));
+            // Round 36 (SR #3): substep cap 16 -> 101. SR's LocalPhysics::
+            // Update (0x19817c, r6 = 0x65 = 101) allows up to 101 catch-up
+            // substeps per frame and DROPS the excess time beyond that; 16
+            // silently discarded simulated time at warp 4 under a low frame
+            // rate (e.g. 30 fps needs 8 steps, a 15 fps hitch needs 16+).
+            int steps = Math.max(1, Math.min(101, Math.round(frameDt * warp / PHYS_DT)));
             for (int i = 0; i < steps; i++) {
                 substep(PHYS_DT);
             }
@@ -1135,7 +1355,24 @@ public class GameWorld {
 
     private void substep(float h) {
         time += h;
+        // task 7 (static terrain): capture the terrain planet's position
+        // BEFORE the rail advance so the per-substep drift can be re-based.
+        Planet tp = terrain.currentPlanet();
+        double tpx = tp != null ? tp.pos.x : 0, tpy = tp != null ? tp.pos.y : 0;
         sun.updateRails(time);
+        // task 7 (probe36 root cause): static chunk bodies are frame-FIXED,
+        // but their true frame position is planet.pos - origin + chunkLocal,
+        // and that moves continuously at (planet.vel - frameVel) — the old
+        // kinematic drive absorbed this every frame; with static bodies the
+        // ground instead rides the origin bookkeeping and RECEDES from a
+        // free-falling ship at exactly the fall speed (the tank never lands).
+        // Re-base the static bodies by the per-substep relative drift,
+        // before the step, so colliders stay pinned to the planet (SR does
+        // the equivalent with a full-scene Recenter EVERY frame, §11).
+        if (tp != null) {
+            rebaseTerrain((tp.pos.x - tpx) - frameVel.x * h,
+                    (tp.pos.y - tpy) - frameVel.y * h, h);
+        }
         // round 26 (debris-acceleration fix): environment forces for EVERY
         // in-physics ship, not just the active one. Ships within
         // RAILS_DISTANCE are stepped by boxWorld too, but used to get NO
@@ -1161,6 +1398,10 @@ public class GameWorld {
             }
         }
         boxWorld.step(h, VEL_ITER, POS_ITER);
+        // SR #1/#2 (round 36): deferred impact/water-entry removals — the
+        // PostSolve callback only flagged parts (SR PartObject::PhysicsStep
+        // pattern, 0x1d2350); execute removals now that the world is unlocked.
+        processPendingPartDamage();
         // advance the inertial frame: the physics origin moves with frameVel
         double fx = frameVel.x * h, fy = frameVel.y * h;
         if (fx != 0 || fy != 0) {
@@ -1228,10 +1469,18 @@ public class GameWorld {
 
             // gravity
             Vec2d g = gravityAt(ux, uy);
-            p.body.applyForceToCenter((float) (g.x * m), (float) (g.y * m), false);
+            // SR #4 (round 36, LocalPhysics::ApplyGravity @ 0x198018): SR
+            // writes m_force directly and FORCES sleeping bodies awake
+            // (m_flags |= 2, sleepTime = 0) — gravity must never be dropped
+            // by a sleeping body. wake=true is the applyForce equivalent.
+            // groundParked ships are unaffected: their bodies are
+            // DEACTIVATED (isActive()==false) and skipped above, so the
+            // round-34 parking semantics survive this wake change.
+            p.body.applyForceToCenter((float) (g.x * m), (float) (g.y * m), true);
 
             // drag
             Planet np = nearestPlanetTo(ux, uy);
+            Vector2 v = p.body.getLinearVelocity();
             if (np != null && np.hasAtmosphere()) {
                 double alt = altitudeAt(ux, uy);
                 // round 14 fix: drag must use the player-editable density law
@@ -1240,12 +1489,14 @@ public class GameWorld {
                 // had no effect on drag.
                 double rho = densityAt(ux, uy);
                 if (rho > 1e-9) {
-                    Vector2 v = p.body.getLinearVelocity();
                     // wind-relative velocity in the universe frame (planet rotation ignored)
                     double rvx = frameVel.x + ship.originVel.x + v.x - np.vel.x;
                     double rvy = frameVel.y + ship.originVel.y + v.y - np.vel.y;
                     double speed2 = rvx * rvx + rvy * rvy;
-                    if (speed2 > 0.01) {
+                    // SR #5 (round 36, ShipOrbitNode::PhysicsStep @ 0x1b9264):
+                    // SR skips drag entirely at v <= 1.0 m/s — kills the
+                    // numerical jitter of a ship creeping along the ground.
+                    if (speed2 > 1.0) {
                         double speed = Math.sqrt(speed2);
                         // per-part drag: Lua-set absolute Cd wins; otherwise the
                         // 0.75 baseline adjusted by the PartList.xml `drag` attr
@@ -1262,20 +1513,53 @@ public class GameWorld {
                                 (float) (-fmag * rvy / speed), false);
                     }
                 }
-                // buoyancy
-                if (np.waterDensity > 0) {
-                    double dx = ux - np.pos.x, dy = uy - np.pos.y;
-                    double rr = Math.sqrt(dx * dx + dy * dy);
-                    double ang = Math.atan2(dy, dx);
-                    if (rr < np.radius && np.heightAt(ang) < 0) {
-                        double submersion = Math.min(1.0, (np.radius - rr) / Math.max(1, p.type.height));
-                        double vol = p.type.width * p.type.height;
-                        double glen = g.len();
-                        double fb = np.waterDensity * vol * Math.max(0, p.type.buoyancy) * submersion * glen;
-                        // buoyancy acts radially outward (opposite local gravity)
-                        p.body.applyForceToCenter((float) (dx / rr * fb), (float) (dy / rr * fb), false);
+            }
+            // water: buoyancy + SR damping + entry damage. Round 36: moved
+            // OUT of the atmosphere branch — water on an airless body still
+            // floats/damps/damages (SR SimulateWater keys on the water info,
+            // not the atmosphere).
+            if (np != null && np.waterDensity > 0) {
+                double dx = ux - np.pos.x, dy = uy - np.pos.y;
+                double rr = Math.sqrt(dx * dx + dy * dy);
+                double ang = Math.atan2(dy, dx);
+                boolean inWater = rr < np.radius && np.heightAt(ang) < 0;
+                if (inWater) {
+                    double submersion = Math.min(1.0, (np.radius - rr) / Math.max(1, p.type.height));
+                    double vol = p.type.width * p.type.height;
+                    double glen = g.len();
+                    double fb = np.waterDensity * vol * Math.max(0, p.type.buoyancy) * submersion * glen;
+                    // buoyancy acts radially outward (opposite local gravity)
+                    p.body.applyForceToCenter((float) (dx / rr * fb), (float) (dy / rr * fb), false);
+                    // SR #7 (round 36, PartObject::SimulateWater @ 0x1d2e20):
+                    // submersion drives the body's damping FIELDS — linear
+                    // 2.0*s (cap 2.0), angular 0.5*s (cap 0.5) — restored on
+                    // exit. This is SR's floating-stability source.
+                    p.body.setLinearDamping((float) (2.0 * submersion));
+                    p.body.setAngularDamping((float) (0.5 * submersion));
+                    p.waterDamped = true;
+                    // SR #8 (round 36, PartObject::OnEnterWater @ 0x1d1e84):
+                    // water-ENTRY speed dual thresholds (literal @ 0x1d2054):
+                    // v > 90 m/s -> explode (destroy for canExplode=false);
+                    // 25 < v <= 90 -> silent removal; v <= 25 -> safe. Flags
+                    // share the task-1 deferred execution channel.
+                    if (!p.wasInWater) {
+                        double evx = frameVel.x + ship.originVel.x + v.x - np.vel.x;
+                        double evy = frameVel.y + ship.originVel.y + v.y - np.vel.y;
+                        double esp2 = evx * evx + evy * evy;
+                        if (esp2 > 90.0 * 90.0) {
+                            if (p.type.canExplode) p.pendingExplode = true;
+                            else p.pendingDestroy = true;
+                        } else if (esp2 > 25.0 * 25.0) {
+                            p.pendingDestroy = true;
+                        }
                     }
+                } else if (p.waterDamped) {
+                    // left the water: SR clears the water-driven damping
+                    p.body.setLinearDamping(0f);
+                    p.body.setAngularDamping(p.baseAngularDamping);
+                    p.waterDamped = false;
                 }
+                p.wasInWater = inWater;
             }
         }
     }

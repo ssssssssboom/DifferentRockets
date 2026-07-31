@@ -30,6 +30,25 @@ public class Part {
     public boolean deployed;         // parachute / lander state
     public boolean stageActivatedThisFrame;
 
+    /**
+     * SR impact-damage deferred-execution flags (docs/sr-physics-re.md §6,
+     * PartObject::PhysicsStep @ 0x1d2350): contact callbacks only SET these
+     * (Box2D world is locked inside PostSolve), GameWorld executes the actual
+     * removal/explosion after the substep ends. pendingDestroy = remove
+     * outright (SR flag 0x1c9), pendingExplode = remove + explosion visual
+     * (SR flag 0x1ca).
+     */
+    public boolean pendingDestroy, pendingExplode;
+
+    /**
+     * SR water state (§8): while submerged the body's damping fields are
+     * driven by submersion (linearDamping = 2*s, angularDamping = 0.5*s);
+     * baseAngularDamping restores the configured value on exit. wasInWater
+     * edges the 90/25 m/s water-entry damage thresholds (0x1d2054).
+     */
+    public boolean waterDamped, wasInWater;
+    public float baseAngularDamping;
+
     /** Wheel physics (round 27): second body + motorized revolute joint, see createWheel. */
     public Body tireBody;
     public com.badlogic.gdx.physics.box2d.joints.RevoluteJoint wheelJoint;
@@ -131,6 +150,7 @@ public class Part {
         bd.angle = shipAngle + angleOffset;
         bd.angularDamping = (float) (!Double.isNaN(jointAngDamp)
                 ? jointAngDamp : PhysicsScript.jointParam("angularDamping"));
+        baseAngularDamping = bd.angularDamping; // water damping restores this on exit (SR §8)
         bd.linearDamping = 0.0f;
         body = ship.world.boxWorld.createBody(bd);
         body.setUserData(this);
@@ -289,17 +309,59 @@ public class Part {
             // fuel units are already kg
             kg = type.tank.dryMassTons * 500.0 + fuel;
         }
+        float m = (float) Math.max(0.05, kg);
+        // SR RE §1/#10 (PartObject::CreatePhysics @ 0x1d28b4): moment of
+        // inertia is GEOMETRY-EXACT — fixture density is overwritten with
+        // totalMass / totalFixtureArea and Box2D's ResetMassData computes I
+        // from the actual polygon shapes, not a box approximation. Single-
+        // fixture parts (everything except wheels) take this path; for a
+        // rectangle it matches m(w²+h²)/12 exactly, custom ShapeDef polygons
+        // get their true inertia. Fuel burn rewrites density + resets the
+        // same way (SR TankObject/EngineObject pattern, §4).
+        if (type.wheel == null) {
+            com.badlogic.gdx.utils.Array<com.badlogic.gdx.physics.box2d.Fixture> fx =
+                    body.getFixtureList();
+            if (fx.size > 0) {
+                double area = 0;
+                for (int i = 0; i < fx.size; i++) {
+                    if (fx.get(i).isSensor()) continue;
+                    area += Math.abs(polygonArea(fx.get(i).getShape()));
+                }
+                if (area > 1e-9) {
+                    float density = (float) (m / area);
+                    for (int i = 0; i < fx.size; i++) fx.get(i).setDensity(density);
+                    body.resetMassData();
+                    return;
+                }
+            }
+        }
+        // Multi-body wheel assembly (axle circle + separate tire body, and the
+        // manual tire MassData in createWheel) keeps the explicit MassData
+        // path: Box2D cannot model the tire's revolute-joint mass split, and
+        // SR's WheelObject likewise assigns explicit circle densities.
         MassData md = new MassData();
-        md.mass = (float) Math.max(0.05, kg);
+        md.mass = m;
         // moment of inertia: approximate as box
         float w = Math.max(0.2f, type.width), h = Math.max(0.2f, type.height);
         md.I = md.mass * (w * w + h * h) / 12f;
-        // Round 35 (SimpleRockets model): round 32's artificial inertia floor
-        // (I >= m*25) is REMOVED — SR uses the real box inertia for every
-        // part; the small-body twist it was suppressing is part of the
-        // intended under-converged 6/2 feel.
         md.center.set(0, 0);
         body.setMassData(md);
+    }
+
+    /** Shoelace area of a PolygonShape (0 for non-polygon shapes). */
+    private static float polygonArea(com.badlogic.gdx.physics.box2d.Shape s) {
+        if (!(s instanceof PolygonShape)) return 0;
+        PolygonShape ps = (PolygonShape) s;
+        int n = ps.getVertexCount();
+        if (n < 3) return 0;
+        Vector2 a = new Vector2(), b = new Vector2();
+        float sum = 0;
+        for (int i = 0; i < n; i++) {
+            ps.getVertex(i, a);
+            ps.getVertex((i + 1) % n, b);
+            sum += a.x * b.y - b.x * a.y;
+        }
+        return sum * 0.5f;
     }
 
     public double getFuel() { return fuel; }

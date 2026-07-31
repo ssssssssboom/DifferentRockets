@@ -480,6 +480,55 @@ public class Ship {
     }
 
     /**
+     * SR impact-damage removal channel (docs/sr-physics-re.md §6, round 36):
+     * full removal chain for a part killed by a collision / water-entry
+     * impulse — sever its joints, destroy its body (wheel tire + revolute
+     * joint go with it), drop it from `parts` (the fuel network is derived
+     * live from parts+links, so it rebuilds implicitly), then split the ship
+     * if the joint graph lost connectivity. SandboxScreen's selectedPart is
+     * guarded by `active.parts.contains(...)` at every use site, so removal
+     * from `parts` is the complete selection cleanup. `explode` additionally
+     * emits a short explosion flash via the existing FlameFx pool (SR
+     * PartObject::Explode); canExplode=false parts (strut/parachute/dock-1)
+     * only ever take the silent destroy path (enforced by the caller).
+     * Must run OUTSIDE Box2D callbacks (bodies/joints are mutated).
+     */
+    public void removePart(Part p, boolean explode) {
+        if (!parts.contains(p)) return;
+        List<Link> dead = new ArrayList<>();
+        for (Link l : links) {
+            if (l.a == p || l.b == p) dead.add(l);
+        }
+        for (Link l : dead) destroyLink(l);
+        parentOf.remove(p);
+        if (explode && p.body != null) explosionFx(p);
+        p.destroyBody();
+        parts.remove(p);
+        clearCrush(); // stale contacts referencing the dead body re-resolve
+        splitIfDisconnected();
+    }
+
+    /** Short explosion flash at the part's position (pooled FlameFx particles, no new art). */
+    private void explosionFx(Part p) {
+        float bx = p.body.getPosition().x, by = p.body.getPosition().y;
+        Vector2 v = p.body.getLinearVelocity();
+        float scale = Math.max(0.6f, Math.min(3f, (p.type.width + p.type.height) * 0.25f));
+        for (int i = 0; i < 18; i++) {
+            double a = Math.random() * 2 * Math.PI;
+            float sp = (float) (2 + Math.random() * 9) * scale;
+            boolean spark = (i & 1) == 0;
+            FlameFx.emit(spark ? FlameFx.TEX_SPARK : FlameFx.TEX_GLOW,
+                    bx, by,
+                    v.x + (float) (Math.cos(a) * sp), v.y + (float) (Math.sin(a) * sp),
+                    1.2f,                              // drag
+                    0.35f + (float) Math.random() * 0.45f, // life
+                    (1.2f + (float) Math.random()) * scale, 0.3f * scale, // size grow->shrink
+                    1f, spark ? 0.85f : 0.55f, 0.15f,  // orange
+                    1f, 0f);
+        }
+    }
+
+    /**
      * SimpleRockets break model (round 35, SR APK ARM disassembly verified):
      * SINGLE-FRAME criterion, checked every physics step, THREE channels —
      * any one tripping destroys the link immediately:

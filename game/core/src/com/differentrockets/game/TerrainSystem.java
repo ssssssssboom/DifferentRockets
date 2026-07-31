@@ -56,14 +56,13 @@ import java.util.Set;
  *    to). Chunks crossing the physics boundary gain/lose their body.
  *
  * Anti-regression (carried over from the chunked system):
- *  - per-chunk KINEMATIC bodies, velocity-driven toward their planet-following
- *    target every frame: the contact solver sees the ground's true surface
- *    velocity, so a landed ship rides the moving planet via friction instead
- *    of being swallowed by a teleporting static collider;
+ *  - per-chunk STATIC bodies (SR RE §7: SR uses static terrain bodies; static
+ *    and kinematic have identical contact response vs dynamic bodies, and
+ *    static skips Box2D's sweep/velocity handling);
  *  - block polygons in chunk-LOCAL coordinates (planet-centered ~637 km
  *    vertices assert natively in Box2D 2.3's float32 centroid math);
  *  - SEAM_OVERLAP_M column overlap: no tunneling gaps, no sideslip snags;
- *  - restitution 0 (no bounce), high default friction 1.0 (no sideslip);
+ *  - restitution 0 (no bounce), SR default friction 0.85;
  *  - degenerate-quad guard in double precision before Box2D sees a polygon.
  */
 public class TerrainSystem implements Disposable {
@@ -73,7 +72,7 @@ public class TerrainSystem implements Disposable {
     private static final double DEF_DEPTH = 32.0;         // shell depth below the skin
     private static final double DEF_RANGE = 100000.0;     // render/load window (+/-m)
     private static final double DEF_PHYS_RANGE = 10000.0; // collider window (+/-m)
-    private static final float DEF_FRICTION = 1.0f;
+    private static final float DEF_FRICTION = 0.85f;      // SR terrain friction (§7, binary 0x3f59999a)
     private static final float DEF_RESTITUTION = 0.0f;    // no bounce
     private static final float DEF_TOP_B = 1.35f;         // skin brightness (clamped)
     private static final float DEF_BOT_B = 0.25f;         // shell-bottom brightness
@@ -122,7 +121,7 @@ public class TerrainSystem implements Disposable {
 
     private class Chunk {
         int index;
-        Body body;               // per-chunk KINEMATIC body at the chunk center (physics range only)
+        Body body;               // per-chunk STATIC body at the chunk center (physics range only)
         double cx, cy;           // chunk center in planet frame
         double lastBX, lastBY;   // last physics-frame target position
         boolean hasLast;
@@ -324,52 +323,11 @@ public class TerrainSystem implements Disposable {
             setupPlanet();
         }
 
-        // chunk bodies follow the planet relative to the floating origin.
-        // KINEMATIC and driven by VELOCITY (not teleported): the contact
-        // solver sees the ground's true surface velocity, so a landed ship
-        // rides the moving planet via friction (the lone-pod sinking fix).
-        double px = planet.pos.x - world.origin.x;
-        double py = planet.pos.y - world.origin.y;
-        for (Chunk c : loaded.values()) {
-            if (c.body != null) {
-                if (!physicsActive) { // super-warp: no contacts needed (B3)
-                    c.destroyBody();
-                    continue;
-                }
-                double tx = px + c.cx, ty = py + c.cy;
-                if (c.hasLast && simDt > 1e-9) {
-                    double mvx = tx - c.lastBX, mvy = ty - c.lastBY;
-                    // round 19 fix (probe-verified): Box2D clamps EVERY body,
-                    // kinematic included, to b2_maxTranslation = 2 m per
-                    // substep. A purely velocity-driven chunk body whose
-                    // per-substep demand exceeds that (ship moving faster
-                    // than ~120 m/s relative to the ground) silently LAGS —
-                    // the collision shell drifted >1.3 km behind the rendered
-                    // terrain at 800 m/s in the probe. Beyond the clamp
-                    // threshold, snap the body to its target (teleport) while
-                    // STILL reporting the true average velocity, so the
-                    // contact solver keeps seeing the real ground speed.
-                    double perSubstep = Math.hypot(mvx, mvy) * (GameWorld.PHYS_DT / simDt);
-                    if (perSubstep > 1.8) {
-                        // snap exactly onto the target and STAND STILL until
-                        // the next drive: setting the true (huge) velocity
-                        // here would let the clamp advance the body 2 m PAST
-                        // the target every substep, oscillating around it.
-                        // Friction fidelity is moot at >120 m/s ground speed.
-                        c.body.setTransform((float) tx, (float) ty, 0);
-                        c.body.setLinearVelocity(0, 0);
-                    } else {
-                        c.body.setLinearVelocity(
-                                (float) (mvx / simDt),
-                                (float) (mvy / simDt));
-                    }
-                } else {
-                    c.body.setTransform((float) tx, (float) ty, 0);
-                    c.body.setLinearVelocity(0, 0);
-                }
-                c.lastBX = tx; c.lastBY = ty; c.hasLast = true;
-            }
-        }
+        // SR RE §7 (priority #9): chunk bodies are STATIC now — created once at
+        // their planet-relative position in createBody() and never moved (no
+        // per-frame velocity drive, no setTransform). Static vs kinematic has
+        // identical contact response against dynamic bodies; static skips the
+        // sweep/velocity handling entirely, matching SR's TerrainSection.
 
         // 10 Hz window management: only edge chunks are created/removed
         refreshT += Gdx.graphics.getDeltaTime();
@@ -564,7 +522,10 @@ public class TerrainSystem implements Disposable {
         double px = planet.pos.x - world.origin.x;
         double py = planet.pos.y - world.origin.y;
         BodyDef bd = new BodyDef();
-        bd.type = BodyDef.BodyType.KinematicBody; // velocity-driven ground
+        // SR RE §7 (priority #9): terrain bodies are STATIC (SR TerrainSection::
+        // CreatePhysics uses BodyDef.type = 0). Position is set ONCE here via
+        // bodyDef.position; static bodies are never setTransform-driven.
+        bd.type = BodyDef.BodyType.StaticBody;
         bd.position.set((float) (px + c.cx), (float) (py + c.cy));
         c.body = world.boxWorld.createBody(bd);
         c.lastBX = px + c.cx; c.lastBY = py + c.cy; c.hasLast = true;

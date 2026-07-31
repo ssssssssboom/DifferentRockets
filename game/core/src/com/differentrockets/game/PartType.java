@@ -114,6 +114,17 @@ public class PartType {
     public float friction = 0.4f;
     public float drag = 0f;           // nosecone uses negative
     public float coverHeight = 0f;
+    /**
+     * SR impact-damage dual thresholds (docs/sr-physics-re.md §6), in normal
+     * impulse (N*s per PostSolve contact impulse): exceeding impactDestroy
+     * removes the part outright; exceeding impactExplode explodes it.
+     * Parsed from the part element's explode="N" attribute (SR PartList.xml
+     * Damage field; binary: part+0x60 = destroy, part+0x68 = explode).
+     * impactDestroy = impactExplode * 0.36 is an ESTIMATE — the RE report
+     * does not give the +0x60/+0x68 ratio.
+     */
+    public double impactDestroy = 540.0;  // 1500 * 0.36 default
+    public double impactExplode = 1500.0; // SR PartList common value
 
     public EngineDef engine;
     public TankDef tank;
@@ -158,6 +169,22 @@ public class PartType {
                 t.friction = e.getFloatAttribute("friction", 0.4f);
                 t.drag = e.getFloatAttribute("drag", 0f);
                 t.coverHeight = e.getFloatAttribute("coverHeight", 0f);
+                // SR RE §6: explode="N" on the part element (preferred), or on
+                // the SR-style <Damage explode="N"/> child; default 1500 (SR
+                // PartList common value). destroy = explode * 0.36 (ESTIMATE,
+                // ratio not recovered from the binary). Old saves/PartLists
+                // without either attribute fall back to the defaults above.
+                {
+                    double exp = Xml.getDouble(e, "explode", Double.NaN);
+                    if (Double.isNaN(exp)) {
+                        XmlReader.Element dmg = e.getChildByName("Damage");
+                        if (dmg != null) exp = Xml.getDouble(dmg, "explode", Double.NaN);
+                    }
+                    if (!Double.isNaN(exp)) {
+                        t.impactExplode = exp;
+                        t.impactDestroy = exp * 0.36; // estimate, see field doc
+                    }
+                }
 
                 for (int c = 0; c < e.getChildCount(); c++) {
                     XmlReader.Element ch = e.getChild(c);

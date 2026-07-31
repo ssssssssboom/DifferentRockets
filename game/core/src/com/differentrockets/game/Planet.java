@@ -57,9 +57,18 @@ public class Planet {
     /** Air density in kg/m^3 at altitude h (exponential model). */
     public double densityAt(double h) {
         if (!hasAtmosphere() || h > atmoHeight || h < -scaleHeight() * 3) return 0;
+        // SR RE (docs/sr-physics-re.md §5, priority #5): hard cutoff — SR zeroes
+        // density when PRESSURE drops below 0.1 Pa (binary literal @ 0x191db0).
+        // Our surfacePressure is in atm-ish units (1.0 = Smearth sea level), so
+        // 0.1 Pa = 0.1 / 101325 of one atmosphere.
+        double p = pressureAt(h); // units of surface pressure
+        if (p * surfacePressure0Pa() < 0.1) return 0;
         // 1.225 kg/m^3 at pressure 1.0
         return 1.225 * surfacePressure * Math.exp(-Math.max(h, 0) / scaleHeight());
     }
+
+    /** Pa represented by surfacePressure = 1.0 (Earth-like 1 atm). */
+    private double surfacePressure0Pa() { return 101325.0; }
 
     /** Pressure at altitude h in units of surface pressure. */
     public double pressureAt(double h) {

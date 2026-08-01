@@ -242,13 +242,22 @@ public class GameWorld {
         Object ua = c.getFixtureA().getBody().getUserData();
         Object ub = c.getFixtureB().getBody().getUserData();
         if (ua == ub && ua != null) return; // same part self-contact (wheel axle/tire) — SR skips
-        impactFlag(ua, maxN);
-        impactFlag(ub, maxN);
+        impactFlag(ua, maxN, "postsolve");
+        impactFlag(ub, maxN, "postsolve");
     }
 
     private void impactFlag(Object userData, float impulse) {
         if (!(userData instanceof Part)) return; // terrain side: nothing to kill
+        impactFlag(userData, impulse, "?");
+    }
+
+    private void impactFlag(Object userData, float impulse, String channel) {
+        if (!(userData instanceof Part)) return; // terrain side: nothing to kill
         Part p = (Part) userData;
+        if (DEBUG_IMPACT && (impulse > p.type.impactDisconnect * 0.5))
+            System.out.println("[impactFlag] ch=" + channel + " part=" + p.type.id
+                    + " imp=" + impulse + " disc=" + (float) p.type.impactDisconnect
+                    + " expl=" + (float) p.type.impactExplode);
         if (impulse > p.type.impactExplode) {
             if (p.type.canExplode) p.pendingExplode = true;
             else p.pendingDisconnect = true; // canExplode=false: demote to disconnect
@@ -329,8 +338,8 @@ public class GameWorld {
                     + " b=" + (ub instanceof Part ? ((Part) ub).type.id : "terrain")
                     + " impA=" + (ua instanceof Part ? (float) (ba.getMass() * closing) : 0)
                     + " impB=" + (ub instanceof Part ? (float) (bb.getMass() * closing) : 0));
-        if (ua instanceof Part) impactFlag(ua, (float) (ba.getMass() * closing));
-        if (ub instanceof Part) impactFlag(ub, (float) (bb.getMass() * closing));
+        if (ua instanceof Part) impactFlag(ua, (float) (ba.getMass() * closing), "begin");
+        if (ub instanceof Part) impactFlag(ub, (float) (bb.getMass() * closing), "begin");
     }
 
     /**
@@ -367,11 +376,13 @@ public class GameWorld {
                 // part + its subtree drift away alive. Root / no recorded
                 // parent: nothing to cut (fallback branch cuts attach<=0
                 // links, matching the detacher semantics).
+                if (DEBUG_IMPACT) System.out.println("[damage] DISCONNECT " + p.type.id + " ship=" + (p.ship != null));
                 if (p.ship != null) p.ship.removeParentJointOf(p);
             }
         }
         if (boomed != null) {
             for (Part p : boomed) {
+                if (DEBUG_IMPACT) System.out.println("[damage] EXPLODE " + p.type.id);
                 if (p.ship != null) p.ship.removePart(p, true);
             }
         }
@@ -571,9 +582,40 @@ public class GameWorld {
         // lift for EVERY part (its own terrain sample at its own surface
         // angle, its own bottom extent incl. 90-degree rotations) and take
         // the max, with a 2 mm slop instead of 100 mm.
-        double spawnR = 0;
-        boolean any = false;
-        for (ShipDesign.DesignPart dp : design.parts) {
+        // Per-component grounding (MAR.xml bug): SR designs carry detached
+        // debris blocks (DisconnectedParts) that sit FAR below the main ship
+        // in design space. Taking the clearance max over ALL parts let the
+        // lowest debris block — whose own arc samples terrain far below the
+        // pad — set spawnR, so the main ship spawned tens of meters above
+        // its own ground and free-fell into an impact explosion. Compute the
+        // required lift per connected component instead: the root component
+        // (part 0) sets spawnR as before; every other component's design y
+        // is shifted so ITS lowest part rests on ITS OWN terrain sample.
+        int np = design.parts.size();
+        int[] compOf = new int[np];
+        java.util.Arrays.fill(compOf, -1);
+        int nComp = 0;
+        for (int i = 0; i < np; i++) {
+            if (compOf[i] >= 0) continue;
+            List<Integer> stack = new ArrayList<>();
+            compOf[i] = nComp;
+            stack.add(i);
+            while (!stack.isEmpty()) {
+                int cur = stack.remove(stack.size() - 1);
+                for (ShipDesign.Connection cn : design.connections) {
+                    int other = cn.partA == cur ? cn.partB : cn.partB == cur ? cn.partA : -1;
+                    if (other >= 0 && other < np && compOf[other] < 0) {
+                        compOf[other] = nComp;
+                        stack.add(other);
+                    }
+                }
+            }
+            nComp++;
+        }
+        double[] compNeed = new double[nComp];
+        boolean[] compAny = new boolean[nComp];
+        for (int i = 0; i < np; i++) {
+            ShipDesign.DesignPart dp = design.parts.get(i);
             PartType t = PartList.get(dp.typeId);
             if (t == null) continue;
             double halfH = (dp.rot % 2 == 0) ? t.height / 2.0 : t.width / 2.0;
@@ -586,9 +628,21 @@ public class GameWorld {
                 r = planet.radius + planet.heightAt(ang); // built-in fallback
             }
             double need = r - (dp.y - halfH);
-            if (!any || need > spawnR) { spawnR = need; any = true; }
+            int c = compOf[i];
+            if (!compAny[c] || need > compNeed[c]) { compNeed[c] = need; compAny[c] = true; }
         }
+        int mainComp = np > 0 ? compOf[0] : -1;
+        boolean any = mainComp >= 0 && compAny[mainComp];
+        double spawnR = any ? compNeed[mainComp] : 0;
         if (!any) { spawnR = planet.radius + planet.heightAt(padAngle) + 2; }
+        else {
+            // ground every detached component on its own terrain (see above)
+            for (int i = 0; i < np; i++) {
+                int c = compOf[i];
+                if (c == mainComp || !compAny[c]) continue;
+                design.parts.get(i).y += (float) (compNeed[c] - spawnR);
+            }
+        }
 
         double ux = Math.cos(padAngle), uy = Math.sin(padAngle);
         spawnR += 0.002; // 2 mm slop: no free-fall drop, no initial penetration
@@ -600,6 +654,11 @@ public class GameWorld {
         // rotate ship so design +y points radially out
         float spawnAngle = (float) (padAngle - Math.PI / 2);
         ship.buildFromDesign(design, spawnAngle);
+        // SR craft files carry disconnected blocks (DisconnectedParts) that are
+        // separate crafts: split immediately so each fragment gets its own
+        // collision group and collides with the main ship again (see
+        // Ship.collisionGroup — inside one Ship, parts never collide).
+        ship.splitIfDisconnected();
         // the frame carries the planet's velocity; bodies start at rest so the
         // ship is at rest relative to the launch site (avoids Box2D's velocity cap)
         frameVel.set(planet.vel);
@@ -608,6 +667,56 @@ public class GameWorld {
         // move the world frame onto the launch site without moving any bodies
         translateFrame(sx - origin.x, sy - origin.y);
         setActive(ship);
+        // launch-pad hold (round 39, SR pad semantics): freeze the grounded
+        // ship until the player's first input — no contact-settle jitter, no
+        // phantom weld stress while it sits on the pad (see Ship.padHold).
+        ship.padHold = true;
+        ship.setBodiesActive(false);
+
+        // shape-level grounding correction (round 39c): the pre-build
+        // clearance uses part-type half-height, but engine bells and
+        // tapered shapes are shallower than their box, so the ship spawned
+        // ~0.2 m up and free-dropped at wake — the catch impulse seeded
+        // the pad-rocking mode (probe 39e). Measure the true lowest
+        // fixture vertex against ITS OWN terrain sample and set the whole
+        // ship down by the residual before freezing it.
+        {
+            double resid = Double.MAX_VALUE;
+            Vector2 wv = new Vector2();
+            for (Part p : ship.parts) {
+                if (p.body == null) continue;
+                List<PartType.ShapeDef> sds = p.type.shapes;
+                if (sds.isEmpty()) { // default box (mirrors Part fixture build)
+                    PartType.ShapeDef sd = new PartType.ShapeDef();
+                    float hw = p.type.width / 2f, hh = p.type.height / 2f;
+                    sd.verts.add(new PartType.Vertex(-hw, -hh));
+                    sd.verts.add(new PartType.Vertex(hw, -hh));
+                    sd.verts.add(new PartType.Vertex(hw, hh));
+                    sd.verts.add(new PartType.Vertex(-hw, hh));
+                    sds = java.util.Collections.singletonList(sd);
+                }
+                for (PartType.ShapeDef sd : sds) {
+                    for (PartType.Vertex v : sd.verts) {
+                        wv.set(v.x, v.y);
+                        p.body.getWorldPoint(wv);
+                        double dxp = ship.origin.x + wv.x - planet.pos.x;
+                        double dyp = ship.origin.y + wv.y - planet.pos.y;
+                        double rv = Math.hypot(dxp, dyp);
+                        double ang = Math.atan2(dyp, dxp);
+                        double rt = TerrainScript.surfaceHeight(planet.name, ang * planet.radius);
+                        if (Double.isNaN(rt) || Double.isInfinite(rt) || rt < planet.radius * 0.5)
+                            rt = planet.radius + planet.heightAt(ang);
+                        double gap = rv - rt;
+                        if (gap < resid) resid = gap;
+                    }
+                }
+            }
+            if (resid != Double.MAX_VALUE && resid > 0.0005 && resid < 10) {
+                final float dy = -(float) resid; // local +y is pad-radial
+                ship.forEachBody(b -> b.setTransform(b.getPosition().x,
+                        b.getPosition().y + dy, b.getAngle()));
+            }
+        }
         targetHeading = spawnAngle; // steering holds the launch heading
 
         // restore every pre-existing ship's universe position and velocity
@@ -1041,6 +1150,9 @@ public class GameWorld {
             simDt = steps * PHYS_DT;
             // scripts run once per frame with the full simulated dt
             if (active != null) {
+                // round 39: first player input wakes the launch-pad hold
+                // (staging wakes inside activateStage)
+                if (active.padHold && (inputThrottle > 0 || turnCommand != 0)) active.wakePadHold();
                 updateSteering(frameDt * warp);
                 active.updateScripts(frameDt * warp);
             }
@@ -1057,7 +1169,7 @@ public class GameWorld {
                 // just the active one — debris under real overload breaks too.
                 // snapshot: a broken weld splits the ship and mutates `ships`
                 for (Ship s : new java.util.ArrayList<>(ships)) {
-                    if (!s.onRails && !s.groundParked) s.checkJointBreaks(invDt);
+                    if (!s.onRails && !s.groundParked && !s.padHold) s.checkJointBreaks(invDt);
                 }
                 reanchorToActive();
                 velocityReanchor();
@@ -1428,7 +1540,7 @@ public class GameWorld {
         // Rails ships are unaffected: they integrate gravity in
         // integrateRails/warpRailsShip instead.
         for (Ship s : ships) {
-            if (!s.onRails) applyEnvironmentForces(s, h);
+            if (!s.onRails && !s.padHold) applyEnvironmentForces(s, h);
         }
         // script-registered continuous forces (engine thrust, RCS...):
         // re-applied at EVERY substep so they cover the full simulated time
@@ -1436,13 +1548,40 @@ public class GameWorld {
         // applyForce only acted on the first substep, so at warp 4 engines
         // burned 4x fuel for 1x thrust).
         for (Ship s : ships) {
-            if (!s.onRails) {
+            if (!s.onRails && !s.padHold) {
                 s.applyFrameForces();
-                s.applyJointDampers(); // round 33b explicit angular viscous bushing
+                if (!"1".equals(System.getProperty("dr.noDampers")))
+                    s.applyJointDampers(h); // round 33b/39b implicit angular bushing
                 s.applyCrushForces(h); // round 34 task 2 squeeze push-apart
             }
         }
         boxWorld.step(h, VEL_ITER, POS_ITER);
+        // round 39d SR-rigid weld angular constraint, velocity level: this
+        // build's weld joint has no working angular channel (round 39), and
+        // a soft 6 Hz spring lets the stack bend under thrust — the bending
+        // couples the engine thrust vector into a whole-ship torque and the
+        // ascent tumbles (probe 39c). SR welds are RIGID, so welded pairs
+        // share one angular velocity: zero the relative spin post-step with
+        // perfectly inelastic impulses (Gauss-Seidel over the link graph;
+        // unconditionally stable, removes energy, permits whole-body spin).
+        for (Ship s : ships) {
+            if (!s.onRails && !s.padHold) s.applyWeldAngularLock();
+        }
+        // round 39c wake-settle guide: right after pad-hold wake the stack
+        // micro-settles into the contact solver and the catch seeds a pad
+        // rocking mode (probe 39e) that later tumbles the ascent. For the
+        // first ~0.5 s after wake, hold the stack vertical (SR pad-guide
+        // semantics): bleed lateral drift and all spin while the contacts
+        // find their seats / the rocket clears the mount.
+        for (Ship s : ships) {
+            if (s.wakeSettle > 0 && !s.onRails) {
+                s.wakeSettle--;
+                s.forEachBody(b -> {
+                    b.setAngularVelocity(0);
+                    b.setLinearVelocity(0, b.getLinearVelocity().y);
+                });
+            }
+        }
         // SR #1/#2 (round 36): deferred impact/water-entry removals — the
         // PostSolve callback only flagged parts (SR PartObject::PhysicsStep
         // pattern, 0x1d2350); execute removals now that the world is unlocked.

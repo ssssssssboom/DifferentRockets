@@ -27,6 +27,17 @@ public class Ship {
     /** Last resolved weld params (smoke-test diagnostics for per-part overrides). */
     public static float debugLastWeldHz = -1, debugLastWeldDamp = -1;
 
+    /**
+     * Round 39 floor for the explicit angular spring implemented per weld
+     * (applyJointDampers): lua frequencyHz=0 means "SR rigid" intent, but this
+     * gdx-box2d build's weld has no angular constraint at 0 Hz (pin joint —
+     * MAR.xml top stack folded 0.6 rad in 17 s and tore). 12 Hz / zeta 0.5
+     * keep a heavy stack angularly honest while staying inside the explicit
+     * integration stability bound (zeta*omega*PHYS_DT <= 0.5, capped in weld()).
+     */
+    private static final double ANG_FLOOR_HZ = 6.0;
+    private static final double ANG_FLOOR_ZETA = 1.0;
+
     public static class Link {
         public Joint joint;
         public Part a, b;
@@ -67,8 +78,22 @@ public class Ship {
          * cViscLin = linearDampingRatio * 2 * omega_ang * m_red.
          */
         public float cViscLin;
+        /**
+         * Round 39 explicit angular SPRING stiffness (N*m/rad) across this
+         * weld — this build's weld joint has no working angular constraint
+         * (see weld()), so the Hooke term k*(deviation) is applied per substep
+         * in applyJointDampers, floored at ANG_FLOOR_HZ even for 0 Hz "rigid"
+         * (SR) lua params.
+         */
+        public float kSpring;
         /** cached world anchor (set at weld time; joints are rigidly placed). */
         public final com.badlogic.gdx.math.Vector2 anchor = new com.badlogic.gdx.math.Vector2();
+        /** body-local copies of the weld anchor, refreshed to world space per
+         *  substep by applyJointDampers — the cached WORLD anchor goes stale
+         *  the moment the ship moves, and stale lever arms turn the linear
+         *  bushing into an energy pump (probe 39e: pad tip-over oscillation). */
+        public final com.badlogic.gdx.math.Vector2 localAnchorA = new com.badlogic.gdx.math.Vector2();
+        public final com.badlogic.gdx.math.Vector2 localAnchorB = new com.badlogic.gdx.math.Vector2();
     }
 
     public final GameWorld world;
@@ -112,6 +137,25 @@ public class Ship {
      * and when the player switches to this ship.
      */
     public boolean groundParked = false;
+    /**
+     * Launch-pad hold (round 39, MAR.xml birth semantics, SR-aligned): set by
+     * GameWorld.launchShip after grounding. Bodies are DEACTIVATED — no
+     * gravity application, no contacts, no joint-break checks — so a freshly
+     * spawned rocket stands motionless exactly like SR's pad spawn, instead
+     * of micro-settling into the contact solver. Wakes on the first player
+     * action (throttle / turn / stage activation).
+     */
+    public boolean padHold = false;
+    /** substeps of post-wake vertical guidance (round 39c, see GameWorld.substep). */
+    public int wakeSettle = 0;
+
+    /** Wake from launch-pad hold (round 39): re-activate all bodies. */
+    public void wakePadHold() {
+        if (!padHold) return;
+        wakeSettle = 60;
+        padHold = false;
+        setBodiesActive(true);
+    }
     public String name = "Ship";
 
     private final Vec2d tmp = new Vec2d();
@@ -123,6 +167,18 @@ public class Ship {
         this.id = nextId++;
         this.name = "Ship-" + id;
     }
+
+    /**
+     * Box2D collision group for this ship's part fixtures (SimpleRockets
+     * semantics): a NEGATIVE group shared by all fixtures of one ship means
+     * parts of the SAME ship never collide with each other — intra-craft
+     * contacts are off, so designs with clipped/overlapping parts (legal in
+     * SR craft files, e.g. a parachute clipped between two tanks in MAR.xml)
+     * no longer self-destruct from contact resolution at spawn. Distinct
+     * ships get distinct groups, so separated debris still collides with the
+     * main craft once splitIfDisconnected moves it to its own Ship.
+     */
+    public short collisionGroup() { return (short) -((id - 1) % 30000 + 1); }
 
     // ---------------------------------------------------------------- build
 
@@ -301,6 +357,8 @@ public class Ship {
         l.breakForce = breakForce;
         l.breakTorque = breakTorque;
         l.anchor.set(worldAnchor);
+        l.localAnchorA.set(a.body.getLocalPoint(worldAnchor));
+        l.localAnchorB.set(b.body.getLocalPoint(worldAnchor));
         l.attachIndexA = a.attachDefs().indexOf(apA);
         l.attachIndexB = b.attachDefs().indexOf(apB);
         // round 33b explicit viscous angular bushing across this weld. The
@@ -318,7 +376,6 @@ public class Ship {
         }
         float iA = a.body.getInertia(), iB = b.body.getInertia();
         double iRed = (iA + iB) > 0 ? (double) iA * iB / (iA + iB) : 0;
-        l.cVisc = (float) (zeta * 2.0 * (2 * Math.PI * Math.max(0, jd.frequencyHz)) * iRed);
         // round 34 task 2 linear bushing: same zeta form against anchor-point
         // relative LINEAR velocity, reduced MASS. Default 0 (probe matrix
         // decides whether it earns a nonzero default).
@@ -328,44 +385,111 @@ public class Ship {
         if (linOv != null) {
             try { zetaLin = Double.parseDouble(linOv); } catch (NumberFormatException ignore) {}
         }
+        // Round 39 (MAR.xml birth-collapse root fix): this gdx-box2d build's
+        // weld joint has NO effective angular constraint at frequencyHz=0 —
+        // round 35's "SR rigid weld" therefore made every connection a PIN.
+        // Probe evidence: MAR's top stack folds 0.6 rad in ~17 s on the pin
+        // and tears via the angle channel; even a FREE-FALLING ship folds
+        // (no contacts), and the fold rate is invariant to solver iterations
+        // — pure inverted-pendulum-on-a-pin dynamics. So the angular spring
+        // is implemented HERE, per substep (applyJointDampers): Hooke torque
+        // k*dev with k = (2*pi*fEff)^2 * I_red, floored at ANG_FLOOR_HZ so a
+        // lua 0 Hz ("rigid", SR intent) still gets real angular integrity.
+        // The viscous damper is capped for explicit-integration stability
+        // (zetaEff*omega*PHYS_DT <= 0.5 — probe: uncapped dampers detonate).
+        double fEff = Math.max(jd.frequencyHz, ANG_FLOOR_HZ);
+        double omega = 2 * Math.PI * fEff;
+        l.kSpring = (float) (omega * omega * iRed);
+        double zetaEff = Math.max(zeta, ANG_FLOOR_ZETA);
+        double zetaCap = 0.5 / (omega * GameWorld.PHYS_DT);
+        if (zetaEff > zetaCap) zetaEff = zetaCap;
+        l.cVisc = (float) (zetaEff * 2.0 * omega * iRed);
         float mA = a.body.getMass(), mB = b.body.getMass();
         double mRed = (mA + mB) > 0 ? (double) mA * mB / (mA + mB) : 0;
-        l.cViscLin = (float) (zetaLin * 2.0 * (2 * Math.PI * Math.max(0, jd.frequencyHz)) * mRed);
-        // Round 35 (SimpleRockets model): a rigid weld (0 Hz) must carry NO
-        // explicit damping — the omega scale factor already zeros both
-        // bushings at freq 0, but force it explicitly so a stray zeta
-        // override can never re-enable the damper layer on rigid links.
-        if (jd.frequencyHz <= 0) { l.cVisc = 0; l.cViscLin = 0; }
+        l.cViscLin = (float) (zetaLin * 2.0 * omega * mRed);
         // SR angle-break channel: remember the weld-time angle difference.
         l.initialAngleDiff = a.body.getAngle() - b.body.getAngle();
-        l.breakAngle = (float) (!Double.isNaN(jp.breakAngle) ? jp.breakAngle
-                : PhysicsScript.jointParam("breakAngle"));
-        if (l.breakAngle <= 0) l.breakAngle = 0.6f; // SR default
+        // SR truth (libNativeModule PartConnection): angle threshold is
+        // min(attachPoint A, attachPoint B); attachpoints without an explicit
+        // breakAngle attribute have NO angle channel (never break by angle).
+        // Per-joint lua override only; the lua GLOBAL default is NOT an SR
+        // concept (SR reads thresholds from the two attachpoints alone), so
+        // it must not arm the angle channel on plain tank/engine welds.
+        if (!Double.isNaN(jp.breakAngle) && jp.breakAngle > 0) {
+            l.breakAngle = (float) jp.breakAngle;
+        } else {
+            float deg = Math.min(apA.breakAngle, apB.breakAngle);
+            l.breakAngle = deg >= 180f ? Float.MAX_VALUE
+                    : (float) Math.toRadians(deg);
+        }
         links.add(l);
     }
 
     /**
-     * Apply the explicit viscous dampers (round 33b angular, round 34 linear)
+     * Round 39d: rigid angular weld lock (velocity level). Two Gauss-Seidel
+     * sweeps over the link graph; each pass applies the perfectly inelastic
+     * impulse that zeroes a pair's relative spin. Whole-ship rotation is
+     * untouched (every body ends with the same w); bending is forbidden.
+     */
+    public void applyWeldAngularLock() {
+        for (int it = 0; it < 2; it++) {
+            for (Link l : links) {
+                if (!l.a.body.isActive() || !l.b.body.isActive()) continue;
+                float dw = l.b.body.getAngularVelocity() - l.a.body.getAngularVelocity();
+                if (Math.abs(dw) < 1e-6) continue;
+                float ia = l.a.body.getInertia(), ib = l.b.body.getInertia();
+                if (ia <= 0 || ib <= 0) continue;
+                float j = (ia * ib / (ia + ib)) * dw;
+                l.a.body.applyAngularImpulse(j, true);
+                l.b.body.applyAngularImpulse(-j, true);
+            }
+        }
+    }
+
+    /**
      * once per physics SUBSTEP from GameWorld.substep, alongside the
      * thrust/frame forces. Each opposing pair of torques/forces is internal
      * to the welded pair (momentum-neutral).
      */
-    public void applyJointDampers() {
+    public void applyJointDampers(float h) {
         for (Link l : links) {
-            if (l.cVisc <= 0 && l.cViscLin <= 0) continue;
+            if (l.cVisc <= 0 && l.cViscLin <= 0 && l.kSpring <= 0) continue;
             if (!l.a.body.isActive() || !l.b.body.isActive()) continue;
-            if (l.cVisc > 0) {
+            if (l.cVisc > 0 || l.kSpring > 0) {
+                // round 39b: IMPLICIT per-link spring-damper solve on the
+                // relative rotational coordinate. The old explicit torque
+                // (probe 39e) was per-link stable (omega*h = 0.63 < 2*zeta)
+                // but a 45-link chain doubles the top eigenfrequency and
+                // forward Euler pumped it — the ship rocked itself over on
+                // the pad. Implicit Euler on (dev, dw) is unconditionally
+                // stable at any chain length:
+                //   iRed*(dw'-dw)/h = -k*(dev + dw'*h) - c*dw'
                 float dw = l.b.body.getAngularVelocity() - l.a.body.getAngularVelocity();
-                float torque = l.cVisc * dw;
-                l.a.body.applyTorque(torque, true);
-                l.b.body.applyTorque(-torque, true);
+                float dev = (l.b.body.getAngle() - l.a.body.getAngle()) - l.initialAngleDiff;
+                while (dev > Math.PI) dev -= 2 * Math.PI;
+                while (dev < -Math.PI) dev += 2 * Math.PI;
+                float ia = l.a.body.getInertia(), ib = l.b.body.getInertia();
+                if (ia > 0 && ib > 0) {
+                    float iRed = ia * ib / (ia + ib);
+                    float den = iRed / h + l.kSpring * h + l.cVisc;
+                    float dwp = (iRed * dw / h - l.kSpring * dev) / den;
+                    float j = iRed * (dw - dwp); // = restoring torque * h
+                    if (j != 0) {
+                        l.a.body.applyAngularImpulse(j, true);
+                        l.b.body.applyAngularImpulse(-j, true);
+                    }
+                }
             }
             if (l.cViscLin > 0) {
-                Vector2 va = l.a.body.getLinearVelocityFromWorldPoint(l.anchor);
-                Vector2 vb = l.b.body.getLinearVelocityFromWorldPoint(l.anchor);
+                // fresh per-substep anchor positions (the weld-time world
+                // anchor is stale once the ship moves/rotates)
+                Vector2 wA = l.a.body.getWorldPoint(l.localAnchorA);
+                Vector2 wB = l.b.body.getWorldPoint(l.localAnchorB);
+                Vector2 va = l.a.body.getLinearVelocityFromWorldPoint(wA);
+                Vector2 vb = l.b.body.getLinearVelocityFromWorldPoint(wB);
                 float fx = l.cViscLin * (vb.x - va.x), fy = l.cViscLin * (vb.y - va.y);
-                l.a.body.applyForce(fx, fy, l.anchor.x, l.anchor.y, true);
-                l.b.body.applyForce(-fx, -fy, l.anchor.x, l.anchor.y, true);
+                l.a.body.applyForce(fx, fy, wA.x, wA.y, true);
+                l.b.body.applyForce(-fx, -fy, wB.x, wB.y, true);
             }
         }
     }
@@ -563,7 +687,23 @@ public class Ship {
                 float diff = l.a.body.getAngle() - l.b.body.getAngle();
                 over = Math.abs(diff - l.initialAngleDiff) > l.breakAngle;
             }
-            if (over) dead.add(l);
+            if (over) {
+                if ("1".equals(System.getProperty("dr.debugImpact"))) {
+                    String why = "";
+                    if (l.breakForce != Float.MAX_VALUE) {
+                        Vector2 f = l.joint.getReactionForce(invDt);
+                        why += " F=" + (f.len() / 1000f) + "/" + l.breakForce;
+                    }
+                    if (l.breakTorque != Float.MAX_VALUE)
+                        why += " T=" + (Math.abs(l.joint.getReactionTorque(invDt)) / 1000f) + "/" + l.breakTorque;
+                    if (l.breakAngle != Float.MAX_VALUE) {
+                        float diff = l.a.body.getAngle() - l.b.body.getAngle();
+                        why += " A=" + Math.abs(diff - l.initialAngleDiff) + "/" + l.breakAngle;
+                    }
+                    System.out.println("[jointBreak]" + why + " parts=" + l.a.type.id + "<->" + l.b.type.id);
+                }
+                dead.add(l);
+            }
         }
         for (Link l : dead) destroyLink(l);
         if (!dead.isEmpty()) splitIfDisconnected();
@@ -620,6 +760,11 @@ public class Ship {
                 p.ship = ns;
                 Part par = parentOf.remove(p);
                 if (par != null) ns.parentOf.put(p, par);
+                // re-group fixtures: the fragment is its own craft now, so it
+                // must COLLIDE with its former shipmates again (SR: separated
+                // stages bump into the core stage) — same-negative-group
+                // filtering would otherwise keep it ghosting through them.
+                p.setCollisionGroup(ns.collisionGroup());
             }
             // move links
             List<Link> mv = new ArrayList<>();
@@ -898,6 +1043,7 @@ public class Ship {
      * `currentStage` now means "last stage number fired".
      */
     public int activateStage() {
+        wakePadHold(); // staging counts as a player action (round 39)
         int next = -1;
         for (Part p : parts) {
             if (p.group > currentStage && (next < 0 || p.group < next)) next = p.group;

@@ -101,7 +101,11 @@ public class Part {
     private List<AttachPoint> mirroredAttach;
 
     // flame fx for this frame (set via Lua emitFlame)
-    public float flameLevel;         // 0 = none, ~1 = full
+    public float flameLevel;
+    /** body angle at build time (round 40h rigid-thrust baseline). */
+    public float spawnAngle;
+    /** build-time offset from the ship's design CoM (round 40i rigid frame). */
+    public float spawnDX, spawnDY;         // 0 = none, ~1 = full
     public float flameGimbalDeg;
 
     /**
@@ -188,9 +192,10 @@ public class Part {
             fd.density = 1f;
             fd.filter.categoryBits = PartType.CAT_PART;
             fd.filter.maskBits = -1; // parts collide with everything
-            // SR semantics: parts of the SAME ship never collide (see
-            // Ship.collisionGroup) — clipped parts no longer explode at spawn
-            fd.filter.groupIndex = ship.collisionGroup();
+            // round 41: same-ship negative collision group REMOVED (owner
+            // directive) — non-mated parts of one ship DO collide in SR
+            // (the crush push-apart system exists for exactly that). Mated
+            // weld pairs stay contact-free via collideConnected=false.
             // round 13 item 1a: Box2D mixes contact friction as sqrt(fA*fB).
             // With the old 0.4 part default, terrain friction was nearly
             // irrelevant (sqrt(0.4*1.0)=0.63 — the ship slid on any slope no
@@ -228,7 +233,7 @@ public class Part {
         fd.density = 1f;
         fd.filter.categoryBits = PartType.CAT_PART;
         fd.filter.maskBits = -1;
-        fd.filter.groupIndex = ship.collisionGroup(); // same-ship parts never collide (SR)
+        // round 41: no negative group (same-ship parts collide, see body fixture)
         fd.friction = Math.max(1.5f, type.friction);
         fd.restitution = 0f;
         body.createFixture(fd);
@@ -253,8 +258,9 @@ public class Part {
         tf.filter.categoryBits = PartType.CAT_TIRE;
         // terrain + other tires ONLY — never parts (per owner spec)
         tf.filter.maskBits = (short) (PartType.CAT_TERRAIN | PartType.CAT_TIRE);
-        // same-ship tires don't grind against each other either (SR group)
-        tf.filter.groupIndex = ship.collisionGroup();
+        // NOTE: tire mask (terrain|tire only) is an independent owner spec
+        // and stays untouched; the negative group is gone (round 41), so
+        // tires now also bump same-ship tires per the mask.
         tf.friction = 2.0f; // rubber grip: propulsion is contact friction
         tf.restitution = 0f;
         tireBody.createFixture(tf);
@@ -472,29 +478,6 @@ public class Part {
         Attach.localSegment(type, attachDefs().get(index), outA, outB);
         outA.set(body.getWorldPoint(outA));
         outB.set(body.getWorldPoint(outB));
-    }
-
-    /**
-     * Re-assign the Box2D collision group of every fixture (body + tire) and
-     * refilter, used when this part moves to a different Ship (stage split) —
-     * see Ship.collisionGroup / splitIfDisconnected.
-     */
-    public void setCollisionGroup(short group) {
-        com.badlogic.gdx.physics.box2d.Filter f;
-        for (int i = 0; i < body.getFixtureList().size; i++) {
-            com.badlogic.gdx.physics.box2d.Fixture fx = body.getFixtureList().get(i);
-            f = fx.getFilterData();
-            f.groupIndex = group;
-            fx.setFilterData(f);
-        }
-        if (tireBody != null) {
-            for (int i = 0; i < tireBody.getFixtureList().size; i++) {
-                com.badlogic.gdx.physics.box2d.Fixture fx = tireBody.getFixtureList().get(i);
-                f = fx.getFilterData();
-                f.groupIndex = group;
-                fx.setFilterData(f);
-            }
-        }
     }
 
     /**

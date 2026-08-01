@@ -40,6 +40,16 @@ public class Ship {
 
     public static class Link {
         public Joint joint;
+        public Joint jointPin; // see comment at weld(): revolute+motor angular lock
+        /** round 40c: revolute + max-torque motor at the same anchor — this
+         *  build's weld joint has NO angular constraint at any frequencyHz
+         *  (probe: 5/15/30 Hz traces byte-identical), so stacks bend on the
+         *  pins under thrust and the thrust-line fanning torque tumbles the
+         *  ascent (probe 41, vacuum). A revolute motor with motorSpeed=0 is
+         *  a SOLVER-side angular velocity lock (implicit, in-step): exactly
+         *  the SR rigid weld angular channel. Linear DOF stays with the
+         *  weld joint (rigid 2x2, works); the revolute's own pin duplicates
+         *  it (same equations, harmless redundancy). */
         public Part a, b;
         public boolean fuelEdge;
         public float breakForce = Float.MAX_VALUE;
@@ -152,7 +162,7 @@ public class Ship {
     /** Wake from launch-pad hold (round 39): re-activate all bodies. */
     public void wakePadHold() {
         if (!padHold) return;
-        wakeSettle = 60;
+        wakeSettle = Integer.parseInt(System.getProperty("dr.wakeSettle", "60"));
         padHold = false;
         setBodiesActive(true);
     }
@@ -169,16 +179,13 @@ public class Ship {
     }
 
     /**
-     * Box2D collision group for this ship's part fixtures (SimpleRockets
-     * semantics): a NEGATIVE group shared by all fixtures of one ship means
-     * parts of the SAME ship never collide with each other — intra-craft
-     * contacts are off, so designs with clipped/overlapping parts (legal in
-     * SR craft files, e.g. a parachute clipped between two tanks in MAR.xml)
-     * no longer self-destruct from contact resolution at spawn. Distinct
-     * ships get distinct groups, so separated debris still collides with the
-     * main craft once splitIfDisconnected moves it to its own Ship.
+     * Round 41 (owner directive): the same-ship negative Box2D collision
+     * group was REMOVED. In SR, non-mated parts of the same ship DO collide
+     * (the crush push-apart system exists for exactly those contacts); the
+     * group made clipped designs ghost through each other instead. Mated
+     * weld pairs remain contact-free via collideConnected=false; spawn
+     * integrity is guarded by padHold + crush + disconnect semantics.
      */
-    public short collisionGroup() { return (short) -((id - 1) % 30000 + 1); }
 
     // ---------------------------------------------------------------- build
 
@@ -196,6 +203,10 @@ public class Ship {
             float ox = dp.x * c - dp.y * s;
             float oy = dp.x * s + dp.y * c;
             p.createBody(ox, oy, spawnAngle);
+            // round 40h fix: baseline is the part's ACTUAL built body angle
+            // (createBody also applies the design 90deg-step rotation), not
+            // the ship spawn rotation.
+            p.spawnAngle = p.body.getAngle();
             parts.add(p);
             byDesign.add(p);
         }
@@ -349,8 +360,24 @@ public class Ship {
         debugLastWeldDamp = jd.dampingRatio;
         jd.collideConnected = false;
         Joint joint = world.boxWorld.createJoint(jd);
+        // round 40c: the weld's angular channel is inert in this build (see
+        // Link.jointPin), so add a revolute joint at the same anchor with a
+        // max-torque 0-speed motor — a solver-side rigid angular lock (SR
+        // weld semantics). Toggle off with -Ddr.noPin=1 for A/B probes.
+        Joint pin = null;
+        if ("1".equals(System.getProperty("dr.pin"))) {
+            com.badlogic.gdx.physics.box2d.joints.RevoluteJointDef rd =
+                    new com.badlogic.gdx.physics.box2d.joints.RevoluteJointDef();
+            rd.initialize(a.body, b.body, worldAnchor);
+            rd.collideConnected = false;
+            rd.enableMotor = true;
+            rd.motorSpeed = 0;
+            rd.maxMotorTorque = 1e12f;
+            pin = world.boxWorld.createJoint(rd);
+        }
         Link l = new Link();
         l.joint = joint;
+        l.jointPin = pin;
         l.a = a;
         l.b = b;
         l.fuelEdge = apA.fuelLine && apB.fuelLine;
@@ -430,6 +457,39 @@ public class Ship {
      * sweeps over the link graph; each pass applies the perfectly inelastic
      * impulse that zeroes a pair's relative spin. Whole-ship rotation is
      * untouched (every body ends with the same w); bending is forbidden.
+     */
+    /**
+     * Round 40h: inertia-weighted mean rotation of the whole ship since
+     * build — the best available estimate of the SR rigid-body orientation
+     * (this joint library cannot hold angles, so parts individually wander;
+     * engine thrust uses spawnAngle + avgRotation as its baseline so a
+     * flexed base cannot steer the thrust line, see ModApi.getRigidAngle).
+     */
+    public float avgRotation() {
+        float iSum = 0, acc = 0;
+        for (Part p : parts) {
+            if (p.body == null) continue;
+            float i = p.body.getInertia();
+            if (i <= 0) continue;
+            float d = p.body.getAngle() - p.spawnAngle;
+            while (d > Math.PI) d -= 2 * Math.PI;
+            while (d < -Math.PI) d += 2 * Math.PI;
+            iSum += i;
+            acc += i * d;
+        }
+        return iSum > 0 ? acc / iSum : 0;
+    }
+
+    /**
+     * Round 40e/40f pairwise angular lock (RESTORED after probe 45). Round
+     * 40i's full kinematic projection (rigid-frame velocity + BETA position
+     * correction) was flight-tested in probe 45 and was CATASTROPHIC: in
+     * vacuum it spun up to 1.55 rad/s and tore the ship apart (46 -> 3 parts,
+     * flex 36 m) within 15 s of ignition, and in atmosphere it diverged to
+     * 76 deg by t=40 s shedding parts, ending in a Box2D NPE crash. The
+     * pairwise impulse pass below is the validated 40e/40f behavior: each
+     * impulse zeroes a weld pair's RELATIVE spin, is momentum-neutral, and
+     * leaves whole-ship rotation untouched.
      */
     public void applyWeldAngularLock() {
         for (int it = 0; it < 2; it++) {
@@ -602,6 +662,10 @@ public class Ship {
             world.boxWorld.destroyJoint(l.joint);
             l.joint = null;
         }
+        if (l.jointPin != null) {
+            world.boxWorld.destroyJoint(l.jointPin);
+            l.jointPin = null;
+        }
         links.remove(l);
     }
 
@@ -760,11 +824,9 @@ public class Ship {
                 p.ship = ns;
                 Part par = parentOf.remove(p);
                 if (par != null) ns.parentOf.put(p, par);
-                // re-group fixtures: the fragment is its own craft now, so it
-                // must COLLIDE with its former shipmates again (SR: separated
-                // stages bump into the core stage) — same-negative-group
-                // filtering would otherwise keep it ghosting through them.
-                p.setCollisionGroup(ns.collisionGroup());
+                // round 41: no re-grouping needed — fixtures carry no
+                // collision group anymore; the fragment collides with its
+                // former shipmates naturally (SR stage-bump semantics).
             }
             // move links
             List<Link> mv = new ArrayList<>();

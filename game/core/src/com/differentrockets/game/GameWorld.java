@@ -655,9 +655,9 @@ public class GameWorld {
         float spawnAngle = (float) (padAngle - Math.PI / 2);
         ship.buildFromDesign(design, spawnAngle);
         // SR craft files carry disconnected blocks (DisconnectedParts) that are
-        // separate crafts: split immediately so each fragment gets its own
-        // collision group and collides with the main ship again (see
-        // Ship.collisionGroup — inside one Ship, parts never collide).
+        // separate crafts: split immediately so each fragment becomes its own
+        // Ship (round 41: no collision groups anymore — fragments now collide
+        // with the main ship naturally, SR stage-bump semantics).
         ship.splitIfDisconnected();
         // the frame carries the planet's velocity; bodies start at rest so the
         // ship is at rest relative to the launch site (avoids Box2D's velocity cap)
@@ -1565,7 +1565,7 @@ public class GameWorld {
         // perfectly inelastic impulses (Gauss-Seidel over the link graph;
         // unconditionally stable, removes energy, permits whole-body spin).
         for (Ship s : ships) {
-            if (!s.onRails && !s.padHold) s.applyWeldAngularLock();
+            if (!s.onRails && !s.padHold && !"1".equals(System.getProperty("dr.noLock"))) s.applyWeldAngularLock();
         }
         // round 39c wake-settle guide: right after pad-hold wake the stack
         // micro-settles into the contact solver and the catch seeds a pad
@@ -1644,6 +1644,52 @@ public class GameWorld {
             }
             break;
         }
+        // SR drag redistribution (round 40, reverse report §4): SR computes
+        // ONE equivalent drag force for the whole ship and splits it across
+        // parts by MASS at each part's CoM, so the resultant acts at the
+        // ship CoM and exerts ZERO torque — an unguided rocket never
+        // aero-tumbles (MAR in SR flies straight). Our per-part CdA /
+        // occlusion magnitude model stays, but magnitudes are summed
+        // ship-wide first and re-apportioned by mass along the ship
+        // freestream. Per-part application at part CoM kept our old
+        // center-of-pressure artifact: force ∝ CdA, not mass → phantom
+        // torque → open-loop tumble (MAR probe: 0.9deg @1s, spin @6.5s,
+        // terrain crash @29.6s).
+        double shipMass = 0;
+        for (Part p : ship.parts) {
+            if (p.body != null && p.body.isActive()) shipMass += p.body.getMass();
+        }
+        double refRvx = 0, refRvy = 0;
+        java.util.IdentityHashMap<Part, Double> dragMag = null;
+        double dragTotal = 0;
+        if (shipMass > 0) {
+            boolean refSet = false;
+            for (Part p : ship.parts) {
+                if (p.body == null || !p.body.isActive()) continue;
+                Planet np = nearestPlanetTo(origin.x + p.body.getPosition().x,
+                        origin.y + p.body.getPosition().y);
+                if (np == null || !np.hasAtmosphere()) continue;
+                double rho = densityAt(origin.x + p.body.getPosition().x,
+                        origin.y + p.body.getPosition().y);
+                if (rho <= 1e-9) continue;
+                Vector2 v = p.body.getLinearVelocity();
+                double rvx = frameVel.x + ship.originVel.x + v.x - np.vel.x;
+                double rvy = frameVel.y + ship.originVel.y + v.y - np.vel.y;
+                double speed2 = rvx * rvx + rvy * rvy;
+                if (speed2 <= 1.0) continue; // SR #5: no drag at v <= 1 m/s
+                if (!refSet) { refSet = true; refRvx = rvx; refRvy = rvy; }
+                double cd = !Double.isNaN(p.dragCd) ? p.dragCd
+                        : Math.max(0.0, 0.75 + p.type.drag);
+                double area = !Double.isNaN(p.dragArea) ? p.dragArea : p.type.width;
+                double fmag = 0.5 * rho * speed2 * cd * area;
+                fmag *= p.dragExposure; // occlusion by upstream structure
+                fmag *= 0.1; // round 37 unit convention
+                if (dragMag == null) dragMag = new java.util.IdentityHashMap<>();
+                dragMag.put(p, fmag);
+                dragTotal += fmag;
+            }
+        }
+
         for (Part p : ship.parts) {
             if (p.body == null || !p.body.isActive()) continue;
             Vector2 bp = p.body.getPosition();
@@ -1662,45 +1708,23 @@ public class GameWorld {
             // round-34 parking semantics survive this wake change.
             p.body.applyForceToCenter((float) (g.x * m), (float) (g.y * m), true);
 
-            // drag
-            Planet np = nearestPlanetTo(ux, uy);
-            Vector2 v = p.body.getLinearVelocity();
-            if (np != null && np.hasAtmosphere()) {
-                double alt = altitudeAt(ux, uy);
-                // round 14 fix: drag must use the player-editable density law
-                // (mod/physics.lua atmosphereDensity) — it used to call the
-                // built-in Planet.densityAt directly, so editing physics.lua
-                // had no effect on drag.
-                double rho = densityAt(ux, uy);
-                if (rho > 1e-9) {
-                    // wind-relative velocity in the universe frame (planet rotation ignored)
-                    double rvx = frameVel.x + ship.originVel.x + v.x - np.vel.x;
-                    double rvy = frameVel.y + ship.originVel.y + v.y - np.vel.y;
-                    double speed2 = rvx * rvx + rvy * rvy;
-                    // SR #5 (round 36, ShipOrbitNode::PhysicsStep @ 0x1b9264):
-                    // SR skips drag entirely at v <= 1.0 m/s — kills the
-                    // numerical jitter of a ship creeping along the ground.
-                    if (speed2 > 1.0) {
-                        double speed = Math.sqrt(speed2);
-                        // per-part drag: Lua-set absolute Cd wins; otherwise the
-                        // 0.75 baseline adjusted by the PartList.xml `drag` attr
-                        // (nosecone drag="-1.0" subtracts from the ship total).
-                        double cd = !Double.isNaN(p.dragCd)
-                                ? p.dragCd
-                                : Math.max(0.0, 0.75 + p.type.drag);
-                        double area = !Double.isNaN(p.dragArea) ? p.dragArea : p.type.width;
-                        double fmag = 0.5 * rho * speed2 * cd * area;
-                        // parts shadowed by upstream structure feel less drag
-                        fmag *= p.dragExposure;
-                        // round 37 unit convention: forces /10 alongside masses
-                        // (mass = XML*50 now) so the deceleration is unchanged.
-                        fmag *= 0.1;
-                        p.body.applyForceToCenter(
-                                (float) (-fmag * rvx / speed),
-                                (float) (-fmag * rvy / speed), false);
-                    }
+            // drag (round 40): ship-total drag re-apportioned by mass along
+            // the ship freestream — zero net torque about the ship CoM.
+            // dragMag marks which parts contributed to the total (i.e. sit
+            // in atmosphere); the SHARE goes to every active part by mass so
+            // the resultant stays at the ship CoM even if some parts are
+            // outside the atmosphere edge.
+            if (dragMag != null && dragTotal > 0) {
+                double speed = Math.hypot(refRvx, refRvy);
+                if (speed > 0) {
+                    double share = dragTotal * (m / shipMass);
+                    p.body.applyForceToCenter(
+                            (float) (-share * refRvx / speed),
+                            (float) (-share * refRvy / speed), false);
                 }
             }
+            Planet np = nearestPlanetTo(ux, uy);
+            Vector2 v = p.body.getLinearVelocity();
             // water: buoyancy + SR damping + entry damage. Round 36: moved
             // OUT of the atmosphere branch — water on an airless body still
             // floats/damps/damages (SR SimulateWater keys on the water info,

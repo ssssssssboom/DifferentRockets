@@ -124,6 +124,11 @@ public class ModApi {
     public void setTargetHeading(double rad) { world().setTargetHeading(rad); }
     /** Current ship heading (radians, same convention as target). */
     public double getShipHeading() { return world().currentHeading(); }
+
+    /** Round 40h: part spawn angle + ship mean rotation — SR rigid-weld
+     *  thrust baseline (see Ship.avgRotation). Engines aim thrust along
+     *  this instead of their own flopping body angle. */
+    public double getRigidAngle() { return part.spawnAngle + part.ship.avgRotation(); }
     /** Latest turn command in -1..1 (same value as getTurn()). */
     public double getTurnCommand() { return world().getTurnCommand(); }
 

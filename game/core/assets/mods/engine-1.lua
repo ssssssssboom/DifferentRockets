@@ -1,4 +1,4 @@
--- v2026.07.31
+-- v2026.08.01
 -- v2026.07.31: unit convention migration (round 37, all forces /10): thrust N
 -- = power * 8.5e3 (SR native: double 8500.0 @0x1cdb78; Blasto 425 = power 5.0
 -- -> 425 kN in SR's own mass scale). Mass unit = XML mass * 50 kg (SR GetMass,
@@ -107,7 +107,7 @@ function onUpdate(part, dt)
   end
 
   if thrust <= 0 then return end
-  local ang = part:getAngle() + math.rad(gimbal)
+  local ang = part:getRigidAngle() + math.rad(gimbal) -- round 40h: SR rigid-weld thrust baseline
   local dx = -math.sin(ang)
   local dy = math.cos(ang)
   -- apply at the nozzle so gimbaling produces torque

@@ -115,22 +115,25 @@ public class PartType {
     public float drag = 0f;           // nosecone uses negative
     public float coverHeight = 0f;
     /**
-     * SR impact-damage dual thresholds (docs/sr-physics-re.md §6), in normal
-     * impulse (N*s per PostSolve contact impulse): exceeding impactDestroy
-     * removes the part outright; exceeding impactExplode explodes it.
-     * Parsed from the part element's explode="N" attribute (SR PartList.xml
-     * Damage field; binary: part+0x60 = destroy, part+0x68 = explode).
-     * impactDestroy = impactExplode * 0.36 is an ESTIMATE — the RE report
-     * does not give the +0x60/+0x68 ratio.
-     * UNITS (round 37): we now use SR's native unit system — SR's
-     * PartObject::GetMass / TankObject::GetMass compute mass = XML mass * 50.0
-     * (float constant at libNativeModule.so .data:0x2542d8 = 50.0f, referenced
-     * via GOT 0x253a6c, shared by both functions), and our massKg() does the
-     * same. Impulse = mass * velocity, so SR's 1500/2500 thresholds apply
-     * NATIVELY with no conversion: explode="N" -> impactExplode = N.
+     * SR impact-damage dual thresholds (docs/sr-physics-re.md §6, round 38
+     * binary-verified semantics), in normal impulse (N*s per PostSolve
+     * contact impulse):
+     *   - impulse > impactDisconnect (PartList <Damage disconnect="N">,
+     *     binary part+0x60) -> next substep SR calls
+     *     PartTree::DisconnectFromParentTree(): the part's link to its PARENT
+     *     is severed and the part + its subtree SEPARATE ALIVE (no deletion).
+     *   - impulse > impactExplode (PartList explode="N" or <Damage
+     *     explode="N">, binary part+0x68) -> PartObject::Explode() deletes
+     *     the part with an explosion.
+     * SR Damage values: pod 1500/1500, big tanks 2500/2500, one part
+     * 250/3000 — disconnect and explode may differ.
+     * UNITS (round 37): SR native unit system — massKg() = XML mass * 50.0
+     * (.data:0x2542d8 = 50.0f via GOT 0x253a6c, shared by
+     * PartObject/TankObject::GetMass). Impulse = mass * velocity, so the raw
+     * SR values apply NATIVELY with no conversion.
      */
-    public double impactDestroy = 540.0;   // 1500 * 0.36 default (estimate)
-    public double impactExplode = 1500.0;  // SR PartList common 1500
+    public double impactDisconnect = 1500.0; // <Damage disconnect> default (SR common 1500)
+    public double impactExplode = 1500.0;    // SR PartList common 1500
 
     public EngineDef engine;
     public TankDef tank;
@@ -180,22 +183,24 @@ public class PartType {
                 t.friction = e.getFloatAttribute("friction", 0.4f);
                 t.drag = e.getFloatAttribute("drag", 0f);
                 t.coverHeight = e.getFloatAttribute("coverHeight", 0f);
-                // SR RE §6: explode="N" on the part element (preferred), or on
-                // the SR-style <Damage explode="N"/> child; default 1500 (SR
-                // PartList common 1500). Round 37 unit convention: our masses
-                // now match SR (massKg = XML*50, .data:0x2542d8), so the raw
-                // SR value applies natively — NO conversion. destroy =
-                // explode * 0.36 (ESTIMATE, ratio not recovered).
+                // SR RE §6 (round 38, binary-verified): explode="N" on the part
+                // element (preferred), or on the SR-style <Damage explode="N"/>
+                // child; disconnect="N" likewise comes from the <Damage> child
+                // (part+0x60), default 1500. Round 37 unit convention: masses
+                // match SR (massKg = XML*50, .data:0x2542d8), so the raw SR
+                // values apply natively — NO conversion.
                 {
                     double exp = Xml.getDouble(e, "explode", Double.NaN);
-                    if (Double.isNaN(exp)) {
-                        XmlReader.Element dmg = e.getChildByName("Damage");
-                        if (dmg != null) exp = Xml.getDouble(dmg, "explode", Double.NaN);
-                    }
-                    if (!Double.isNaN(exp)) {
-                        t.impactExplode = exp;        // SR native value, no conversion
-                        t.impactDestroy = exp * 0.36; // estimate, see field doc
-                    }
+                    double dis = Double.NaN;
+                    XmlReader.Element dmg = e.getChildByName("Damage");
+                    if (Double.isNaN(exp) && dmg != null)
+                        exp = Xml.getDouble(dmg, "explode", Double.NaN);
+                    if (dmg != null)
+                        dis = Xml.getDouble(dmg, "disconnect", Double.NaN);
+                    if (Double.isNaN(dis))
+                        dis = Xml.getDouble(e, "disconnect", Double.NaN);
+                    if (!Double.isNaN(exp)) t.impactExplode = exp;   // SR native, no conversion
+                    if (!Double.isNaN(dis)) t.impactDisconnect = dis; // SR native, no conversion
                 }
 
                 for (int c = 0; c < e.getChildCount(); c++) {

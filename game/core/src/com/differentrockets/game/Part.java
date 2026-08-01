@@ -32,13 +32,15 @@ public class Part {
 
     /**
      * SR impact-damage deferred-execution flags (docs/sr-physics-re.md §6,
-     * PartObject::PhysicsStep @ 0x1d2350): contact callbacks only SET these
-     * (Box2D world is locked inside PostSolve), GameWorld executes the actual
-     * removal/explosion after the substep ends. pendingDestroy = remove
-     * outright (SR flag 0x1c9), pendingExplode = remove + explosion visual
-     * (SR flag 0x1ca).
+     * PartObject::PhysicsStep @ 0x1d2350; round 38 binary-verified): contact
+     * callbacks only SET these (Box2D world is locked inside PostSolve),
+     * GameWorld executes the action after the substep ends.
+     * pendingDisconnect = sever the part's link to its PARENT — the part and
+     * its subtree separate ALIVE (SR flag 0x1c9 ->
+     * PartTree::DisconnectFromParentTree; NO deletion). pendingExplode =
+     * remove + explosion visual (SR flag 0x1ca -> PartObject::Explode).
      */
-    public boolean pendingDestroy, pendingExplode;
+    public boolean pendingDisconnect, pendingExplode;
 
     /**
      * SR water state (§8): while submerged the body's damping fields are

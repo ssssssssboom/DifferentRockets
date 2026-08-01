@@ -215,16 +215,19 @@ public class GameWorld {
 
     /**
      * SR impact damage (docs/sr-physics-re.md §6, LocalPhysics::PostSolve @
-     * 0x197734 + PartObject::OnCollision @ 0x1d1534): take the MAX normal
-     * impulse of the contact (N*s, per-substep) and compare it against each
-     * involved part's dual thresholds — impulse > impactExplode explodes,
-     * impulse > impactDestroy removes outright. SR semantics: the callback
-     * ONLY SETS FLAGS on the part (SR flags 0x1c9/0x1ca); the actual
-     * removal/explosion runs after the substep in processPendingPartDamage
-     * (SR defers to the next substep's PartObject::PhysicsStep, 0x1d2350 —
-     * mutating bodies/joints inside a Box2D callback would corrupt the
-     * world). canExplode=false parts (strut/parachute/dock-1) never explode:
-     * an explode-level impulse demotes to the destroy path.
+     * 0x197734 + PartObject::OnCollision @ 0x1d1534, round 38 binary-verified):
+     * take the MAX normal impulse of the contact (N*s, per-substep) and
+     * compare it against each involved part's dual thresholds —
+     * impulse > impactExplode explodes (PartObject::Explode, part deleted);
+     * impulse > impactDisconnect severs the part's PARENT link — the part and
+     * its subtree separate ALIVE (PartTree::DisconnectFromParentTree, no
+     * deletion). SR semantics: the callback ONLY SETS FLAGS on the part (SR
+     * flags 0x1c9/0x1ca); the actual action runs after the substep in
+     * processPendingPartDamage (SR defers to the next substep's
+     * PartObject::PhysicsStep, 0x1d2350 — mutating bodies/joints inside a
+     * Box2D callback would corrupt the world). canExplode=false parts
+     * (strut/parachute/dock-1) never explode: an explode-level impulse
+     * demotes to the disconnect path.
      */
     private void impact(com.badlogic.gdx.physics.box2d.Contact c,
                         com.badlogic.gdx.physics.box2d.ContactImpulse i) {
@@ -232,6 +235,10 @@ public class GameWorld {
         float[] ni = i.getNormalImpulses();
         for (float v : ni) if (v > maxN) maxN = v;
         if (maxN <= 0) return;
+        if (DEBUG_IMPACT) {
+            float sum = 0; for (float v : ni) sum += v;
+            System.out.println("[impact] maxN=" + maxN + " sum=" + sum + " pts=" + ni.length);
+        }
         Object ua = c.getFixtureA().getBody().getUserData();
         Object ub = c.getFixtureB().getBody().getUserData();
         if (ua == ub && ua != null) return; // same part self-contact (wheel axle/tire) — SR skips
@@ -244,24 +251,35 @@ public class GameWorld {
         Part p = (Part) userData;
         if (impulse > p.type.impactExplode) {
             if (p.type.canExplode) p.pendingExplode = true;
-            else p.pendingDestroy = true; // canExplode=false: destroy-only path
-        } else if (impulse > p.type.impactDestroy) {
-            p.pendingDestroy = true;
+            else p.pendingDisconnect = true; // canExplode=false: demote to disconnect
+        } else if (impulse > p.type.impactDisconnect) {
+            p.pendingDisconnect = true;
         }
     }
 
     /**
-     * Channel-2 impact estimate (round 36, probe36): beginContact closing
-     * speed along the contact normal, impulse ≈ m·vN — the perfectly
-     * inelastic one-substep stop, i.e. SR's PostSolve max-normal-impulse for
-     * a hard hit. Needed because velocities above BODY_VEL_SAFE are parked in
+     * Channel-2 impact estimate (round 36, probe36; round 38 gating):
+     * beginContact closing speed along the contact normal, impulse ≈ m·vN —
+     * the perfectly inelastic one-substep stop, i.e. SR's PostSolve
+     * max-normal-impulse for a hard hit. It exists ONLY for the solver's
+     * blind spot: velocities above BODY_VEL_SAFE are parked in
      * frameVel/originVel (clamp guard) and static terrain carries no solver
      * velocity at all (Box2D 2.3 ignores SetLinearVelocity on static bodies),
      * so the raw PostSolve impulse UNDERESTIMATES exactly the high-speed
-     * impacts that must explode. Computed in universe-consistent terms
-     * (frameVel cancels in the difference): part side = bodyVel +
-     * ship.originVel, terrain side = planet.vel − frameVel (static chunks
-     * are pinned to the terrain planet by the per-substep re-base).
+     * impacts that must explode. Two gates (round 38):
+     *   - BOTH bodies are Parts and closing <= BODY_VEL_SAFE: the solver
+     *     sees the impact fine — channel 1 (PostSolve) is authoritative,
+     *     channel 2 stands down. (Empirically the blind spot is ONLY the
+     *     static-terrain case: probe38 B2 measured maxN=66 N*s for a
+     *     50 kg pod stopping 35 m/s — a ~26x under-report — because the
+     *     soft static contact spreads the stop over ~26 substeps. So
+     *     terrain hits run channel 2 at ANY speed, as in round 36.)
+     *   - both Parts of the SAME ship: internal squeeze is the crush
+     *     system's job (Ship.applyCrushForces), not impact damage.
+     * Computed in universe-consistent terms (frameVel cancels in the
+     * difference): part side = bodyVel + ship.originVel, terrain side =
+     * planet.vel − frameVel (static chunks are pinned to the terrain planet
+     * by the per-substep re-base).
      */
     private void impactBegin(com.badlogic.gdx.physics.box2d.Contact c) {
         com.badlogic.gdx.physics.box2d.Body ba = c.getFixtureA().getBody();
@@ -269,6 +287,9 @@ public class GameWorld {
         Object ua = ba.getUserData(), ub = bb.getUserData();
         if (!(ua instanceof Part) && !(ub instanceof Part)) return;
         if (ua == ub) return; // same part self-contact (wheel axle/tire)
+        if (ua instanceof Part && ub instanceof Part
+                && ((Part) ua).ship != null && ((Part) ua).ship == ((Part) ub).ship)
+            return; // same-ship internal contact: crush handles it, SR has no channel 2
         double vax, vay, vbx, vby;
         if (ua instanceof Part) {
             com.badlogic.gdx.math.Vector2 v = ba.getLinearVelocity();
@@ -292,39 +313,61 @@ public class GameWorld {
         }
         com.badlogic.gdx.physics.box2d.WorldManifold wm = c.getWorldManifold();
         float nx = wm.getNormal().x, ny = wm.getNormal().y; // from A to B
-        double closing = -((vax - vbx) * nx + (vay - vby) * ny); // >0 = approaching
+        // approaching speed: n points A->B, so closing = (vA - vB) . n
+        // (round 38 fix: the old "-((vA-vB).n)" equaled the SEPARATION speed
+        // and dropped every genuinely approaching contact whose moving part
+        // happened to be fixture B — probe38 B2: no channel-2 flag at 51 m/s).
+        double closing = (vax - vbx) * nx + (vay - vby) * ny; // >0 = approaching
+        // part-vs-part within the solver's velocity domain: channel 1 owns it.
+        // Terrain hits bypass this gate — static contacts under-report at ANY
+        // speed (see method doc).
+        if (ua instanceof Part && ub instanceof Part && closing <= BODY_VEL_SAFE) return;
         if (closing <= 0) return;
+        if (DEBUG_IMPACT)
+            System.out.println("[impactBegin] closing=" + (float) closing
+                    + " a=" + (ua instanceof Part ? ((Part) ua).type.id : "terrain")
+                    + " b=" + (ub instanceof Part ? ((Part) ub).type.id : "terrain")
+                    + " impA=" + (ua instanceof Part ? (float) (ba.getMass() * closing) : 0)
+                    + " impB=" + (ub instanceof Part ? (float) (bb.getMass() * closing) : 0));
         if (ua instanceof Part) impactFlag(ua, (float) (ba.getMass() * closing));
         if (ub instanceof Part) impactFlag(ub, (float) (bb.getMass() * closing));
     }
 
     /**
-     * Execute the deferred SR impact/water-entry removals after a substep
+     * Execute the deferred SR impact/water-entry actions after a substep
      * (SR: next substep's PhysicsStep). Flags are collected across ALL ships
-     * first — a removal can split its ship, moving sibling parts to a new
-     * Ship mid-processing; each removal then resolves against the part's
+     * first — an explosion can split its ship, moving sibling parts to a new
+     * Ship mid-processing; each action then resolves against the part's
      * CURRENT ship. Ships left empty are dropped from the world.
+     * Round 38 (binary-verified SR semantics): disconnect does NOT delete —
+     * it severs only the part's PARENT link (removeParentJointOf) and the
+     * part + its subtree separate alive via splitIfDisconnected; a root part
+     * (or one without a parent link) is untouched. Explode deletes.
      */
     private void processPendingPartDamage() {
-        List<Part> doomed = null, boomed = null;
+        List<Part> detached = null, boomed = null;
         for (Ship s : ships) {
             for (Part p : s.parts) {
                 if (p.pendingExplode) {
                     p.pendingExplode = false;
-                    p.pendingDestroy = false;
+                    p.pendingDisconnect = false;
                     if (boomed == null) boomed = new ArrayList<>();
                     boomed.add(p);
-                } else if (p.pendingDestroy) {
-                    p.pendingDestroy = false;
-                    if (doomed == null) doomed = new ArrayList<>();
-                    doomed.add(p);
+                } else if (p.pendingDisconnect) {
+                    p.pendingDisconnect = false;
+                    if (detached == null) detached = new ArrayList<>();
+                    detached.add(p);
                 }
             }
         }
-        if (doomed == null && boomed == null) return;
-        if (doomed != null) {
-            for (Part p : doomed) {
-                if (p.ship != null) p.ship.removePart(p, false);
+        if (detached == null && boomed == null) return;
+        if (detached != null) {
+            for (Part p : detached) {
+                // SR DisconnectFromParentTree: cut ONLY the parent link; the
+                // part + its subtree drift away alive. Root / no recorded
+                // parent: nothing to cut (fallback branch cuts attach<=0
+                // links, matching the detacher semantics).
+                if (p.ship != null) p.ship.removeParentJointOf(p);
             }
         }
         if (boomed != null) {
@@ -816,6 +859,8 @@ public class GameWorld {
      * it), keeping every body well under the clamp at all times.
      */
     private static final float BODY_VEL_SAFE = 100f; // fold to originVel above this (clamp = 120 u/s)
+    /** probe/debug: print PostSolve impulse decomposition (-Ddr.debugImpact=1). */
+    private static final boolean DEBUG_IMPACT = "1".equals(System.getProperty("dr.debugImpact"));
 
     private void velocityReanchor() {
         if (active == null) return;
@@ -1543,20 +1588,22 @@ public class GameWorld {
                     p.body.setLinearDamping((float) (2.0 * submersion));
                     p.body.setAngularDamping((float) (0.5 * submersion));
                     p.waterDamped = true;
-                    // SR #8 (round 36, PartObject::OnEnterWater @ 0x1d1e84):
+                    // SR #8 (round 36/38, PartObject::OnEnterWater @ 0x1d1e84):
                     // water-ENTRY speed dual thresholds (literal @ 0x1d2054):
-                    // v > 90 m/s -> explode (destroy for canExplode=false);
-                    // 25 < v <= 90 -> silent removal; v <= 25 -> safe. Flags
-                    // share the task-1 deferred execution channel.
+                    // v > 90 m/s -> explode flag (0x1ca; disconnect for
+                    // canExplode=false); 25 < v <= 90 -> flag 0x1c9 too —
+                    // round 38 binary-verified: that is the DISCONNECT flag,
+                    // the part separates alive, it does NOT vanish;
+                    // v <= 25 -> safe. Flags share the deferred channel.
                     if (!p.wasInWater) {
                         double evx = frameVel.x + ship.originVel.x + v.x - np.vel.x;
                         double evy = frameVel.y + ship.originVel.y + v.y - np.vel.y;
                         double esp2 = evx * evx + evy * evy;
                         if (esp2 > 90.0 * 90.0) {
                             if (p.type.canExplode) p.pendingExplode = true;
-                            else p.pendingDestroy = true;
+                            else p.pendingDisconnect = true;
                         } else if (esp2 > 25.0 * 25.0) {
-                            p.pendingDestroy = true;
+                            p.pendingDisconnect = true;
                         }
                     }
                 } else if (p.waterDamped) {

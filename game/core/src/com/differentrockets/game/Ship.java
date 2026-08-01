@@ -969,22 +969,37 @@ public class Ship {
      */
     public static class FrameForce {
         public com.badlogic.gdx.physics.box2d.Body body;
-        public float fx, fy, px, py;
+        /** Force vector and application point in the body's LOCAL frame.
+         * Round 38 (probe38 spin fix): BOTH are re-expressed through the
+         * body's live transform at every substep. A point captured once per
+         * frame goes stale as the body rotates (probe37); a DIRECTION
+         * captured once per frame lags the rotation and its lever arm about
+         * the COM systematically PUMPS angular momentum (probe38: fresh
+         * point + stale direction spun the stack to 10 rad/s). */
+        public float fx, fy;   // local force vector
+        public float lx, ly;   // local point (meters)
     }
     public final List<FrameForce> frameForces = new ArrayList<>();
 
     /** Register a continuous force for this frame (see FrameForce). */
     public void addFrameForce(com.badlogic.gdx.physics.box2d.Body b,
-                              float fx, float fy, float px, float py) {
+                              float fx, float fy, float localX, float localY) {
         FrameForce f = new FrameForce();
-        f.body = b; f.fx = fx; f.fy = fy; f.px = px; f.py = py;
+        f.body = b; f.fx = fx; f.fy = fy; f.lx = localX; f.ly = localY;
         frameForces.add(f);
     }
+
+    private final Vector2 tmpFF = new Vector2();
+    private final Vector2 tmpFF2 = new Vector2();
 
     /** Re-apply this frame's registered forces (called before every substep). */
     public void applyFrameForces() {
         for (FrameForce f : frameForces) {
-            if (f.body != null) f.body.applyForce(f.fx, f.fy, f.px, f.py, true);
+            if (f.body != null) {
+                Vector2 wp = f.body.getWorldPoint(tmpFF.set(f.lx, f.ly));
+                Vector2 wf = f.body.getWorldVector(tmpFF2.set(f.fx, f.fy));
+                f.body.applyForce(wf.x, wf.y, wp.x, wp.y, true);
+            }
         }
     }
 

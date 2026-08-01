@@ -188,7 +188,7 @@
 `PartObject::PhysicsStep` @ `0x1d2350`（172 B，每子步每零件）：
 
 - 先调 RigidBody 的 `vtbl[8]`（= `RigidBody::PhysicsStep @ 0x1d12c8`，把 b2Body 的 xf/角度同步进 double 逻辑位置/速度字段，纯簿记）。
-- **延迟爆炸/移除**：`[part+0x1ca]` 置位且未 destroyed → 清位、置 destroyed 位（`0x1c8`）、调 `Explode()`；`[part+0x1c9]` 置位 → 置位 `0x1c8` 并调 `PartTree::0x1d97f8`（从树移除/拆树）。最后调自身 `vtbl[0x70]`（PostPhysicsStep 钩子，基类近空）。
+- **延迟爆炸/断连**（round 38 勘误，`PartTree::0x1d97f8` 已确认为 `DisconnectFromParentTree()`）：`[part+0x1ca]` 置位且未 destroyed → 清位、置 destroyed 位（`0x1c8`）、调 `Explode()`（删除零件）；`[part+0x1c9]` 置位 → 调 `PartTree::DisconnectFromParentTree()`——**断开该零件与父零件的连接，零件和它的子树活着分离出去，不是删除**（早前"从树移除"的表述作废）。最后调自身 `vtbl[0x70]`（PostPhysicsStep 钩子，基类近空）。
 - 即：碰撞/断裂只在 body 上打标志，**实际爆炸/移除统一在下一个子步的 PhysicsStep 执行**，避免在 Box2D 回调里改 world。
 
 `ShipOrbitNode::PhysicsStep`：见 §3（顺序：OrbitNode 基类 → Ship → 零件 PhysicsStep → 连接 PhysicsStep → 阻力）。
@@ -226,7 +226,7 @@
 `PartObject::OnCollision` @ `0x1d1534`（216 B）：
 
 - 先调对方 `vtbl[0x14]`；非零走特殊交互分支（`0x1d83e8`/`0x1d84c0`/`0x1dd4b0`——对接捕获相关，部分未解）。
-- **冲量损伤**：`impulse > [part+0x60]`（double，挤压阈值）→ 置 `0x1c9`（移除标志）；`impulse > [part+0x68]`（double，爆炸阈值）→ 置 `0x1ca`（爆炸标志）。**单位是冲量（N·s 每子步归一前），不是力**。
+- **冲量损伤**（round 38 勘误）：`impulse > [part+0x60]`（double，= PartList `<Damage disconnect>` 值，**断连阈值**）→ 置 `0x1c9`（断连标志 → DisconnectFromParentTree，零件+子树活着分离）；`impulse > [part+0x68]`（double，= `<Damage explode>` 值，爆炸阈值）→ 置 `0x1ca`（爆炸标志 → Explode 删除）。**单位是冲量（N·s 每子步归一前），不是力**。Damage 值实例：pod 1500/1500、大油箱 2500/2500、某件 250/3000（disconnect/explode 可不等）。SR 没有 beginContact 闭合速度估算通道（我们的 channel 2 是求解器盲区补丁，closing ≤ 100 直接return）。
 - 新接触且 `impulse > 500.0f`（literal @ `0x1d1608`，`0x1d1598`）且未在爆炸 → 生成碰撞特效（`0x1ac6b8`）。
 - `PartObject::SetExplodeThreshold` @ `0x1d2288`：写 `[part+0x68]`。唯一调用点 @ `0x16f9ac`，位于 `SatRecoveryRuntime::Initialize`（沙盒/回收场景把零件设为不可爆）。
 - `PartObject::Explode` @ `0x1d2298`：未 destroyed 且 `[part+0x14a]`（canExplode）→ 通知 listeners `vtbl[8]`、置 destroyed（`0x1cb`）、`PartTree::0x1d9aa4`（从树摘除）、调 `0x1ac3a0`（在零件位置生成爆炸，强度 = `[part+0x150](explode) × [part+0x70]`），最后 `vtbl[0x6c]`（OnExploded 虚函数）。
@@ -234,7 +234,7 @@
 `PartObject::OnEnterWater` @ `0x1d1e84`（476 B）——入水伤害：
 
 - 入水速度 v：**v > 90.0f**（literal @ `0x1d2054`）→ 可爆件置爆炸标志（0x1ca）、不可爆件置移除标志（0x1c9）；
-- **25.0 < v ≤ 90.0** → 只置移除标志（零件沉没消失）；v ≤ 25.0 → 安全（`0x1d2018`）。
+- **25.0 < v ≤ 90.0** → 置的也是 `0x1c9`（round 38 勘误：= **断连**，零件分离后沉没，不是直接消失；早前"移除/消失"表述作废）；v ≤ 25.0 → 安全（`0x1d2018`）。
 - 溅落冲击：强度 = clamp(v / 50.0f, 0.1, 1.0) × clamp(质量/10, 0.25, 10)（literals @ `0x1d2058`=50.0、@ `0x1d205c`=0.1），调 `0x1a9260`（水花/冲击波效果）。
 
 ### 我们实现
@@ -397,7 +397,7 @@
 
 | # | 系统 | 差异点 | 级别 | 出处（SR 地址 / 我们位置） |
 |---|------|--------|------|---------------------------|
-| 1 | 碰撞损伤 | PostSolve 最大法向冲量 × 双阈值（消失 `[+0x60]` / 爆炸 `[+0x68]`），延迟一子步执行 | **必须复刻** | `0x197734` / GameWorld.java:194 |
+| 1 | 碰撞损伤 | PostSolve 最大法向冲量 × 双阈值（**断连** `[+0x60]`→DisconnectFromParentTree，零件+子树活着分离 / 爆炸 `[+0x68]`→Explode 删除），延迟一子步执行 | **必须复刻** | `0x197734` / GameWorld.java |
 | 2 | 爆炸执行时机 | 回调只打标志，下一子步 PhysicsStep 执行 Explode/移除 | **必须复刻** | `0x1d2350` / Ship.java |
 | 3 | 子步上限 | 101 步追帧 vs 我们 16 步丢时间 | 建议复刻 | `0x19817c` / GameWorld.java:772 |
 | 4 | 引力唤醒 | 直接写 m_force 并强制唤醒睡眠 body | 建议复刻 | `0x198018` / GameWorld.java:1231 |
@@ -442,8 +442,9 @@ DifferentRockets 采用 SR 原生单位，**SR 逆向得到的常量直接落地
   实现：`mods/engine-*.lua` / `ion-0.lua` 的 `thrust = part:getEnginePower() * 8.5e3 * frac`。
 - **燃料质量**：`燃料 kg = fuel × 0.1`（SR 满油箱 6000 fuel = 12 XML 质量单位 = 600 kg）。
   实现：`Part.updateMass()` 的 `dryMassTons * 50.0 + fuel * 0.1`。
-- **冲击阈值**：PartList.xml `explode="N"` 为法向冲量 N·s **原值原生适用**
-  （常见 1500/2500），`PartType.impactDestroy = explode × 0.36` 仍是估计值。
+- **冲击阈值**：PartList.xml `<Damage disconnect/explode>` 为法向冲量 N·s **原值原生适用**
+  （常见 1500/2500）。round 38 起：`impactDisconnect` 直接解析 `disconnect`（缺省 1500），
+  语义 = 断连非删除；早前的 `impactDestroy = explode × 0.36` 估计**作废**。
 
 迁移规则（round 37 一次性执行）：所有显式力/力矩常量 ÷10，所有质量 ×0.1，
 速度/角度/加速度不动 —— 迁移前后动力学完全一致（TWR、48 s 燃烧、

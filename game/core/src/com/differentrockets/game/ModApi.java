@@ -40,11 +40,15 @@ public class ModApi {
     /** Apply force at a local offset (meters, part frame). */
     public void applyForceAt(double fx, double fy, double localX, double localY) {
         if (part.body == null) return;
-        Vector2 wp = part.body.getWorldPoint(new Vector2((float) localX, (float) localY));
         // register as a continuous frame force: GameWorld.substep re-applies
         // it before EVERY physics step this frame, so thrust covers the full
-        // simulated time at any warp level (see Ship.FrameForce)
-        part.ship.addFrameForce(part.body, (float) fx, (float) fy, wp.x, wp.y);
+        // simulated time at any warp level (see Ship.FrameForce). Round 38:
+        // the force is stored in the part's LOCAL frame (converted here while
+        // the script-time transform is exact) and re-expressed through the
+        // LIVE body transform at every substep — stale direction pumped
+        // angular momentum just like the stale point did (probe37/probe38).
+        Vector2 lf = part.body.getLocalVector(new Vector2((float) fx, (float) fy));
+        part.ship.addFrameForce(part.body, lf.x, lf.y, (float) localX, (float) localY);
     }
 
     public void applyTorque(double t) {

@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?><Ship version="1" liftedOff="0" touchingGround="0">
+<DisconnectedParts/>
+<Parts>
+<Part partType="pod-1" id="1" x="0.399423" y="-1.082211" angle="0.000000" angleV="0.000000" editorAngle="0">
+<Pod throttle="0.000000" name="Unwheel">
+<Staging currentStage="0">
+</Staging>
+</Pod>
+</Part>
+<Part partType="strut-1" id="100000001" x="0.274423" y="-2.332211" angle="0.000000" angleV="0.000000" editorAngle="0" activated="0" exploded="0" flippedX="0" flippedY="0"/>
+<Part partType="strut-1" id="100000002" x="3.774423" y="2.167789" angle="4.712389" angleV="0.000000" editorAngle="3" activated="0" exploded="0" flippedX="0" flippedY="0"/>
+<Part partType="strut-1" id="100000003" x="-3.225577" y="2.167789" angle="4.712389" angleV="0.000000" editorAngle="3" activated="0" exploded="0" flippedX="0" flippedY="0"/>
+<Part partType="strut-1" id="100000004" x="0.312720" y="6.667789" angle="0.000000" angleV="0.000000" editorAngle="0" activated="0" exploded="0" flippedX="0" flippedY="0"/>
+<Part partType="strut-1" id="100000005" x="-7.725577" y="-2.375000" angle="0.000000" angleV="0.000000" editorAngle="0" activated="0" exploded="0" flippedX="0" flippedY="0"/>
+<Part partType="wheel-2" id="100000006" x="-11.250000" y="-2.875000" angle="0.000000" angleV="0.000000" editorAngle="0" activated="0" exploded="0" flippedX="0" flippedY="0"/>
+<Part partType="wheel-2" id="100000007" x="-6.750000" y="-2.875000" angle="0.000000" angleV="0.000000" editorAngle="0" activated="0" exploded="0" flippedX="0" flippedY="0"/>
+<Part partType="wheel-2" id="100000008" x="-1.750000" y="-2.832211" angle="0.000000" angleV="0.000000" editorAngle="0" activated="0" exploded="0" flippedX="0" flippedY="0"/>
+<Part partType="wheel-2" id="100000009" x="2.250000" y="-2.832211" angle="0.000000" angleV="0.000000" editorAngle="0" activated="0" exploded="0" flippedX="0" flippedY="0"/>
+</Parts>
+<Connections>
+<Connection parentAttachPoint="2" childAttachPoint="1" parentPart="1" childPart="100000001"/>
+<Connection parentAttachPoint="1" childAttachPoint="4" parentPart="100000001" childPart="100000002"/>
+<Connection parentAttachPoint="1" childAttachPoint="4" parentPart="100000001" childPart="100000003"/>
+<Connection parentAttachPoint="3" childAttachPoint="2" parentPart="100000002" childPart="100000004"/>
+<Connection parentAttachPoint="3" childAttachPoint="4" parentPart="100000001" childPart="100000005"/>
+<Connection parentAttachPoint="2" childAttachPoint="1" parentPart="100000005" childPart="100000006"/>
+<Connection parentAttachPoint="2" childAttachPoint="1" parentPart="100000005" childPart="100000007"/>
+<Connection parentAttachPoint="2" childAttachPoint="1" parentPart="100000001" childPart="100000008"/>
+<Connection parentAttachPoint="2" childAttachPoint="1" parentPart="100000001" childPart="100000009"/>
+</Connections>
+</Ship>

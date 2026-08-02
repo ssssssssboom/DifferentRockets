@@ -35,8 +35,8 @@ public class Ship {
      * keep a heavy stack angularly honest while staying inside the explicit
      * integration stability bound (zeta*omega*PHYS_DT <= 0.5, capped in weld()).
      */
-    private static final double ANG_FLOOR_HZ = 6.0;
-    private static final double ANG_FLOOR_ZETA = 1.0;
+    private static final double ANG_FLOOR_HZ = Double.parseDouble(System.getProperty("dr.angFloorHz", "6.0"));
+    private static final double ANG_FLOOR_ZETA = Double.parseDouble(System.getProperty("dr.angFloorZeta", "1.0"));
 
     public static class Link {
         public Joint joint;
@@ -428,7 +428,15 @@ public class Ship {
         double omega = 2 * Math.PI * fEff;
         l.kSpring = (float) (omega * omega * iRed);
         double zetaEff = Math.max(zeta, ANG_FLOOR_ZETA);
-        double zetaCap = 0.5 / (omega * GameWorld.PHYS_DT);
+        // round 46 task 2: the zeta cap below dated from the EXPLICIT damper
+        // (probe: uncapped explicit dampers detonate). The round-39b solver
+        // is IMPLICIT Euler — unconditionally stable at any cVisc — so the
+        // cap only strangled damping exactly where stiff springs need it
+        // (12 Hz capped to zeta 0.40, 24 Hz to 0.20, 48 Hz to 0.10: MAR
+        // rang itself apart in probe 46's sweep). Cap remains available via
+        // -Ddr.zetaCap=<value> for explicit-integration experiments.
+        double zetaCap = Double.parseDouble(System.getProperty("dr.zetaCap",
+                String.valueOf(0.5 / (omega * GameWorld.PHYS_DT))));
         if (zetaEff > zetaCap) zetaEff = zetaCap;
         l.cVisc = (float) (zetaEff * 2.0 * omega * iRed);
         float mA = a.body.getMass(), mB = b.body.getMass();
@@ -512,6 +520,13 @@ public class Ship {
      * to the welded pair (momentum-neutral).
      */
     public void applyJointDampers(float h) {
+        // round 46 task 2: per-link implicit solves are Gauss-Seidel passes
+        // over the weld chain; a single pass per substep leaves the chain's
+        // global bending mode under-converged, which destabilises stiff
+        // (>=12 Hz) springs on a 45-link stack (probe 46 sweep). Iterate the
+        // angular pass; linear bushing stays single-pass.
+        int angIters = Integer.parseInt(System.getProperty("dr.dampIters", "1"));
+        for (int iter = 0; iter < angIters; iter++)
         for (Link l : links) {
             if (l.cVisc <= 0 && l.cViscLin <= 0 && l.kSpring <= 0) continue;
             if (!l.a.body.isActive() || !l.b.body.isActive()) continue;
@@ -541,6 +556,7 @@ public class Ship {
                 }
             }
             if (l.cViscLin > 0) {
+                if (iter > 0) continue; // linear bushing: single pass
                 // fresh per-substep anchor positions (the weld-time world
                 // anchor is stale once the ship moves/rotates)
                 Vector2 wA = l.a.body.getWorldPoint(l.localAnchorA);
@@ -731,6 +747,12 @@ public class Ship {
      * and the old soft-spring jitter they fed on no longer exists.
      */
     public void checkJointBreaks(float invDt) {
+        // round 46 (Wheel.xml wake break cascade): weld reaction-force spikes
+        // during the post-wake settle window are the structure seating onto
+        // its contacts, not crash loads — SR does not fail welds on pad
+        // release. Grace the break channels for the whole wakeSettle window
+        // plus a 2 s tail (settle overshoot outlives the guide itself).
+        if (wakeSettle > -120) return;
         List<Link> dead = new ArrayList<>();
         for (Link l : links) {
             if (l.breakForce == Float.MAX_VALUE && l.breakTorque == Float.MAX_VALUE

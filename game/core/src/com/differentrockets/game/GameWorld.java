@@ -254,6 +254,12 @@ public class GameWorld {
     private void impactFlag(Object userData, float impulse, String channel) {
         if (!(userData instanceof Part)) return; // terrain side: nothing to kill
         Part p = (Part) userData;
+        // round 46 (Wheel.xml wake-slam fix): impacts flagged while the ship
+        // is inside its post-wake settle window (wakeSettle > 0, ~1 s) are
+        // contact-solver SEAT transients — the suspension loading onto the
+        // tires / stack settling into its pad contacts — not crashes. The
+        // old code severed struts the instant the player staged a rover.
+        if (p.ship != null && p.ship.wakeSettle > -120) return;
         if (DEBUG_IMPACT && (impulse > p.type.impactDisconnect * 0.5))
             System.out.println("[impactFlag] ch=" + channel + " part=" + p.type.id
                     + " imp=" + impulse + " disc=" + (float) p.type.impactDisconnect
@@ -645,6 +651,15 @@ public class GameWorld {
         }
 
         double ux = Math.cos(padAngle), uy = Math.sin(padAngle);
+        // round 46 (Wheel.xml burial root fix): planets MOVE in real time and
+        // launchShip takes real seconds (mod load, weld build, save). The 39c
+        // grounding correction below re-read planet.pos AFTER placement, so
+        // it measured the ship against an ADVANCED planet center, hallucinated
+        // a +7.18 m "float" and shoved a correctly-placed ship 7.18 m INTO the
+        // physical terrain (wheels born buried; wake -> struts impact-sever).
+        // Snapshot the planet position used for placement and reuse THAT for
+        // the correction's radius/terrain math.
+        final double launchPx = planet.pos.x, launchPy = planet.pos.y;
         spawnR += 0.002; // 2 mm slop: no free-fall drop, no initial penetration
         double sx = planet.pos.x + ux * spawnR;
         double sy = planet.pos.y + uy * spawnR;
@@ -699,8 +714,8 @@ public class GameWorld {
                     for (PartType.Vertex v : sd.verts) {
                         wv.set(v.x, v.y);
                         p.body.getWorldPoint(wv);
-                        double dxp = ship.origin.x + wv.x - planet.pos.x;
-                        double dyp = ship.origin.y + wv.y - planet.pos.y;
+                        double dxp = ship.origin.x + wv.x - launchPx;
+                        double dyp = ship.origin.y + wv.y - launchPy;
                         double rv = Math.hypot(dxp, dyp);
                         double ang = Math.atan2(dyp, dxp);
                         double rt = TerrainScript.surfaceHeight(planet.name, ang * planet.radius);
@@ -711,7 +726,10 @@ public class GameWorld {
                     }
                 }
             }
-            if (resid != Double.MAX_VALUE && resid > 0.0005 && resid < 10) {
+            // design envelope is ~0.2 m (engine bells / tapered shapes);
+            // refuse anything beyond 1 m — a large "residual" is a
+            // measurement artifact, never a real float (round 46).
+            if (resid != Double.MAX_VALUE && resid > 0.0005 && resid < 1.0) {
                 final float dy = -(float) resid; // local +y is pad-radial
                 ship.forEachBody(b -> b.setTransform(b.getPosition().x,
                         b.getPosition().y + dy, b.getAngle()));
@@ -1574,9 +1592,9 @@ public class GameWorld {
         // semantics): bleed lateral drift and all spin while the contacts
         // find their seats / the rocket clears the mount.
         for (Ship s : ships) {
-            if (s.wakeSettle > 0 && !s.onRails) {
-                s.wakeSettle--;
-                s.forEachBody(b -> {
+            if (s.wakeSettle > -120 && !s.onRails) {
+                s.wakeSettle--; // keeps counting past 0: checkJointBreaks grace tail (round 46)
+                if (s.wakeSettle > 0) s.forEachBody(b -> {
                     b.setAngularVelocity(0);
                     b.setLinearVelocity(0, b.getLinearVelocity().y);
                 });
